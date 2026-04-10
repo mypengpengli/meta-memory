@@ -1,0 +1,4 @@
+interface:
+  display_name: "记忆技能"
+  short_description: "在对话中按领域和主题加载、写回记忆。"
+  default_prompt: "使用 $memory-orchestrator 按领域和主题加载这次对话需要的记忆，并判断新信息该写回哪一层。"
