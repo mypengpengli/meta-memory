@@ -87,6 +87,9 @@
 - 学习：方法 / 计划 / 输入 / 训练 / 复盘
 - 家庭与子女教育：理念 / 画像 / 习惯 / 陪伴 / 阶段事项
 - 日常生活：节奏 / 居住 / 饮食 / 事务 / 物品与设备
+- 健康：状态 / 作息 / 饮食 / 运动 / 风险与医疗
+- 财务与消费：原则 / 日常消费 / 购买决策 / 大额事项 / 资产与现金流
+- 人际与关系：人物 / 沟通 / 边界 / 协作 / 冲突与修复
 
 ## 使用方法
 
@@ -167,3 +170,6 @@ SKILL.md
 - `references/learning-topic-tree.md`
 - `references/family-education-topic-tree.md`
 - `references/daily-life-topic-tree.md`
+- `references/health-topic-tree.md`
+- `references/finance-topic-tree.md`
+- `references/relationships-topic-tree.md`
