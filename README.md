@@ -103,8 +103,6 @@ python scripts/memory_runtime.py remember --store D:\memory-data --subject-id me
 
 更详细的设计、加载规则和参考模板在：
 
+- [references/reference-map.md](references/reference-map.md)
 - [SKILL.md](SKILL.md)
-- [references/memory-system.md](references/memory-system.md)
-- [references/loading-rules.md](references/loading-rules.md)
-- [references/writeback-rules.md](references/writeback-rules.md)
 - [references/memory/index.md](references/memory/index.md)
