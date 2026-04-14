@@ -1,4 +1,4 @@
 interface:
   display_name: "记忆技能"
-  short_description: "在对话中按领域和主题加载、写回记忆。"
-  default_prompt: "使用 $memory-orchestrator 按领域和主题加载这次对话需要的记忆，并判断新信息该写回哪一层。"
+  short_description: "围绕具体人物加载、写回长期记忆。"
+  default_prompt: "使用 $memory-orchestrator 先读取这个人的画像、当前状态、关系和目标，再判断新信息该写回画像、状态、事件、关系、目标、会话还是候选池。"

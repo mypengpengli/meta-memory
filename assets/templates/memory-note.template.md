@@ -1,14 +1,19 @@
 ---
-area: work
-memory_kind: topic
+subject_id: person-example
+subject_name: Example Person
+memory_kind: profile
+domain: general
 topic: example-topic
-subtopics: []
 tags: []
-related_topics: []
-related_projects: []
-related_sources: []
-stability: medium
-load_hint: by-topic
+start_at: ""
+end_at: ""
+confidence: 0.7
+status: active
+source: ""
+related_people: []
+related_events: []
+supersedes: []
+replaced_by: []
 ---
 
 # 标题
@@ -21,16 +26,17 @@ load_hint: by-topic
 
 说明这条记忆记录的核心内容。
 
-## 适合在什么情况下被召回
+## 时间边界
 
-- 情况 1
-- 情况 2
+- 什么时候开始成立
+- 什么时候失效，或目前仍有效
 
-## 相关主题
+## 关联人物与事件
 
-- 主题 A
-- 主题 B
+- 人物 A
+- 事件 B
 
-## 相关项目或来源
+## 来源与可信度
 
-- 项目 / 来源
+- 来源
+- 为什么判断可信

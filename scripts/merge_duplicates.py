@@ -3,16 +3,14 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from _common import emit, first_heading, markdown_files, parse_args, store_root
+from _common import emit, first_heading, indexed_roots, markdown_files, parse_args, store_root
 
 
 def main() -> None:
     args = parse_args("Report duplicate memory note titles.")
     root = store_root(args.store)
     buckets: dict[str, list[str]] = defaultdict(list)
-    for path in markdown_files(
-        [root / "fixed", root / "topics", root / "projects", root / "candidates"]
-    ):
+    for path in markdown_files(indexed_roots(root)):
         buckets[first_heading(path).strip().lower()].append(str(path))
     duplicates = {title: paths for title, paths in buckets.items() if len(paths) > 1}
     emit({"status": "ok", "duplicates": duplicates, "count": len(duplicates)})

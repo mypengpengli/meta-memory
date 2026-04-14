@@ -1,41 +1,40 @@
 # 记忆索引
 
-这是当前 Skill 的记忆入口索引。
+这是当前 Skill 的人物记忆入口索引。
 对话时先看这里，再决定展开哪份记忆。
 
-## 固定记忆
+## 人物核心
 
-- [fixed-memory.md](fixed-memory.md)
-  - 适合：长期偏好、长期规则、长期坑点
+- [person-profile.md](person-profile.md)
+  - 最稳定的人物画像
+- [state-current.md](state-current.md)
+  - 最近一段时间的当前状态
 
-## 根领域索引
+## 长期推进事项
 
-- [work-index.md](work-index.md)
-  - 工作、编程、产品、业务、项目
-- [learning-index.md](learning-index.md)
-  - 学习方法、知识积累、学习目标
-- [family-education-index.md](family-education-index.md)
-  - 家庭、子女教育、教育理念、阶段教育重点
-- [daily-life-index.md](daily-life-index.md)
-  - 日常生活、生活习惯、生活环境、安排
-- [health-index.md](health-index.md)
-  - 作息、饮食、运动、身体状态
-- [finance-index.md](finance-index.md)
-  - 财务、消费、预算、购买偏好
-- [relationships-index.md](relationships-index.md)
-  - 人际关系、沟通方式、边界、重要对象
+- [goals-projects.md](goals-projects.md)
+  - 长期目标、阶段计划、项目状态
 
-## 项目记忆
+## 关系与时间
 
-- [project-current.md](project-current.md)
-  - 适合：当前项目专属状态
+- [relationships-current.md](relationships-current.md)
+  - 当前最重要的关系对象和关系规则
+- [timeline-index.md](timeline-index.md)
+  - 关键事件和时间线入口
 
-## 会话记忆
+## 领域切面
+
+- [domains-index.md](domains-index.md)
+  - 工作、学习、健康、财务等领域切面入口
+
+## 当前工作层
 
 - [session-current.md](session-current.md)
-  - 适合：当前这段工作进行到哪里
+  - 当前这段工作进行到哪里
+- [candidate-pool.md](candidate-pool.md)
+  - 还没稳定的新信息
 
 ## 归档索引
 
 - [archive-index.md](archive-index.md)
-  - 适合：需要找原始记录和原始证据时使用
+  - 原始聊天、日志、证据入口

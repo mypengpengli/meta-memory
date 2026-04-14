@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from _common import (
+    as_float,
     emit,
     first_heading,
+    first_summary_line,
+    indexed_roots,
+    json_text,
     markdown_files,
     open_db,
     parse_args,
@@ -12,45 +16,129 @@ from _common import (
 )
 
 
+def infer_memory_kind(meta: dict[str, object], path: str) -> str:
+    kind = str(meta.get("memory_kind") or meta.get("scope") or meta.get("type") or "").strip()
+    if kind:
+        return kind
+    normalized = path.replace("\\", "/")
+    if "/profile/" in normalized or "/fixed/" in normalized:
+        return "profile"
+    if "/states/" in normalized:
+        return "state"
+    if "/events/" in normalized:
+        return "event"
+    if "/relationships/" in normalized:
+        return "relationship"
+    if "/goals/" in normalized or "/projects/" in normalized:
+        return "goal"
+    if "/domains/" in normalized or "/topics/" in normalized:
+        return "domain"
+    if "/sessions/" in normalized:
+        return "session"
+    if "/candidates/" in normalized:
+        return "candidate"
+    return "note"
+
+
+def infer_domain(meta: dict[str, object], path: str) -> str:
+    domain = str(meta.get("domain") or meta.get("area") or "").strip()
+    if domain:
+        return domain
+    normalized = path.replace("\\", "/")
+    for candidate in ["work", "learning", "daily-life", "health", "finance", "relationships"]:
+        if f"/{candidate}/" in normalized or normalized.endswith(f"/{candidate}.md"):
+            return candidate
+    return "general"
+
+
 def main() -> None:
-    args = parse_args("Reindex curated memory notes into SQLite.")
+    args = parse_args("Reindex person memory notes into SQLite.")
     root = store_root(args.store)
     conn = open_db(root)
-    files = markdown_files(
-        [
-            root / "fixed",
-            root / "topics",
-            root / "projects",
-            root / "sessions",
-            root / "candidates",
-        ]
-    )
+    files = markdown_files(indexed_roots(root))
+    current_paths = {str(path) for path in files}
+
+    if current_paths:
+        placeholders = ", ".join("?" for _ in current_paths)
+        conn.execute(
+            f"DELETE FROM documents WHERE path NOT IN ({placeholders})",
+            tuple(sorted(current_paths)),
+        )
+        conn.execute(
+            f"DELETE FROM scores WHERE path NOT IN ({placeholders})",
+            tuple(sorted(current_paths)),
+        )
+    else:
+        conn.execute("DELETE FROM documents")
+        conn.execute("DELETE FROM scores")
+
     indexed = 0
     for path in files:
         meta = parse_frontmatter(path)
+        doc_path = str(path)
+        memory_kind = infer_memory_kind(meta, doc_path)
+        confidence = as_float(meta.get("confidence"), 0.5 if memory_kind != "candidate" else 0.3)
         conn.execute(
             """
-            INSERT INTO documents(path, scope, doc_type, title, topic, tags, status, mtime)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents(
+                path, title, subject_id, subject_name, memory_kind, domain, topic, tags, summary,
+                confidence, status, source, start_at, end_at, related_people, related_events,
+                related_topics, related_sources, supersedes, replaced_by, mtime
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
-                scope=excluded.scope,
-                doc_type=excluded.doc_type,
                 title=excluded.title,
+                subject_id=excluded.subject_id,
+                subject_name=excluded.subject_name,
+                memory_kind=excluded.memory_kind,
+                domain=excluded.domain,
                 topic=excluded.topic,
                 tags=excluded.tags,
+                summary=excluded.summary,
+                confidence=excluded.confidence,
                 status=excluded.status,
+                source=excluded.source,
+                start_at=excluded.start_at,
+                end_at=excluded.end_at,
+                related_people=excluded.related_people,
+                related_events=excluded.related_events,
+                related_topics=excluded.related_topics,
+                related_sources=excluded.related_sources,
+                supersedes=excluded.supersedes,
+                replaced_by=excluded.replaced_by,
                 mtime=excluded.mtime
             """,
             (
-                str(path),
-                meta.get("scope", ""),
-                meta.get("type", ""),
+                doc_path,
                 first_heading(path),
-                meta.get("topic", ""),
-                str(meta.get("tags", "")),
-                meta.get("status", ""),
+                str(meta.get("subject_id", "")),
+                str(meta.get("subject_name", "")),
+                memory_kind,
+                infer_domain(meta, doc_path),
+                str(meta.get("topic", "")),
+                json_text(meta.get("tags", [])),
+                first_summary_line(path),
+                confidence,
+                str(meta.get("status", "pending" if memory_kind == "candidate" else "active")),
+                json_text(meta.get("source", meta.get("related_sources", ""))),
+                str(meta.get("start_at", "")),
+                str(meta.get("end_at", "")),
+                json_text(meta.get("related_people", [])),
+                json_text(meta.get("related_events", [])),
+                json_text(meta.get("related_topics", [])),
+                json_text(meta.get("related_sources", [])),
+                json_text(meta.get("supersedes", [])),
+                json_text(meta.get("replaced_by", [])),
                 path.stat().st_mtime,
             ),
+        )
+        conn.execute(
+            """
+            INSERT INTO scores(path, confidence)
+            VALUES(?, ?)
+            ON CONFLICT(path) DO UPDATE SET confidence=excluded.confidence
+            """,
+            (doc_path, confidence),
         )
         indexed += 1
     conn.commit()
