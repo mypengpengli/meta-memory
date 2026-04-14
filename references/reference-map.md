@@ -4,10 +4,10 @@
 
 先从这里判断该读什么：
 
-- 想看整体模型：`memory-system.md`
-- 想看回答前怎么取记忆：`loading-rules.md`
-- 想看回合后怎么写回：`writeback-rules.md`
-- 想看样板记忆入口：`memory/index.md`
+- 想知道“当前问题该读哪份顶层记忆”：`memory/index.md`
+- 想知道“回答前怎么按问题类型取记忆，以及什么时候停止展开”：`loading-rules.md`
+- 想知道“新信息该写到哪一层”：`writeback-rules.md`
+- 想知道“整个系统分了哪些层，各层负责什么”：`memory-system.md`
 
 只在需要时再读：
 

@@ -77,18 +77,19 @@ python scripts/memory_runtime.py remember --store D:\memory-data --subject-id me
 - `scripts/memory_runtime.py record-event`
   - 只记录原始事件，不立即整理
 
-## 什么时候用哪一层
+## 回答前怎么判断读哪层
 
-- 稳定人物特征和长期偏好：`profile`
-- 当前阶段持续成立的状态：`states`
-- 有明确时间点的关键经历：`events`
-- 与重要人物相关的稳定模式：`relationships`
-- 长期目标和项目：`goals`
-- 工作/学习/健康等可复用经验：`domains`
-- 当前回合临时推进信息：`sessions`
-- 还不够稳定、仍需观察：`candidates`
+- 问“这个人是谁”、长期偏好、稳定风格时，先读 `profile`
+- 问最近状态、近况、阶段变化时，先读 `states`
+- 问长期目标、项目、约束时，先读 `goals`
+- 问某个重要人物、关系、边界时，先读 `relationships`
+- 问关键事件、前后变化、原因、时间线时，先读 `events`
+- 问工作、学习、健康、财务等领域切面时，先读 `domains`
+- 问当前这轮任务做到哪、下一步是什么时，先读 `sessions`
+- 问还没证实、仍需观察的信息时，先读 `candidates`
+- 问证据、原话、原始记录时，再下钻 `archive`
 
-拿不准时，先写 `candidate`。
+如果同时涉及多类内容，先从 `profile -> states -> goals` 开始，只有当前问题确实需要时再继续展开。
 
 ## 对外使用建议
 
@@ -103,6 +104,7 @@ python scripts/memory_runtime.py remember --store D:\memory-data --subject-id me
 
 更详细的设计、加载规则和参考模板在：
 
+- [references/memory/index.md](references/memory/index.md)
+- [references/loading-rules.md](references/loading-rules.md)
 - [references/reference-map.md](references/reference-map.md)
 - [SKILL.md](SKILL.md)
-- [references/memory/index.md](references/memory/index.md)

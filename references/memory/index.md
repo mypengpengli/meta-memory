@@ -3,6 +3,18 @@
 这是当前 Skill 的人物记忆入口索引。
 对话时先看这里，再决定展开哪份记忆。
 
+## 先按问题路由
+
+- 问“这个人是谁”、稳定偏好、长期习惯：看 [person-profile.md](person-profile.md)
+- 问最近状态、近况、阶段变化：看 [state-current.md](state-current.md)
+- 问长期目标、项目进度、明确约束：看 [goals-projects.md](goals-projects.md)
+- 问某个重要人物、关系模式、边界：看 [relationships-current.md](relationships-current.md)
+- 问关键事件、前后变化、时间线：看 [timeline-index.md](timeline-index.md)
+- 问工作、学习、健康、财务等具体领域：看 [domains-index.md](domains-index.md)
+- 问当前会话做到哪、下一步是什么：看 [session-current.md](session-current.md)
+- 问还不稳定的新判断、待验证信息：看 [candidate-pool.md](candidate-pool.md)
+- 问证据、原始聊天、长日志：看 [archive-index.md](archive-index.md)
+
 ## 人物核心
 
 - [person-profile.md](person-profile.md)
