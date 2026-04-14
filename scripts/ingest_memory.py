@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--store", required=True, help="Path to the external memory-data root")
     parser.add_argument("--title", help="Memory title")
+    parser.add_argument("--title-file", help="Read title from a UTF-8 text file")
     parser.add_argument("--content", help="Inline content")
     parser.add_argument("--content-file", help="Read content from a UTF-8 text file")
     parser.add_argument("--payload-file", help="Read title/content/metadata from a UTF-8 JSON file")
@@ -62,7 +63,10 @@ def load_payload(path: str | None) -> dict[str, object]:
 
 
 def read_input(args: argparse.Namespace, payload: dict[str, object]) -> tuple[str, str]:
-    title = args.title or str(payload.get("title", "")).strip()
+    if args.title_file:
+        title = Path(args.title_file).read_text(encoding="utf-8-sig").strip()
+    else:
+        title = args.title or str(payload.get("title", "")).strip()
     if args.content_file:
         content = Path(args.content_file).read_text(encoding="utf-8-sig").strip()
     elif args.content:

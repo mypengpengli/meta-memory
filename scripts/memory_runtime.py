@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     remember.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     remember.add_argument("--session-id", default="", help="Session id")
     remember.add_argument("--title", help="Memory title")
+    remember.add_argument("--title-file", help="Read the memory title from a UTF-8 text file")
     remember.add_argument("--content", help="Memory content")
     remember.add_argument("--content-file", help="Read content from a UTF-8 text file")
     remember.add_argument("--payload-file", help="Read title/content/metadata from a UTF-8 JSON file")

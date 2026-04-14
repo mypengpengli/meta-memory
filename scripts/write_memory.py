@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Write a structured memory note into the external store.")
     parser.add_argument("--store", required=True, help="Path to the external memory-data root")
     parser.add_argument("--title", help="Memory note title")
+    parser.add_argument("--title-file", help="Read note title from a UTF-8 text file")
     parser.add_argument(
         "--kind",
         choices=sorted(KIND_DIRS),
@@ -117,6 +118,12 @@ def read_content(args: argparse.Namespace) -> str:
     if args.content:
         return args.content.strip()
     return ""
+
+
+def read_title(args: argparse.Namespace) -> str:
+    if args.title_file:
+        return Path(args.title_file).read_text(encoding="utf-8-sig").strip()
+    return (args.title or "").strip()
 
 
 def load_payload(path: str | None) -> dict[str, object]:
@@ -316,9 +323,9 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
 def main() -> None:
     args = parse_args()
     payload = load_payload(args.payload_file)
-    title = str(arg_or_payload(args, payload, "title", "")).strip()
+    title = read_title(args) or str(payload.get("title", "")).strip()
     if not title:
-        raise SystemExit("A title is required via --title or --payload-file.")
+        raise SystemExit("A title is required via --title, --title-file, or --payload-file.")
 
     content = read_content(args)
     if not content:

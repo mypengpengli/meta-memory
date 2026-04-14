@@ -30,6 +30,8 @@ python scripts/memory_runtime.py finalize-turn --store D:\memory-data --subject-
 python scripts/memory_runtime.py remember --store D:\memory-data --subject-id me --subject-name 我 --title 回答风格偏好 --content "长期更喜欢先给结论，再给解释。" --use-underlying-kind
 ```
 
+如果标题、内容带中文、多行文本，或者由宿主程序传入，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`。
+
 如果你的宿主只能在每回合前后各调用一次脚本，这个仓库就已经能工作。
 
 ## 它做什么
