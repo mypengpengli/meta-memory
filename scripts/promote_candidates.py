@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from _common import compose_markdown, emit, ensure_default_dirs, read_text, split_frontmatter, store_root
+from _common import DEFAULT_STORE_HELP, compose_markdown, emit, ensure_default_dirs, read_text, split_frontmatter, store_root
 from normalize_candidates import DEFAULT_META as CANDIDATE_DEFAULTS
 from write_memory import (
     DEFAULT_CONFIDENCE,
@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Promote a candidate memory into a long-term memory note."
     )
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument(
         "--candidate",
         required=True,

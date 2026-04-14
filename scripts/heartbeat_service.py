@@ -9,14 +9,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _common import emit
+from _common import DEFAULT_STORE_HELP, emit, store_root
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the heartbeat organizer on a repeating timer so the memory system can organize incrementally."
     )
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Limit to one subject_id")
     parser.add_argument("--check-every-minutes", type=float, default=10.0, help="Heartbeat check interval")
     parser.add_argument("--organize-interval-minutes", type=int, default=30, help="Minimum organize interval")
@@ -40,11 +40,12 @@ def utc_now() -> str:
 
 def build_command(args: argparse.Namespace) -> list[str]:
     base = Path(__file__).resolve().parent
+    root = store_root(args.store)
     command = [
         sys.executable,
         str(base / "run_heartbeat.py"),
         "--store",
-        args.store,
+        str(root),
         "--interval-minutes",
         str(args.organize_interval_minutes),
         "--min-pending",

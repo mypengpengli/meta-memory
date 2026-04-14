@@ -10,27 +10,34 @@
 ## Quick Start
 
 默认按“每回合事件驱动”使用，不需要先手动初始化。
-第一次调用运行时入口时，store 会自动创建。
+第一次调用运行时入口时，仓库内的 `memory-data/` 会自动创建。
+默认数据位置固定为：
+
+- Markdown 记忆：`memory-data/profile`、`memory-data/states`、`memory-data/candidates` 等
+- SQLite：`memory-data/db/memory_index.sqlite`
+
+只有在你明确想把数据放到别处时，才需要额外传 `--store`。
 
 回答前：
 
 ```text
-python scripts/memory_runtime.py prepare-context --store D:\memory-data --subject-id me --subject-name 我 --session-id session-20260413 --query "我最近的睡眠状态有什么值得注意的吗？"
+python scripts/memory_runtime.py prepare-context --subject-id me --subject-name 我 --session-id session-20260413 --query "我最近的睡眠状态有什么值得注意的吗？"
 ```
 
 回答后：
 
 ```text
-python scripts/memory_runtime.py finalize-turn --store D:\memory-data --subject-id me --subject-name 我 --session-id session-20260413 --reply "最近睡眠里最值得注意的是它和晚饭时间可能有关，但目前还只是候选观察。"
+python scripts/memory_runtime.py finalize-turn --subject-id me --subject-name 我 --session-id session-20260413 --reply "最近睡眠里最值得注意的是它和晚饭时间可能有关，但目前还只是候选观察。"
 ```
 
 用户明确要求记住时：
 
 ```text
-python scripts/memory_runtime.py remember --store D:\memory-data --subject-id me --subject-name 我 --title 回答风格偏好 --content "长期更喜欢先给结论，再给解释。" --use-underlying-kind
+python scripts/memory_runtime.py remember --subject-id me --subject-name 我 --title 回答风格偏好 --content "长期更喜欢先给结论，再给解释。" --use-underlying-kind
 ```
 
 如果标题、内容带中文、多行文本，或者由宿主程序传入，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`。
+如果你确实想把数据放到别处，再显式传 `--store <path>` 覆盖默认目录。
 
 如果你的宿主只能在每回合前后各调用一次脚本，这个仓库就已经能工作。
 

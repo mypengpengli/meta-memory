@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from _common import compose_markdown, emit, ensure_default_dirs, parse_frontmatter, read_text, split_frontmatter, store_root
+from _common import DEFAULT_STORE_HELP, compose_markdown, emit, ensure_default_dirs, parse_frontmatter, read_text, split_frontmatter, store_root
 
 
 KIND_DIRS = {
@@ -50,7 +50,7 @@ DEFAULT_STATUS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Write a structured memory note into the external store.")
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--title", help="Memory note title")
     parser.add_argument("--title-file", help="Read note title from a UTF-8 text file")
     parser.add_argument(

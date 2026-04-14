@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from classify_memory import LONG_TERM_KINDS, classify
-from _common import emit, open_db, read_text, split_frontmatter, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, read_text, split_frontmatter, store_root
 
 
 ACTION_PRIORITY = {
@@ -20,7 +20,7 @@ ACTION_PRIORITY = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Review candidate memories and rank promotion opportunities.")
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Filter by subject_id")
     parser.add_argument("--subject-name", help="Filter by subject_name")
     parser.add_argument("--top-k", type=int, default=20, help="Maximum candidates to return")

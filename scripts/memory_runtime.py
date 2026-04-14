@@ -11,7 +11,7 @@ from classify_memory import classify
 from ingest_memory import build_payload, load_payload as load_memory_payload, read_input
 from ingest_raw_event import insert_raw_event
 from write_memory import write_payload
-from _common import emit, ensure_store_ready, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, ensure_store_ready, open_db, store_root
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     record.add_argument("--allow-duplicate", action="store_true", help="Allow exact duplicate raw events")
 
     prepare = subparsers.add_parser("prepare-context", help="Record the current user turn, run heartbeat, and retrieve memory context")
-    prepare.add_argument("--store", required=True, help="Path to the external memory-data root")
+    prepare.add_argument("--store", help=DEFAULT_STORE_HELP)
     prepare.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     prepare.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     prepare.add_argument("--session-id", default="", help="Session id")
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--out-file", help="Write the full JSON result to a UTF-8 file")
 
     finalize = subparsers.add_parser("finalize-turn", help="Record the assistant reply and optionally organize the finished turn")
-    finalize.add_argument("--store", required=True, help="Path to the external memory-data root")
+    finalize.add_argument("--store", help=DEFAULT_STORE_HELP)
     finalize.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     finalize.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     finalize.add_argument("--session-id", default="", help="Session id")
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     finalize.add_argument("--out-file", help="Write the full JSON result to a UTF-8 file")
 
     remember = subparsers.add_parser("remember", help="Explicitly write a memory while also recording its raw source")
-    remember.add_argument("--store", required=True, help="Path to the external memory-data root")
+    remember.add_argument("--store", help=DEFAULT_STORE_HELP)
     remember.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     remember.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     remember.add_argument("--session-id", default="", help="Session id")
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def add_shared_record_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     parser.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     parser.add_argument("--session-id", default="", help="Session id")

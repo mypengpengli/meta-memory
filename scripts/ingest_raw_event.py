@@ -5,12 +5,12 @@ import argparse
 import json
 from pathlib import Path
 
-from _common import emit, open_db, sha256_text, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest a raw event into the event inbox without organizing it yet.")
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     parser.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     parser.add_argument("--session-id", default="", help="Session id for grouping recent events")

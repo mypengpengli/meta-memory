@@ -7,14 +7,14 @@ from pathlib import Path
 
 from classify_memory import LONG_TERM_KINDS, classify
 from write_memory import DEFAULT_CONFIDENCE, DEFAULT_STATUS, as_list, slugify, write_payload
-from _common import emit, store_root
+from _common import DEFAULT_STORE_HELP, emit, store_root
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Classify a memory and write it into the appropriate layer in one step."
     )
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--title", help="Memory title")
     parser.add_argument("--title-file", help="Read title from a UTF-8 text file")
     parser.add_argument("--content", help="Inline content")

@@ -9,6 +9,9 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable
 
+DEFAULT_STORE_DIRNAME = "memory-data"
+DEFAULT_STORE_HELP = f"Path to the memory-data root; defaults to ./{DEFAULT_STORE_DIRNAME} under the skill root"
+
 
 DEFAULT_DIRS = [
     "profile",
@@ -122,12 +125,23 @@ MEMORY_SOURCE_COLUMNS = {
 
 def parse_args(description: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     return parser.parse_args()
 
 
-def store_root(raw: str) -> Path:
-    return Path(raw).expanduser().resolve()
+def skill_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_store_root() -> Path:
+    return (skill_root() / DEFAULT_STORE_DIRNAME).resolve()
+
+
+def store_root(raw: str | None) -> Path:
+    text = str(raw or "").strip()
+    if text:
+        return Path(text).expanduser().resolve()
+    return default_store_root()
 
 
 def ensure_default_dirs(root: Path) -> None:

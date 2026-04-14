@@ -5,14 +5,14 @@ import argparse
 import re
 from datetime import datetime, timezone
 
-from _common import emit, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Search raw events by subject, topic, domain, time range, and free-text query."
     )
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Filter by subject_id")
     parser.add_argument("--session-id", help="Filter by session_id")
     parser.add_argument("--query", help="Free-text query against topic/domain/content")

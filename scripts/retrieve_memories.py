@@ -7,7 +7,7 @@ import math
 import re
 from datetime import datetime, timezone
 
-from _common import emit, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 
 
 KIND_BIAS = {
@@ -34,7 +34,7 @@ BASIC_KINDS = ["profile", "state"]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Retrieve the most relevant memories for a question.")
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--query", help="The current question or task")
     parser.add_argument("--query-file", help="Read the query from a UTF-8 text file")
     parser.add_argument("--top-k", type=int, default=6, help="Maximum memories to return")

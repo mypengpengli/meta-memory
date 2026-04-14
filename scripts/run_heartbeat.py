@@ -8,14 +8,14 @@ from pathlib import Path
 
 from classify_memory import LONG_TERM_KINDS, classify, first_sentence, slugify
 from write_memory import DEFAULT_CONFIDENCE, DEFAULT_STATUS, run_indexing, write_payload
-from _common import emit, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the lightweight heartbeat and incrementally organize new raw events."
     )
-    parser.add_argument("--store", required=True, help="Path to the external memory-data root")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Limit to one subject_id")
     parser.add_argument("--interval-minutes", type=int, default=30, help="Minimum interval between organize runs")
     parser.add_argument("--min-pending", type=int, default=3, help="Pending event threshold that triggers organize")
