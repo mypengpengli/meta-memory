@@ -31,6 +31,18 @@ STATUS_BIAS = {
 
 BASIC_KINDS = ["profile", "state"]
 
+PAGE_ROLE_BIAS = {
+    "person-profile": 1.6,
+    "state-current": 1.4,
+    "goals-projects": 1.1,
+    "relationships-current": 1.1,
+    "timeline-index": 0.9,
+    "domains-index": 0.8,
+    "domain-current": 0.7,
+    "session-current": 0.5,
+    "candidate-pool": 0.2,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Retrieve the most relevant memories for a question.")
@@ -167,6 +179,10 @@ def base_score(row: dict[str, object]) -> float:
     kind = str(row["memory_kind"])
     status = str(row["status"])
     score = rank_score + KIND_BIAS.get(kind, 0.4) + STATUS_BIAS.get(status, 0.0)
+    page_role = str(row.get("page_role", "") or "")
+    score += PAGE_ROLE_BIAS.get(page_role, 0.0)
+    if int(row.get("canonical", 0) or 0) == 1:
+        score += 0.6
     if row["end_at"]:
         score -= 0.2
     return score
@@ -178,8 +194,10 @@ def select_basics(rows: list[dict[str, object]], top_k: int) -> list[dict[str, o
         if len(selected) >= top_k:
             break
         candidates = [row for row in rows if row["memory_kind"] == kind and row["status"] != "superseded"]
-        if candidates:
-            selected.append(candidates[0])
+        canonical = [row for row in candidates if int(row.get("canonical", 0) or 0) == 1]
+        preferred = canonical[0] if canonical else (candidates[0] if candidates else None)
+        if preferred:
+            selected.append(preferred)
     return selected
 
 
@@ -249,6 +267,8 @@ def main() -> None:
             d.subject_id,
             d.subject_name,
             d.memory_kind,
+            d.page_role,
+            d.canonical,
             d.domain,
             d.topic,
             d.tags,
@@ -277,6 +297,8 @@ def main() -> None:
         "subject_id",
         "subject_name",
         "memory_kind",
+        "page_role",
+        "canonical",
         "domain",
         "topic",
         "tags",
@@ -347,6 +369,8 @@ def main() -> None:
                     "path": row["path"],
                     "title": row["title"],
                     "memory_kind": row["memory_kind"],
+                    "page_role": row["page_role"],
+                    "canonical": bool(row["canonical"]),
                     "domain": row["domain"],
                     "topic": row["topic"],
                     "summary": row["summary"],

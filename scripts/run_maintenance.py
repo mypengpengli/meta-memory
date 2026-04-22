@@ -27,6 +27,8 @@ def main() -> None:
         base / "reindex_memory.py",
         base / "merge_duplicates.py",
         base / "score_memories.py",
+        base / "build_views.py",
+        base / "lint_memory.py",
     ]
     results = [run(script, str(root)) for script in scripts]
     emit({"status": "ok", "steps": results})

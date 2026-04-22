@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--skip-record-query", action="store_true", help="Do not append the current query to raw_events")
     prepare.add_argument("--allow-duplicate", action="store_true", help="Allow exact duplicate raw events when recording the query")
     prepare.add_argument("--skip-heartbeat", action="store_true", help="Do not run heartbeat before retrieval")
-    prepare.add_argument("--heartbeat-policy", choices=["conservative", "balanced", "aggressive"], default="balanced")
+    prepare.add_argument("--heartbeat-policy", choices=["conservative", "balanced", "aggressive"], default="conservative")
     prepare.add_argument("--heartbeat-interval-minutes", type=int, default=30)
     prepare.add_argument("--heartbeat-min-pending", type=int, default=3)
     prepare.add_argument("--heartbeat-max-events", type=int, default=20)
@@ -64,10 +64,26 @@ def parse_args() -> argparse.Namespace:
     finalize.add_argument("--allow-duplicate", action="store_true", help="Allow exact duplicate raw events")
     finalize.add_argument("--skip-record-reply", action="store_true", help="Do not record the assistant reply before heartbeat")
     finalize.add_argument("--skip-heartbeat", action="store_true", help="Do not run heartbeat after recording the reply")
-    finalize.add_argument("--heartbeat-policy", choices=["conservative", "balanced", "aggressive"], default="balanced")
+    finalize.add_argument("--heartbeat-policy", choices=["conservative", "balanced", "aggressive"], default="conservative")
     finalize.add_argument("--heartbeat-interval-minutes", type=int, default=30)
     finalize.add_argument("--heartbeat-min-pending", type=int, default=2)
     finalize.add_argument("--heartbeat-max-events", type=int, default=20)
+    finalize.add_argument("--capture-artifact", action="store_true", help="Write the reply into a structured memory page in a controlled way")
+    finalize.add_argument("--artifact-title", help="Optional title for the captured reply artifact")
+    finalize.add_argument("--artifact-title-file", help="Read the artifact title from a UTF-8 file")
+    finalize.add_argument(
+        "--artifact-kind",
+        choices=["profile", "state", "event", "relationship", "goal", "domain", "session", "candidate"],
+        help="Override the classifier result for the captured reply artifact",
+    )
+    finalize.add_argument(
+        "--artifact-use-underlying-kind",
+        action="store_true",
+        help="If the reply classifies to session/candidate, promote it to the suggested long-term kind",
+    )
+    finalize.add_argument("--artifact-domain", help="Override the artifact domain")
+    finalize.add_argument("--artifact-topic", help="Override the artifact topic")
+    finalize.add_argument("--artifact-tag", action="append", default=[], help="Additional tag for the captured artifact; may be repeated")
     finalize.add_argument("--out-file", help="Write the full JSON result to a UTF-8 file")
 
     remember = subparsers.add_parser("remember", help="Explicitly write a memory while also recording its raw source")
@@ -361,6 +377,77 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def capture_reply_artifact(
+    root: Path,
+    args: argparse.Namespace,
+    reply: str,
+    raw_record: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not args.capture_artifact or not reply.strip():
+        return None
+
+    title = read_text_arg(args.artifact_title, args.artifact_title_file) or reply.splitlines()[0][:60].strip() or "Reply Artifact"
+    payload: dict[str, object] = {}
+    artifact_args = argparse.Namespace(
+        subject_id=args.subject_id,
+        subject_name=args.subject_name,
+        force_kind=args.artifact_kind,
+        use_underlying_kind=args.artifact_use_underlying_kind,
+        domain=args.artifact_domain,
+        topic=args.artifact_topic,
+        source=None,
+        start_at=None,
+        end_at=None,
+        confidence=None,
+        status=None,
+        tag=args.artifact_tag or [],
+        related_person=[],
+        related_event=[],
+        related_source=[],
+        slug=None,
+        mode="create",
+    )
+    classification = classify(title, reply, args.subject_id, args.subject_name)
+    final_payload = build_payload(classification, payload, artifact_args, title, reply)
+    final_payload["subject_id"] = args.subject_id
+    final_payload["subject_name"] = args.subject_name
+
+    if raw_record and raw_record.get("inserted"):
+        raw_source = f"raw_event:{raw_record['raw_event_id']}"
+        final_payload["source"] = raw_source
+        related_sources = list(final_payload.get("related_sources", []))
+        if raw_source not in related_sources:
+            related_sources.append(raw_source)
+        final_payload["related_sources"] = related_sources
+
+    written = write_payload(root, final_payload, skip_index=False)
+
+    if raw_record and raw_record.get("inserted"):
+        mark_raw_event_organized(
+            root,
+            int(raw_record["raw_event_id"]),
+            classifier_kind=str(classification["recommended_kind"]),
+            classifier_domain=str(classification["recommended_domain"]),
+            target_memory_kind=str(final_payload["kind"]),
+            target_memory_path=str(written["path"]),
+            note={
+                "origin": "reply-artifact",
+                "recommended_kind": classification["recommended_kind"],
+                "underlying_long_term_kind": classification["underlying_long_term_kind"],
+                "classification_confidence": classification["classification_confidence"],
+                "final_kind": final_payload["kind"],
+            },
+            link_role="reply-artifact",
+        )
+
+    return {
+        "status": "ok",
+        "classification": classification,
+        "final_payload": final_payload,
+        "written": written,
+    }
+
+
 def remember_memory(args: argparse.Namespace) -> dict[str, object]:
     root = store_root(args.store)
     bootstrap = ensure_store_ready(root)
@@ -492,6 +579,8 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
             allow_duplicate=args.allow_duplicate,
         )
 
+    artifact = capture_reply_artifact(root, args, reply, recorded)
+
     heartbeat = None
     if not args.skip_heartbeat:
         heartbeat_args = [
@@ -515,6 +604,7 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
         "command": "finalize-turn",
         "store_bootstrap": bootstrap,
         "recorded_raw_event": recorded,
+        "artifact": artifact,
         "heartbeat": heartbeat,
     }
     write_json_file(args.out_file, result)

@@ -139,7 +139,9 @@ def arg_or_payload(args: argparse.Namespace, payload: dict[str, object], attr: s
     return payload.get(attr, default)
 
 
-def preferred_filename(kind: str, slug: str) -> str:
+def preferred_filename(kind: str, slug: str, canonical: bool = False) -> str:
+    if canonical:
+        return f"{slug}.md"
     if kind in {"session", "candidate", "event", "archive"}:
         return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slug}.md"
     return f"{slug}.md"
@@ -156,10 +158,10 @@ def unique_path(path: Path) -> Path:
         counter += 1
 
 
-def resolve_path(root: Path, kind: str, slug: str, mode: str) -> Path:
+def resolve_path(root: Path, kind: str, slug: str, mode: str, canonical: bool = False) -> Path:
     folder = root / KIND_DIRS[kind]
     folder.mkdir(parents=True, exist_ok=True)
-    target = folder / preferred_filename(kind, slug)
+    target = folder / preferred_filename(kind, slug, canonical=canonical)
     if mode == "create":
         return unique_path(target)
     return target
@@ -187,6 +189,8 @@ def build_meta_from_payload(payload: dict[str, object], title: str) -> dict[str,
         "subject_id": str(payload.get("subject_id", "person-unknown")),
         "subject_name": str(payload.get("subject_name", "Unknown")),
         "memory_kind": kind,
+        "page_role": str(payload.get("page_role", "")),
+        "canonical": bool(payload.get("canonical", False)),
         "domain": str(payload.get("domain", "general")),
         "topic": str(payload.get("topic", slugify(title))),
         "tags": as_list(payload.get("tags", payload.get("tag", []))),
@@ -209,6 +213,8 @@ def build_meta(args: argparse.Namespace, payload: dict[str, object], title: str)
         "kind": kind,
         "subject_id": str(arg_or_payload(args, payload, "subject_id", "person-unknown")),
         "subject_name": str(arg_or_payload(args, payload, "subject_name", "Unknown")),
+        "page_role": str(payload.get("page_role", "")),
+        "canonical": bool(payload.get("canonical", False)),
         "domain": str(arg_or_payload(args, payload, "domain", "general")),
         "topic": str(arg_or_payload(args, payload, "topic", slugify(title))),
         "tags": as_list(arg_or_payload(args, payload, "tag", payload.get("tags", []))),
@@ -254,7 +260,7 @@ def append_body(existing_body: str, content: str) -> str:
 def run_indexing(store: Path) -> list[dict[str, object]]:
     base = Path(__file__).resolve().parent
     steps: list[dict[str, object]] = []
-    for script_name in ("reindex_memory.py", "score_memories.py"):
+    for script_name in ("reindex_memory.py", "score_memories.py", "build_views.py"):
         result = subprocess.run(
             [sys.executable, str(base / script_name), "--store", str(store)],
             check=True,
@@ -285,7 +291,7 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
         raise ValueError(f"Unsupported write mode: {mode}")
 
     slug = slugify(str(payload.get("slug", title)))
-    target = resolve_path(root, kind, slug, mode)
+    target = resolve_path(root, kind, slug, mode, canonical=bool(payload.get("canonical", False)))
     meta = build_meta_from_payload(payload, title)
 
     if mode == "append" and target.exists():

@@ -2,6 +2,8 @@
 subject_id: person-example
 subject_name: Example Person
 memory_kind: profile
+page_role: ""
+canonical: false
 domain: general
 topic: example-topic
 tags: []

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy",
         choices=["conservative", "balanced", "aggressive"],
-        default="balanced",
+        default="conservative",
         help="How aggressively to write directly into long-term layers",
     )
     parser.add_argument("--dry-run", action="store_true", help="Do not write or update any state")
@@ -122,8 +123,86 @@ def choose_target_kind(classification: dict[str, object], policy: str) -> str:
     return "candidate"
 
 
+QUESTION_PATTERNS = [
+    r"[？?]\s*$",
+    r"^(为什么|怎么|如何|请问|能不能|可不可以|是否|有没有|要不要|是不是)",
+    r"^(what|why|how|when|where|who|which|can you|could you|would you)\b",
+    r"(是什么|怎么办|是什么原因|有没有可能|吗[？?]?$|呢[？?]?$)",
+]
+
+CANONICAL_PAGE_MAP = {
+    "profile": ("person-profile", "人物画像"),
+    "state": ("state-current", "当前状态"),
+    "goal": ("goals-projects", "目标与项目"),
+    "relationship": ("relationships-current", "当前关系"),
+    "event": ("timeline-index", "时间线"),
+    "session": ("session-current", "当前会话"),
+    "candidate": ("candidate-pool", "候选池"),
+}
+
+
+def is_question_like(event: dict[str, object]) -> bool:
+    if str(event["source_type"]) != "conversation-user":
+        return False
+    text = str(event["content"] or "").strip()
+    normalized = text.casefold()
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in QUESTION_PATTERNS)
+
+
+def choose_auto_target_kind(event: dict[str, object], classification: dict[str, object], policy: str) -> str:
+    source_type = str(event["source_type"] or "")
+    recommended = str(classification["recommended_kind"])
+    if source_type in {"conversation-user", "conversation-assistant"}:
+        if recommended == "candidate":
+            return "candidate"
+        return "session"
+    return choose_target_kind(classification, policy)
+
+
+def canonical_page_title(event: dict[str, object], target_kind: str, domain: str) -> str:
+    subject_name = str(event["subject_name"] or "Unknown")
+    if target_kind == "domain":
+        domain_label = domain if domain and domain != "general" else "通用"
+        return f"{subject_name} · {domain_label}领域记忆"
+    _, title = CANONICAL_PAGE_MAP.get(target_kind, ("note", event["title"]))
+    return f"{subject_name} · {title}"
+
+
+def canonical_page_role(target_kind: str) -> str:
+    if target_kind == "domain":
+        return "domain-current"
+    return CANONICAL_PAGE_MAP.get(target_kind, ("note", ""))[0]
+
+
+def canonical_slug(event: dict[str, object], target_kind: str, domain: str) -> str:
+    subject_slug = slugify(str(event["subject_id"] or "subject-unknown"))
+    if target_kind == "domain":
+        domain_slug = slugify(domain or "general")
+        return f"{subject_slug}-domain-{domain_slug}"
+    page_slug = CANONICAL_PAGE_MAP.get(target_kind, ("note", ""))[0]
+    return f"{subject_slug}-{page_slug}"
+
+
+def canonical_content(event: dict[str, object], classification: dict[str, object]) -> str:
+    summary = first_sentence(str(event["content"] or "")).strip() or str(event["title"])
+    observed_at = str(event["event_time"] or event["created_at"] or "").strip()
+    lines = [
+        f"一句摘要：{summary}",
+        "",
+        f"- 原始事件：raw_event:{event['id']}",
+        f"- 来源类型：{event['source_type']}",
+    ]
+    if observed_at:
+        lines.append(f"- 观察时间：{observed_at}")
+    if event["source_ref"]:
+        lines.append(f"- 来源引用：{event['source_ref']}")
+    lines.append(f"- 初始分类：{classification['recommended_kind']} / {classification['recommended_domain']}")
+    lines.extend(["", "原始内容：", "", str(event["content"]).strip()])
+    return "\n".join(lines).strip()
+
+
 def build_payload_from_event(event: dict[str, object], classification: dict[str, object], policy: str) -> dict[str, object]:
-    target_kind = choose_target_kind(classification, policy)
+    target_kind = choose_auto_target_kind(event, classification, policy)
     suggested = dict(classification["suggested_payload"])
     underlying = str(classification["underlying_long_term_kind"])
     tags = list(suggested.get("tags", []))
@@ -141,21 +220,25 @@ def build_payload_from_event(event: dict[str, object], classification: dict[str,
         confidence = max(confidence, DEFAULT_CONFIDENCE[target_kind])
         status = DEFAULT_STATUS[target_kind]
 
+    domain = str(event["domain_hint"] or suggested.get("domain", "general"))
+
     return {
-        "title": event["title"],
-        "content": event["content"],
+        "title": canonical_page_title(event, target_kind, domain),
+        "content": canonical_content(event, classification),
         "kind": target_kind,
         "subject_id": event["subject_id"],
         "subject_name": event["subject_name"],
-        "domain": event["domain_hint"] or suggested.get("domain", "general"),
+        "page_role": canonical_page_role(target_kind),
+        "canonical": True,
+        "domain": domain,
         "topic": event["topic_hint"] or suggested.get("topic", slugify(event["title"])),
         "tags": tags,
         "status": status,
         "confidence": confidence,
         "source": f"raw_event:{event['id']}",
         "related_sources": [f"raw_event:{event['id']}"],
-        "slug": f"raw-{event['id']}-{slugify(event['title'])}",
-        "mode": "create",
+        "slug": canonical_slug(event, target_kind, domain),
+        "mode": "append",
         "start_at": event["event_time"] or "",
         "related_people": [],
         "related_events": [],
@@ -220,6 +303,50 @@ def process_subject(conn, root: Path, subject_id: str, max_events: int, policy: 
         title = event["topic_hint"] or first_sentence(event["content"])[:60] or f"raw-event-{event['id']}"
         event["title"] = title
         classification = classify(title, event["content"], event["subject_id"], event["subject_name"])
+
+        if is_question_like(event):
+            note = json.dumps(
+                {
+                    "policy": policy,
+                    "ignored_reason": "question_like_conversation_turn",
+                    "recommended_kind": classification["recommended_kind"],
+                },
+                ensure_ascii=False,
+            )
+            if not dry_run:
+                conn.execute(
+                    """
+                    UPDATE raw_events
+                    SET
+                        processed_state = 'ignored',
+                        processed_at = ?,
+                        batch_id = ?,
+                        classifier_kind = ?,
+                        classifier_domain = ?,
+                        note = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        iso_now(),
+                        batch_id,
+                        str(classification["recommended_kind"]),
+                        str(classification["recommended_domain"]),
+                        note,
+                        event["id"],
+                    ),
+                )
+            processed.append(
+                {
+                    "raw_event_id": event["id"],
+                    "title": title,
+                    "recommended_kind": classification["recommended_kind"],
+                    "target_kind": None,
+                    "path": None,
+                    "ignored": True,
+                }
+            )
+            continue
+
         payload = build_payload_from_event(event, classification, policy)
 
         if dry_run:
@@ -230,6 +357,7 @@ def process_subject(conn, root: Path, subject_id: str, max_events: int, policy: 
                     "recommended_kind": classification["recommended_kind"],
                     "target_kind": payload["kind"],
                     "path": None,
+                    "ignored": False,
                 }
             )
             continue
@@ -269,6 +397,7 @@ def process_subject(conn, root: Path, subject_id: str, max_events: int, policy: 
                 "recommended_kind": classification["recommended_kind"],
                 "target_kind": payload["kind"],
                 "path": memory_path,
+                "ignored": False,
             }
         )
 

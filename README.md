@@ -40,14 +40,15 @@ python scripts/memory_runtime.py remember --subject-id me --subject-name 我 --t
 如果你确实想把数据放到别处，再显式传 `--store <path>` 覆盖默认目录。
 
 如果你的宿主只能在每回合前后各调用一次脚本，这个仓库就已经能工作。
+现在默认是保守写回：
+
+- 对话回合默认先进入 `raw_events`
+- 自动整理默认只会下沉到 `session` 或 `candidate`
+- 长期层默认通过显式 `remember` 或受控 artifact capture 进入
 
 ## 它做什么
 
-- 记住“这个人是谁”
-- 记住“这个人现在怎样”
-- 记住“发生过哪些关键事件”
-- 记住“和谁有关、在推进什么、哪些信息还只是候选”
-
+- 记住  
 默认记忆层：
 
 - `profile`
@@ -73,7 +74,8 @@ python scripts/memory_runtime.py remember --subject-id me --subject-name 我 --t
 2. `prepare-context` 在回答前整理旧的 `pending` 事件，并检索相关记忆
 3. `finalize-turn` 在回答后记录助手回复，并在需要时继续整理
 4. `remember` 在用户明确要求时直接写入结构化记忆，同时保留来源
-5. 如果需要证据或时间线，再从 `raw_events` 下钻
+5. 如果需要把这次回答沉淀成正式记忆，可以在 `finalize-turn` 时显式打开 artifact capture
+6. 如果需要证据或时间线，再从 `raw_events` 下钻
 
 ## 主要入口
 
@@ -85,6 +87,17 @@ python scripts/memory_runtime.py remember --subject-id me --subject-name 我 --t
   - 显式写入记忆
 - `scripts/memory_runtime.py record-event`
   - 只记录原始事件，不立即整理
+
+## 现在多了什么
+
+- 自动生成 `memory-data/index.md`
+  - 给人和代理看的正式记忆导航页
+- 自动生成 `memory-data/log.md`
+  - 最近原始事件时间线
+- 自动生成 `memory-data/sources.md`
+  - 解释原始来源层和正式记忆层的分工
+- 新增 `scripts/lint_memory.py`
+  - 检查“对话被错误提升到长期层”“长期页缺少来源”“canonical 页重复”等问题
 
 ## 回答前怎么判断读哪层
 

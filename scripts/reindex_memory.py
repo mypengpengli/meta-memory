@@ -40,6 +40,36 @@ def infer_memory_kind(meta: dict[str, object], path: str) -> str:
     return "note"
 
 
+def infer_page_role(meta: dict[str, object], path: str, memory_kind: str) -> str:
+    role = str(meta.get("page_role", "")).strip()
+    if role:
+        return role
+    normalized = path.replace("\\", "/")
+    if normalized.endswith("/index.md"):
+        return "index"
+    if normalized.endswith("/log.md"):
+        return "log"
+    if normalized.endswith("/sources.md"):
+        return "sources"
+    if memory_kind == "profile":
+        return "profile-note"
+    if memory_kind == "state":
+        return "state-note"
+    if memory_kind == "goal":
+        return "goal-note"
+    if memory_kind == "relationship":
+        return "relationship-note"
+    if memory_kind == "event":
+        return "event-note"
+    if memory_kind == "domain":
+        return "domain-note"
+    if memory_kind == "session":
+        return "session-note"
+    if memory_kind == "candidate":
+        return "candidate-note"
+    return "note"
+
+
 def infer_domain(meta: dict[str, object], path: str) -> str:
     domain = str(meta.get("domain") or meta.get("area") or "").strip()
     if domain:
@@ -81,16 +111,18 @@ def main() -> None:
         conn.execute(
             """
             INSERT INTO documents(
-                path, title, subject_id, subject_name, memory_kind, domain, topic, tags, summary,
+                path, title, subject_id, subject_name, memory_kind, page_role, canonical, domain, topic, tags, summary,
                 confidence, status, source, start_at, end_at, related_people, related_events,
                 related_topics, related_sources, supersedes, replaced_by, mtime
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 title=excluded.title,
                 subject_id=excluded.subject_id,
                 subject_name=excluded.subject_name,
                 memory_kind=excluded.memory_kind,
+                page_role=excluded.page_role,
+                canonical=excluded.canonical,
                 domain=excluded.domain,
                 topic=excluded.topic,
                 tags=excluded.tags,
@@ -114,6 +146,8 @@ def main() -> None:
                 str(meta.get("subject_id", "")),
                 str(meta.get("subject_name", "")),
                 memory_kind,
+                infer_page_role(meta, doc_path, memory_kind),
+                1 if bool(meta.get("canonical", False)) else 0,
                 infer_domain(meta, doc_path),
                 str(meta.get("topic", "")),
                 json_text(meta.get("tags", [])),

@@ -62,6 +62,8 @@ DOCUMENT_COLUMNS = {
     "subject_id": "TEXT",
     "subject_name": "TEXT",
     "memory_kind": "TEXT",
+    "page_role": "TEXT",
+    "canonical": "INTEGER DEFAULT 0",
     "domain": "TEXT",
     "topic": "TEXT",
     "tags": "TEXT",

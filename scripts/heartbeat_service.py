@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy",
         choices=["conservative", "balanced", "aggressive"],
-        default="balanced",
+        default="conservative",
         help="How aggressively to write directly into long-term layers",
     )
     parser.add_argument("--skip-index", action="store_true", help="Skip the reindex/rescore pass")

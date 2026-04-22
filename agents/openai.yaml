@@ -1,4 +1,4 @@
 interface:
   display_name: "记忆技能"
-  short_description: "围绕具体人物加载、写回长期记忆。"
-  default_prompt: "使用 $memory-orchestrator 先读取这个人的画像、当前状态、关系和目标，再判断新信息该写回画像、状态、事件、关系、目标、会话还是候选池。"
+  short_description: "围绕具体人物准备记忆上下文、记录原始对话事件并保守写回"
+  default_prompt: "使用 $memory-orchestrator 在回答前通过 scripts/memory_runtime.py 准备记忆上下文，在回答后记录原始事件并保守写回；只有明确记住或显式捕获 artifact 时才进入长期层。"
