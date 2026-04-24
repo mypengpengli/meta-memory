@@ -1,47 +1,71 @@
 # Meta Memory
 
-**中文** | **English**
+面向 Codex / 智能体的本地优先、可解释、低上下文长期记忆系统。
 
-Meta Memory is a portable Codex skill and local runtime for long-term memory around a specific person or subject.
+Local-first, deterministic memory for Codex agents.
 
-它不是把所有历史一次性塞进上下文的 RAG 文件夹，而是一个“原始事件层 + 编译后的 Markdown 记忆层 + 运行时规则”的记忆系统。设计灵感来自 Andrej Karpathy 的 [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：知识应该持续沉淀成可维护的结构，而不是每次提问都从原始材料重新拼接。
+Meta Memory 解决的是一个很实际的问题：智能体如果没有长期记忆，每次对话都像第一次见你；但如果把所有历史都塞进上下文，又会慢、贵、混乱，还容易把无关旧信息带进当前回答。
 
-It follows the same core idea: raw sources stay as evidence, the agent maintains a compact compiled wiki, and each query reads only the pages needed for the current answer.
+所以这个项目不是一个“历史记录文件夹”，也不是简单 RAG。它更像一个给智能体用的记忆系统：先保存原始经历，再把稳定、重要、可复用的信息整理成结构化记忆，回答问题时只联想到当前最相关的一小部分。
 
-## 中文说明
+In short: Meta Memory is a local runtime that records raw events, compiles durable memories into Markdown, and retrieves only the relevant context for each turn.
 
-### 它解决什么
+适合这些场景：
 
-- 每轮对话前自动准备相关记忆上下文。
-- 每轮对话后记录原始用户/助手事件。
-- 用户明确要求“记住”时，把信息写入结构化长期记忆。
-- 默认保守写回，避免普通闲聊或未验证猜测污染长期层。
-- 通过脚本检索少量正相关记忆，避免全量读取 `memory-data/`。
+- 你希望智能体长期记住一个人、一个项目、一个客户或一个持续任务。
+- 你希望它每次回答前能自动想起相关背景，但不要读取全部历史。
+- 你希望记忆能追溯来源、能被人工审计、能被修正和替换。
+- 你不想把 embedding 当成唯一召回方式，希望召回过程更稳定、更可解释。
 
-### 工作方式
+## Why
 
-1. `raw_events` 保存原始证据和对话事件。
-2. Markdown 记忆页保存稳定、可复用、可人工审计的事实。
-3. SQLite 索引保存检索、命中、来源映射和处理状态。
-4. `prepare-context` 在回答前整理旧事件并返回 `context_markdown`。
-5. `finalize-turn` 在回答后记录助手回复并保守整理。
-6. `remember` 只在用户明确要求时写入长期记忆。
+普通聊天记录、RAG、embedding 搜索都能“找东西”，但个人长期记忆需要更严格的规则。原因很简单：
 
-关键设计取舍：
+- **不能什么都记成长期记忆**：一次闲聊、猜测、临时想法，不应该污染长期层。
+- **不能每次读全部历史**：记忆越多，上下文越大，回答越慢，也越容易跑偏。
+- **不能只靠模糊语义搜索**：embedding 有用，但它不总是稳定，尤其是你想精确找回某条关键记忆时。
+- **必须保留来源**：长期记忆应该能追溯到原始对话或事件，方便以后修正。
+- **必须能解释召回原因**：系统应该能告诉你为什么这条记忆被找出来，是标题命中、全文命中，还是通过某个主题联想到的。
 
-- `subject-id` 是隔离记忆的 scope/container，可以是 `person:lp`、`project:meta-memory`、`client:acme`。
-- `profile` 存稳定身份和偏好，`states` 存近期状态，`sessions` 存本轮任务状态。
-- 原始事件尽量 append-only；稳定 Markdown 记忆可以通过追加、替换、`supersedes` / `replaced_by` 表达更新。
-- 显式记忆可以带 `related_people`、`related_events`、`related_topics`、`related_sources`，检索会利用这些链接信号。
-- 默认不依赖 embedding；主路径是字段权重、SQLite FTS/BM25、关联扩展和生命周期排序。
-- 每条记忆有 `importance`，用于把高价值长期事实排在普通记录前面。
+Meta Memory 采用的是“确定性优先”的路线：字段权重、SQLite FTS/BM25、显式关联、多跳联想、生命周期、重要性排序和召回评测。embedding 以后可以作为可选兜底，但不是默认主路径。
 
-默认记忆层：
+## 中文概览
 
-- `profile`: 身份、长期偏好、稳定风格
+### 一句话理解
+
+你可以把它想成三层：
+
+1. **原始记录层**：先把对话、事件、回复原封不动记下来，相当于“经历”。
+2. **整理记忆层**：把真正稳定、有价值的信息整理成 Markdown，相当于“长期记忆”。
+3. **联想检索层**：回答前根据当前问题，只找出相关的少量记忆，相当于“想起来”。
+
+这和人脑比较像：人不会每次回答问题都回放一生经历，而是先想到几个相关主题，再顺着人物、事件、时间、目标继续联想。
+
+### 它具体做什么
+
+- 回答前运行 `prepare-context`，只返回相关的 `context_markdown`。
+- 回答后运行 `finalize-turn`，记录用户/助手原始事件。
+- 用户明确要求“记住”时运行 `remember`，写入结构化长期记忆。
+- 默认保守写回，普通对话先进入 `session` 或 `candidate`。
+- 不默认依赖 embedding，主召回路径是字段权重、SQLite FTS/BM25、关联扩展、生命周期和重要性排序。
+
+### 它怎么“联想”
+
+当你问一个问题时，它不会全量读取 `memory-data/`，而是按下面顺序找：
+
+1. 先按 `subject-id` 限定范围，比如 `person:me`、`project:meta-memory`。
+2. 再查标题、主题、标签、摘要、正文、人物、事件、来源。
+3. 如果命中了一条记忆，再沿着 `related_topics`、`related_people`、`related_events`、`related_sources` 扩展 1-2 跳。
+4. 最后按重要性、状态、是否过期、是否被替代、最近命中情况排序。
+
+这样做的目标是：既尽量不漏掉相关记忆，又不把无关历史塞进上下文。
+
+### 记忆层
+
+- `profile`: 稳定身份、长期偏好、固定风格
 - `states`: 当前状态、近期阶段变化
-- `events`: 关键事件和时间线
-- `relationships`: 重要人物、关系模式、边界
+- `events`: 关键事件、时间线、转折点
+- `relationships`: 重要人物、关系模式、沟通边界
 - `goals`: 长期目标、项目、约束
 - `domains`: 工作、学习、健康、财务、日常等领域经验
 - `sessions`: 当前会话和短期任务状态
@@ -50,28 +74,67 @@ It follows the same core idea: raw sources stay as evidence, the agent maintains
 
 ### 快速开始
 
-第一次运行脚本会自动创建默认数据目录：
+第一次运行会自动创建：
 
-- Markdown: `memory-data/`
-- SQLite: `memory-data/db/memory_index.sqlite`
+- `memory-data/`: 默认本地记忆目录
+- `memory-data/db/memory_index.sqlite`: 检索、来源、状态索引
 
-回答前准备上下文：
+最常用的流程只有三步。
+
+第一步，回答前准备记忆上下文：
+
 
 ```bash
 python scripts/memory_runtime.py prepare-context \
-  --subject-id me \
+  --subject-id person:me \
   --subject-name 我 \
   --session-id session-20260424 \
   --query-file query.txt
 ```
 
-使用返回 JSON 里的 `context_markdown`，不要把完整 JSON 诊断、整个 `memory-data/` 或 `references/` 全量塞入上下文。
+只使用返回 JSON 里的 `context_markdown`。不要把完整 JSON、`memory-data/`、`references/` 或单个记忆文件全量塞进模型上下文。
 
-如果想扩大内部联想但不增加最终上下文，可以调大候选池或关联跳数：
+第二步，回答后记录助手回复：
+
+```bash
+python scripts/memory_runtime.py finalize-turn \
+  --subject-id person:me \
+  --subject-name 我 \
+  --session-id session-20260424 \
+  --reply-file reply.txt
+```
+
+第三步，用户明确要求“记住”时，再写入长期记忆：
+
+```bash
+python scripts/memory_runtime.py remember \
+  --subject-id person:me \
+  --subject-name 我 \
+  --title-file title.txt \
+  --content-file memory.txt \
+  --related-topic answer-style \
+  --importance 0.9 \
+  --use-underlying-kind
+```
+
+中文、多行文本、引号较多的内容，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`，避免 shell 编码和转义问题。
+
+## Recall Model
+
+Meta Memory currently uses an explainable, non-embedding default recall path:
+
+1. **Scope filter**: `--subject-id` isolates memory by person, project, client, or other container.
+2. **Direct field match**: title, topic, tags, summary, people, events, topics, sources.
+3. **Full-text recall**: SQLite FTS/BM25 indexes title, summary, body text, and relation fields.
+4. **Associative expansion**: after a direct hit, retrieval expands through shared `related_people`, `related_events`, `related_topics`, and `related_sources`.
+5. **Lifecycle ranking**: active memories rise; ended, superseded, or replaced memories fall or disappear.
+6. **Importance ranking**: each memory has `importance`; durable high-impact facts outrank ordinary notes.
+
+You can widen internal recall without increasing final context:
 
 ```bash
 python scripts/memory_runtime.py prepare-context \
-  --subject-id me \
+  --subject-id person:me \
   --subject-name 我 \
   --session-id session-20260424 \
   --query-file query.txt \
@@ -79,183 +142,53 @@ python scripts/memory_runtime.py prepare-context \
   --expand-hops 2
 ```
 
-回答后记录回复：
+The final prompt remains controlled by `--top-k` and `context_markdown`.
 
-```bash
-python scripts/memory_runtime.py finalize-turn \
-  --subject-id me \
-  --subject-name 我 \
-  --session-id session-20260424 \
-  --reply-file reply.txt
-```
+## Writeback Policy
 
-用户明确要求记住时：
+Default behavior is conservative:
 
-```bash
-python scripts/memory_runtime.py remember \
-  --subject-id me \
-  --subject-name 我 \
-  --title-file title.txt \
-  --content-file memory.txt \
-  --related-topic answer-style \
-  --use-underlying-kind
-```
+- Raw events are preserved first in `raw_events`.
+- Automatic organization writes to `session` or `candidate` by default.
+- Long-term layers should come from explicit `remember`, validated promotion, or intentional artifact capture.
+- Use `supersedes` / `replaced_by` or `status: superseded` for conflicts and replacements.
+- Do not promote normal user questions, one-off chat, unverified guesses, or long transcripts directly into long-term memory.
 
-中文、多行文本、引号较多的内容，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`，避免 shell 编码和转义问题。
+## As A Codex Skill
 
-### 作为 Codex Skill 使用
+`SKILL.md` is the agent-facing runtime contract. This `README.md` is for humans.
 
-把仓库作为一个 skill 放到 Codex 可发现的 skills 目录后，代理会先看到 `SKILL.md` 的 `name` 和 `description`。触发后默认只需要读取 `SKILL.md`，正常工作时运行 `scripts/memory_runtime.py` 即可。
+When the skill triggers, the agent should:
 
-自动加载边界：
+- Read `SKILL.md`.
+- Run `scripts/memory_runtime.py prepare-context` before answering.
+- Use only `context_markdown` as memory context.
+- Run `scripts/memory_runtime.py finalize-turn` after answering.
+- Run `scripts/memory_runtime.py remember` only for explicit durable memory.
 
-- 会加载：`SKILL.md`
-- 会执行：`scripts/memory_runtime.py`
-- 默认使用：`prepare-context` 返回的 `context_markdown`
-- 不默认读取：`README.md`、`references/`、`memory-data/`、单个记忆 Markdown 文件
-
-只有在运行时返回的信息不够、需要人工审计读取顺序、或排查写回分类问题时，才按需读取 `references/` 中的一份文件。
-
-### 维护
-
-```bash
-python scripts/run_maintenance.py
-```
-
-它会重建索引、评分和生成视图，并运行 lint。
-
-也可以单独检查：
-
-```bash
-python scripts/lint_memory.py
-```
-
-如果要持续验证“该召回的记忆没有漏”，准备一个 JSON 用例文件：
-
-```json
-[
-  {
-    "name": "answer style",
-    "query": "how should answers be structured",
-    "subject_id": "me",
-    "must_include": ["answer style preference"],
-    "must_not_include": ["obsolete"]
-  }
-]
-```
-
-然后运行：
-
-```bash
-python scripts/evaluate_retrieval.py --cases-file retrieval-cases.json --strict
-```
-
-生成视图：
-
-- `memory-data/index.md`: 正式记忆导航
-- `memory-data/log.md`: 原始事件时间线
-- `memory-data/sources.md`: 来源层和正式记忆层的映射
-
-## English
-
-### What It Does
-
-Meta Memory gives an agent a disciplined memory loop:
-
-- Load only relevant memories before answering.
-- Record raw user and assistant turns after answering.
-- Save explicit user-requested facts into structured long-term memory.
-- Keep automatic writeback conservative.
-- Avoid bulk-loading memory folders into the model context.
-
-### Architecture
-
-The system has three layers:
-
-- Raw events: immutable evidence from conversations and imports.
-- Compiled Markdown memory: stable, reviewable pages the agent maintains over time.
-- Runtime index: SQLite tables for search, scores, sources, and processing state.
-
-Design choices:
-
-- `subject-id` is the memory scope/container, for example `person:lp`, `project:meta-memory`, or `client:acme`.
-- `profile` is static identity and preference memory; `states` is recent dynamic state; `sessions` is short-lived task state.
-- Raw events are append-only evidence; compiled memories may be appended, replaced, or linked through `supersedes` / `replaced_by`.
-- Explicit memories can include `related_people`, `related_events`, `related_topics`, and `related_sources`; retrieval uses these link signals.
-- Embeddings are not the default path; recall uses weighted fields, SQLite FTS/BM25, association expansion, and lifecycle ranking.
-- Each memory has an `importance` score so durable high-impact facts outrank ordinary notes.
-
-The runtime flow is:
-
-1. `prepare-context` records the user request, organizes pending events conservatively, retrieves relevant memories, and returns `context_markdown`.
-2. The agent answers using only relevant memory context.
-3. `finalize-turn` records the assistant reply and optionally organizes the finished turn.
-4. `remember` writes durable facts when the user explicitly asks the agent to remember something.
-
-### Quick Start
-
-Prepare context before the answer:
-
-```bash
-python scripts/memory_runtime.py prepare-context \
-  --subject-id me \
-  --subject-name "Me" \
-  --session-id session-20260424 \
-  --query-file query.txt
-```
-
-Record the assistant reply after the answer:
-
-```bash
-python scripts/memory_runtime.py finalize-turn \
-  --subject-id me \
-  --subject-name "Me" \
-  --session-id session-20260424 \
-  --reply-file reply.txt
-```
-
-Explicitly remember a durable fact:
-
-```bash
-python scripts/memory_runtime.py remember \
-  --subject-id me \
-  --subject-name "Me" \
-  --title-file title.txt \
-  --content-file memory.txt \
-  --related-topic answer-style \
-  --use-underlying-kind
-```
-
-Use file-based arguments for multiline text, non-ASCII text, quotes, or host-generated payloads.
-
-### Context Discipline
-
-During normal skill use, the agent should rely on `context_markdown` from `prepare-context`.
-
-Do not load these by default:
+The agent should not load these by default:
 
 - `README.md`
 - `references/`
 - `memory-data/`
 - individual memory Markdown files
-- full JSON diagnostics from runtime output
+- full runtime JSON diagnostics
 
-Read references only when debugging, auditing, or manually deciding a loading/writeback policy.
+## Maintenance
 
-Retrieval is intentionally explainable. Runtime results expose `query_score`, `fts_score`, `association_score`, `lifecycle_score`, and `reasons` so missed or surprising recalls can be debugged without inspecting every memory file.
+Run the standard maintenance sequence:
 
-### Repository Layout
-
-```text
-SKILL.md                  Codex skill entrypoint
-agents/openai.yaml        UI metadata
-scripts/                  Runtime, indexing, retrieval, writeback, lint
-references/               On-demand design and policy references
-assets/templates/         Memory page templates
-memory-data/              Default local memory store, git-ignored
+```bash
+python scripts/run_maintenance.py
 ```
 
-### Validation
+This rebuilds indexes, scores, generated views, and lint checks.
+
+Run lint only:
+
+```bash
+python scripts/lint_memory.py
+```
 
 Compile scripts:
 
@@ -263,30 +196,82 @@ Compile scripts:
 python -m compileall scripts
 ```
 
-Validate the skill with Codex's skill validator:
+Validate the skill folder:
 
 ```bash
 python <path-to-skill-creator>/scripts/quick_validate.py .
 ```
 
-Run maintenance:
+## Retrieval Evaluation
 
-```bash
-python scripts/run_maintenance.py
+To stop guessing whether recall is good, create retrieval cases:
+
+```json
+[
+  {
+    "name": "answer style",
+    "query": "how should answers be structured",
+    "subject_id": "person:me",
+    "must_include": ["answer style preference"],
+    "must_not_include": ["obsolete"]
+  }
+]
 ```
 
-Evaluate retrieval quality:
+Run:
 
 ```bash
 python scripts/evaluate_retrieval.py --cases-file retrieval-cases.json --strict
 ```
 
-## Design Notes
+The evaluator reports `recall_at_k`, selected titles, missing expectations, and unexpected matches. This is the recommended way to improve recall over time.
 
-Meta Memory intentionally combines compiled Markdown memory with lightweight retrieval. The compiled layer makes knowledge compound across sessions; retrieval and strict context rules prevent the compiled layer from becoming a new source of context bloat.
+## Repository Layout
 
-The default policy is conservative: raw evidence is always preserved, candidates can be reviewed later, and long-term memory requires explicit or validated promotion.
+```text
+SKILL.md                  Agent-facing runtime contract
+agents/openai.yaml        UI metadata
+scripts/                  Runtime, indexing, retrieval, writeback, lint, evaluation
+references/               On-demand design and policy references
+assets/templates/         Memory note templates
+memory-data/              Default local memory store, git-ignored
+```
 
-The recall path intentionally avoids making embeddings mandatory. Embeddings can be useful as a semantic fallback, but personal memory needs deterministic, inspectable signals first: exact fields, full-text search, graph-like links, recency/usefulness, and explicit lifecycle metadata.
+Generated views inside `memory-data/`:
 
-The design is informed by the scoped memory and tool-first retrieval patterns in [supermemory](https://github.com/supermemoryai/supermemory) and the User/Session/Agent memory split and retrieve-generate-store loop in [mem0](https://github.com/mem0ai/mem0), but this repository stays local-first and dependency-light.
+- `index.md`: compiled memory navigation
+- `log.md`: raw event timeline
+- `sources.md`: source layer and memory-source mapping
+
+## English Quick Reference
+
+### What It Is
+
+Meta Memory is a local memory runtime for agents. It records raw events, writes durable memories into structured Markdown, and retrieves a small relevant context before each answer.
+
+### Core Commands
+
+```bash
+python scripts/memory_runtime.py prepare-context --subject-id person:me --subject-name "Me" --session-id session-1 --query-file query.txt
+python scripts/memory_runtime.py finalize-turn --subject-id person:me --subject-name "Me" --session-id session-1 --reply-file reply.txt
+python scripts/memory_runtime.py remember --subject-id person:me --subject-name "Me" --title-file title.txt --content-file memory.txt --use-underlying-kind
+```
+
+### Design Choices
+
+- `subject-id` is the memory scope/container.
+- `profile` stores stable identity and preferences.
+- `states` stores recent dynamic state.
+- `sessions` stores short-lived task state.
+- Raw events are append-only evidence.
+- Compiled memories are updated through append, replace, `supersedes`, or `replaced_by`.
+- Retrieval is deterministic by default: weighted fields, SQLite FTS/BM25, association expansion, lifecycle ranking, and importance ranking.
+- Embeddings are optional future fallback, not the primary recall path.
+
+## Design Influences
+
+- Andrej Karpathy's [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): compile durable knowledge instead of repeatedly rereading raw material.
+- [supermemory](https://github.com/supermemoryai/supermemory): scoped memory and tool-first retrieval.
+- [mem0](https://github.com/mem0ai/mem0): User/Session/Agent memory split and retrieve-generate-store loop.
+
+Meta Memory keeps those ideas local-first, dependency-light, and inspectable.
