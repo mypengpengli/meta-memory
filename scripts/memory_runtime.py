@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--heartbeat-max-events", type=int, default=20)
     prepare.add_argument("--top-k", type=int, default=6, help="Maximum retrieved memories")
     prepare.add_argument("--include-candidates", action="store_true", help="Allow candidate memories in retrieval")
-    prepare.add_argument("--no-basics", action="store_true", help="Do not force-include profile/state memories")
+    prepare.add_argument("--no-basics", action="store_true", help="Do not prioritize relevant profile/state memories")
     prepare.add_argument("--raw-limit", type=int, default=3, help="Maximum raw evidence snippets to include")
     prepare.add_argument("--skip-raw-evidence", action="store_true", help="Do not search raw events for evidence snippets")
     prepare.add_argument("--context-out-file", help="Write the rendered prompt context to a UTF-8 text file")
@@ -177,7 +177,6 @@ def format_memory_context(retrieved: dict[str, object], raw_evidence: dict[str, 
 
     selected = list(retrieved.get("selected", []))
     relevant_selected = [item for item in selected if float(item.get("query_score", 0.0) or 0.0) > 0.0]
-    fallback_selected = [item for item in selected if item not in relevant_selected]
 
     lines = [
         "# Memory Context",
@@ -188,12 +187,7 @@ def format_memory_context(retrieved: dict[str, object], raw_evidence: dict[str, 
         "## Retrieved Memories",
     ]
 
-    if relevant_selected:
-        display_selected = relevant_selected
-    elif evidence_rows:
-        display_selected = []
-    else:
-        display_selected = fallback_selected[:2]
+    display_selected = relevant_selected
 
     if not display_selected:
         lines.append("- No relevant structured memories were found.")

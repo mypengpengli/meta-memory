@@ -1,63 +1,63 @@
 ---
 name: memory-orchestrator
-description: 为一个具体人物或主体准备记忆上下文、记录原始对话事件，并把信息保守写回到 session/candidate 或显式沉淀到长期层。适合需要在多轮对话中通过 `scripts/memory_runtime.py prepare-context`、`finalize-turn`、`remember` 管理 profile/state/goal/relationship/event/domain 记忆，同时避免全量加载记忆文件或误污染长期层的场景。
+description: Prepare and persist per-person or per-subject memory for Codex conversations. Use when an agent must load only relevant profile/state/goal/relationship/event/domain/session memories before answering, record user and assistant turns after answering, explicitly remember user-requested facts, or maintain a raw-source plus compiled Markdown memory system without bulk-loading memory files. 为具体人物或主体准备记忆上下文、记录对话事件、保守写回 session/candidate，并在用户明确要求时沉淀长期记忆；适合需要自动加载相关记忆、自动记录回合、避免全量读取和误污染长期层的场景。
 ---
 
 # Memory Orchestrator
 
-把这个 Skill 当作“宿主前后置运行时”。
-默认先跑运行时，不先手工展开很多记忆文件。
+Treat this skill as a per-turn memory runtime, not as a folder to browse manually. / 把它当作每回合前后置运行时，不要默认展开记忆目录。
 
-按下面顺序使用：
+## Runtime Contract
 
-1. 回答前运行 `scripts/memory_runtime.py prepare-context`
-   - 读取返回的 `context_markdown`
-   - 只把相关上下文注入当前回答
-2. 回答后运行 `scripts/memory_runtime.py finalize-turn`
-   - 记录原始事件
-   - 让系统保守整理
-3. 用户明确要求“记住这个”时运行 `scripts/memory_runtime.py remember`
-4. 只有当一次回答本身值得沉淀时，才在 `finalize-turn` 上加 `--capture-artifact`
+1. Before answering, run `scripts/memory_runtime.py prepare-context`.
+   - Pass `--subject-id`, `--subject-name`, `--session-id`, and the current user request.
+   - Prefer `--query-file` for Chinese, multiline text, quotes, or host-provided content.
+   - Use only the returned `context_markdown` as memory context.
+   - Do not inject full `retrieved`, `raw_evidence`, `memory-data/`, or `references/` into the reply context unless debugging.
+2. Answer the user with current facts first, using retrieved memories only when relevant.
+3. After answering, run `scripts/memory_runtime.py finalize-turn`.
+   - Record the assistant reply with `--reply-file` when possible.
+   - Let the runtime organize conservatively.
+4. When the user explicitly says to remember/save a fact, run `scripts/memory_runtime.py remember`.
+   - Use `--title-file`, `--content-file`, or `--payload-file` for nontrivial text.
+   - Add `--use-underlying-kind` when accepting the classifier's long-term kind.
+5. Use `finalize-turn --capture-artifact` only when the assistant reply itself is durable knowledge worth filing.
 
-默认数据目录是 Skill 根目录下的 `memory-data/`。
-默认数据库文件是 `memory-data/db/memory_index.sqlite`。
-多行文本、中文引号或宿主传入内容优先走 `--query-file`、`--reply-file`、`--title-file`、`--content-file`、`--payload-file`。
+Default store: `memory-data/` under this skill directory. Default index: `memory-data/db/memory_index.sqlite`.
 
-默认写回规则：
+## Writeback Guardrails
 
-- 先写 `raw_events`
-- 自动整理默认只进 `session` / `candidate`
-- 长期层优先通过显式 `remember`
-- 用户问句不要直接进长期层
+- Always preserve raw evidence first in `raw_events`.
+- Automatic organization defaults to `session` or `candidate`.
+- Long-term layers (`profile`, `states`, `events`, `relationships`, `goals`, `domains`) should come from explicit `remember`, validated promotion, or intentional artifact capture.
+- Never promote a normal user question, one-off chat, unverified guess, or long raw transcript directly into long-term memory.
+- If unsure, keep it as `candidate` until later evidence confirms it.
 
-不要把 `references/` 当成默认上下文。
-只有在下面情况才补读参考文件：
+## Context Budget Rules
 
-- 运行时返回的上下文不够
-- 需要人工审计读取顺序或写回策略
-- 需要排查分类、canonical 页或来源映射问题
+- The skill trigger loads this `SKILL.md`; it should be enough for normal use.
+- Runtime scripts may be executed without reading their source.
+- `prepare-context` is the default retrieval surface; it returns positive-match memories in `context_markdown`.
+- Do not read generated `memory-data/index.md`, `memory-data/log.md`, `memory-data/sources.md`, or individual memory files unless `context_markdown` is insufficient.
+- Do not read `README.md` during normal skill use; it is for humans on GitHub.
 
-补读时，一次只读最相关的 1 份；不够再继续。
-建议顺序：
+## Optional References
 
-1. `references/reference-map.md`
-2. `references/loading-rules.md`
-3. `references/writeback-rules.md`
-4. `references/memory/index.md`
-5. `references/memory-system.md`
+Read at most one reference file at a time, only when the runtime result is insufficient or you are auditing behavior.
 
-维护时使用：
+- `references/reference-map.md`: choose which reference is relevant.
+- `references/loading-rules.md`: decide which memory layer to inspect manually.
+- `references/writeback-rules.md`: decide where new information belongs.
+- `references/memory/index.md`: inspect top-level memory page conventions.
+- `references/memory-system.md`: inspect the raw-source plus compiled-memory architecture.
 
-- `scripts/run_maintenance.py`
-  - 重建索引、评分、视图并跑 lint
-- `scripts/lint_memory.py`
-  - 检查错误提升、缺来源、重复 canonical 页
+Stop reading references as soon as you know the next action.
 
-系统会持续生成：
+## Maintenance
 
-- `memory-data/index.md`
-  - 正式记忆导航页
-- `memory-data/log.md`
-  - 原始事件时间线
-- `memory-data/sources.md`
-  - 来源层与正式记忆层分工
+- Run `scripts/run_maintenance.py` to rebuild indexes, scores, generated views, and lint checks.
+- Run `scripts/lint_memory.py` when auditing for missing sources, accidental long-term promotion, duplicate canonical pages, or stale structure.
+- Generated views are navigation aids only:
+  - `memory-data/index.md`
+  - `memory-data/log.md`
+  - `memory-data/sources.md`

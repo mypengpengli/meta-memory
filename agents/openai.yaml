@@ -1,4 +1,4 @@
 interface:
-  display_name: "记忆技能"
-  short_description: "围绕具体人物准备记忆上下文、记录原始对话事件并保守写回"
-  default_prompt: "使用 $memory-orchestrator 在回答前通过 scripts/memory_runtime.py 准备记忆上下文，在回答后记录原始事件并保守写回；只有明确记住或显式捕获 artifact 时才进入长期层。"
+  display_name: "Meta Memory / 记忆编排"
+  short_description: "Load only relevant per-person memories, record turns, and conservatively write back durable facts"
+  default_prompt: "Use $memory-orchestrator to run scripts/memory_runtime.py before answering, use only context_markdown as memory context, record the turn after answering, and write long-term memory only when explicitly requested or intentionally captured."

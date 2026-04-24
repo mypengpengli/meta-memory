@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-basics",
         action="store_true",
-        help="Do not force-include profile/state memories at the front",
+        help="Do not prioritize relevant profile/state memories at the front",
     )
     return parser.parse_args()
 
@@ -203,7 +203,8 @@ def select_basics(rows: list[dict[str, object]], top_k: int) -> list[dict[str, o
 
 def update_retrieval_stats(conn, selected: list[dict[str, object]], query: str, filters: dict[str, object]) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    for row in selected:
+    relevant_selected = [row for row in selected if float(row.get("query_score", 0.0) or 0.0) > 0.0]
+    for row in relevant_selected:
         hit_count = int(row["hit_count"] or 0) + 1
         confidence = float(row["score_confidence"] or row["confidence"] or 0.0)
         rank_score = round(math.log1p(hit_count) + confidence, 4)
@@ -222,7 +223,7 @@ def update_retrieval_stats(conn, selected: list[dict[str, object]], query: str, 
     payload = {
         "query": query,
         "filters": filters,
-        "used_paths": [row["path"] for row in selected],
+        "used_paths": [row["path"] for row in relevant_selected],
     }
     conn.execute(
         "INSERT INTO retrieval_log(used_paths) VALUES(?)",
@@ -327,16 +328,17 @@ def main() -> None:
         items.append(row)
 
     items.sort(key=lambda item: (float(item["total_score"]), float(item["query_score"])), reverse=True)
+    relevant_items = [item for item in items if float(item["query_score"]) > 0.0]
 
     selected: list[dict[str, object]] = []
     selected_paths: set[str] = set()
     if not args.no_basics:
-        for row in select_basics(items, args.top_k):
+        for row in select_basics(relevant_items, args.top_k):
             if row["path"] not in selected_paths:
                 selected.append(row)
                 selected_paths.add(str(row["path"]))
 
-    for row in items:
+    for row in relevant_items:
         if len(selected) >= args.top_k:
             break
         if row["path"] in selected_paths:

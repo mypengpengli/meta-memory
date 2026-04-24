@@ -1,132 +1,228 @@
 # Meta Memory
 
-`meta-memory` 是一个适合以 `SKILL` 方式分发的人物长期记忆系统。
-它的目标不是把所有信息一次性塞进上下文，而是：
+**中文** | **English**
 
-- 围绕一个具体的人建立长期记忆
-- 回答时只取最相关的少量记忆
-- 新信息先进入原始事件层，再逐步整理成稳定记忆
+Meta Memory is a portable Codex skill and local runtime for long-term memory around a specific person or subject.
 
-## Quick Start
+它不是把所有历史一次性塞进上下文的 RAG 文件夹，而是一个“原始事件层 + 编译后的 Markdown 记忆层 + 运行时规则”的记忆系统。设计灵感来自 Andrej Karpathy 的 [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：知识应该持续沉淀成可维护的结构，而不是每次提问都从原始材料重新拼接。
 
-默认按“每回合事件驱动”使用，不需要先手动初始化。
-第一次调用运行时入口时，仓库内的 `memory-data/` 会自动创建。
-默认数据位置固定为：
+It follows the same core idea: raw sources stay as evidence, the agent maintains a compact compiled wiki, and each query reads only the pages needed for the current answer.
 
-- Markdown 记忆：`memory-data/profile`、`memory-data/states`、`memory-data/candidates` 等
-- SQLite：`memory-data/db/memory_index.sqlite`
+## 中文说明
 
-只有在你明确想把数据放到别处时，才需要额外传 `--store`。
+### 它解决什么
 
-回答前：
+- 每轮对话前自动准备相关记忆上下文。
+- 每轮对话后记录原始用户/助手事件。
+- 用户明确要求“记住”时，把信息写入结构化长期记忆。
+- 默认保守写回，避免普通闲聊或未验证猜测污染长期层。
+- 通过脚本检索少量正相关记忆，避免全量读取 `memory-data/`。
 
-```text
-python scripts/memory_runtime.py prepare-context --subject-id me --subject-name 我 --session-id session-20260413 --query "我最近的睡眠状态有什么值得注意的吗？"
+### 工作方式
+
+1. `raw_events` 保存原始证据和对话事件。
+2. Markdown 记忆页保存稳定、可复用、可人工审计的事实。
+3. SQLite 索引保存检索、命中、来源映射和处理状态。
+4. `prepare-context` 在回答前整理旧事件并返回 `context_markdown`。
+5. `finalize-turn` 在回答后记录助手回复并保守整理。
+6. `remember` 只在用户明确要求时写入长期记忆。
+
+默认记忆层：
+
+- `profile`: 身份、长期偏好、稳定风格
+- `states`: 当前状态、近期阶段变化
+- `events`: 关键事件和时间线
+- `relationships`: 重要人物、关系模式、边界
+- `goals`: 长期目标、项目、约束
+- `domains`: 工作、学习、健康、财务、日常等领域经验
+- `sessions`: 当前会话和短期任务状态
+- `candidates`: 未验证、待观察、可能冲突的信息
+- `archive`: 原始来源和导入材料
+
+### 快速开始
+
+第一次运行脚本会自动创建默认数据目录：
+
+- Markdown: `memory-data/`
+- SQLite: `memory-data/db/memory_index.sqlite`
+
+回答前准备上下文：
+
+```bash
+python scripts/memory_runtime.py prepare-context \
+  --subject-id me \
+  --subject-name 我 \
+  --session-id session-20260424 \
+  --query-file query.txt
 ```
 
-回答后：
+使用返回 JSON 里的 `context_markdown`，不要把完整 JSON 诊断、整个 `memory-data/` 或 `references/` 全量塞入上下文。
 
-```text
-python scripts/memory_runtime.py finalize-turn --subject-id me --subject-name 我 --session-id session-20260413 --reply "最近睡眠里最值得注意的是它和晚饭时间可能有关，但目前还只是候选观察。"
+回答后记录回复：
+
+```bash
+python scripts/memory_runtime.py finalize-turn \
+  --subject-id me \
+  --subject-name 我 \
+  --session-id session-20260424 \
+  --reply-file reply.txt
 ```
 
 用户明确要求记住时：
 
-```text
-python scripts/memory_runtime.py remember --subject-id me --subject-name 我 --title 回答风格偏好 --content "长期更喜欢先给结论，再给解释。" --use-underlying-kind
+```bash
+python scripts/memory_runtime.py remember \
+  --subject-id me \
+  --subject-name 我 \
+  --title-file title.txt \
+  --content-file memory.txt \
+  --use-underlying-kind
 ```
 
-如果标题、内容带中文、多行文本，或者由宿主程序传入，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`。
-如果你确实想把数据放到别处，再显式传 `--store <path>` 覆盖默认目录。
+中文、多行文本、引号较多的内容，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`，避免 shell 编码和转义问题。
 
-如果你的宿主只能在每回合前后各调用一次脚本，这个仓库就已经能工作。
-现在默认是保守写回：
+### 作为 Codex Skill 使用
 
-- 对话回合默认先进入 `raw_events`
-- 自动整理默认只会下沉到 `session` 或 `candidate`
-- 长期层默认通过显式 `remember` 或受控 artifact capture 进入
+把仓库作为一个 skill 放到 Codex 可发现的 skills 目录后，代理会先看到 `SKILL.md` 的 `name` 和 `description`。触发后默认只需要读取 `SKILL.md`，正常工作时运行 `scripts/memory_runtime.py` 即可。
 
-## 它做什么
+自动加载边界：
 
-- 记住  
-默认记忆层：
+- 会加载：`SKILL.md`
+- 会执行：`scripts/memory_runtime.py`
+- 默认使用：`prepare-context` 返回的 `context_markdown`
+- 不默认读取：`README.md`、`references/`、`memory-data/`、单个记忆 Markdown 文件
 
-- `profile`
-- `states`
-- `events`
-- `relationships`
-- `goals`
-- `domains`
-- `sessions`
-- `candidates`
-- `archive`
+只有在运行时返回的信息不够、需要人工审计读取顺序、或排查写回分类问题时，才按需读取 `references/` 中的一份文件。
 
-## 它怎么工作
+### 维护
 
-这套系统是双层存储：
+```bash
+python scripts/run_maintenance.py
+```
 
-- Markdown：存稳定、可复用、可人工阅读的正式记忆
-- SQLite：存原始事件、索引、命中统计、处理状态、来源映射
+它会重建索引、评分和生成视图，并运行 lint。
 
-核心机制是：
+也可以单独检查：
 
-1. 新内容先进入 `raw_events`
-2. `prepare-context` 在回答前整理旧的 `pending` 事件，并检索相关记忆
-3. `finalize-turn` 在回答后记录助手回复，并在需要时继续整理
-4. `remember` 在用户明确要求时直接写入结构化记忆，同时保留来源
-5. 如果需要把这次回答沉淀成正式记忆，可以在 `finalize-turn` 时显式打开 artifact capture
-6. 如果需要证据或时间线，再从 `raw_events` 下钻
+```bash
+python scripts/lint_memory.py
+```
 
-## 主要入口
+生成视图：
 
-- `scripts/memory_runtime.py prepare-context`
-  - 回答前取上下文
-- `scripts/memory_runtime.py finalize-turn`
-  - 回答后记录回复并顺手整理
-- `scripts/memory_runtime.py remember`
-  - 显式写入记忆
-- `scripts/memory_runtime.py record-event`
-  - 只记录原始事件，不立即整理
+- `memory-data/index.md`: 正式记忆导航
+- `memory-data/log.md`: 原始事件时间线
+- `memory-data/sources.md`: 来源层和正式记忆层的映射
 
-## 现在多了什么
+## English
 
-- 自动生成 `memory-data/index.md`
-  - 给人和代理看的正式记忆导航页
-- 自动生成 `memory-data/log.md`
-  - 最近原始事件时间线
-- 自动生成 `memory-data/sources.md`
-  - 解释原始来源层和正式记忆层的分工
-- 新增 `scripts/lint_memory.py`
-  - 检查“对话被错误提升到长期层”“长期页缺少来源”“canonical 页重复”等问题
+### What It Does
 
-## 回答前怎么判断读哪层
+Meta Memory gives an agent a disciplined memory loop:
 
-- 问“这个人是谁”、长期偏好、稳定风格时，先读 `profile`
-- 问最近状态、近况、阶段变化时，先读 `states`
-- 问长期目标、项目、约束时，先读 `goals`
-- 问某个重要人物、关系、边界时，先读 `relationships`
-- 问关键事件、前后变化、原因、时间线时，先读 `events`
-- 问工作、学习、健康、财务等领域切面时，先读 `domains`
-- 问当前这轮任务做到哪、下一步是什么时，先读 `sessions`
-- 问还没证实、仍需观察的信息时，先读 `candidates`
-- 问证据、原话、原始记录时，再下钻 `archive`
+- Load only relevant memories before answering.
+- Record raw user and assistant turns after answering.
+- Save explicit user-requested facts into structured long-term memory.
+- Keep automatic writeback conservative.
+- Avoid bulk-loading memory folders into the model context.
 
-如果同时涉及多类内容，先从 `profile -> states -> goals` 开始，只有当前问题确实需要时再继续展开。
+### Architecture
 
-## 对外使用建议
+The system has three layers:
 
-如果你想把它发给别的智能体或宿主，优先保留 `SKILL + scripts + references` 这套结构。
-它比插件更容易移植，因为：
+- Raw events: immutable evidence from conversations and imports.
+- Compiled Markdown memory: stable, reviewable pages the agent maintains over time.
+- Runtime index: SQLite tables for search, scores, sources, and processing state.
 
-- 不依赖特定宿主的插件生命周期
-- 不要求后台常驻
-- 只要求宿主能在每回合前后调用脚本
+The runtime flow is:
 
-## 详细资料
+1. `prepare-context` records the user request, organizes pending events conservatively, retrieves relevant memories, and returns `context_markdown`.
+2. The agent answers using only relevant memory context.
+3. `finalize-turn` records the assistant reply and optionally organizes the finished turn.
+4. `remember` writes durable facts when the user explicitly asks the agent to remember something.
 
-更详细的设计、加载规则和参考模板在：
+### Quick Start
 
-- [references/memory/index.md](references/memory/index.md)
-- [references/loading-rules.md](references/loading-rules.md)
-- [references/reference-map.md](references/reference-map.md)
-- [SKILL.md](SKILL.md)
+Prepare context before the answer:
+
+```bash
+python scripts/memory_runtime.py prepare-context \
+  --subject-id me \
+  --subject-name "Me" \
+  --session-id session-20260424 \
+  --query-file query.txt
+```
+
+Record the assistant reply after the answer:
+
+```bash
+python scripts/memory_runtime.py finalize-turn \
+  --subject-id me \
+  --subject-name "Me" \
+  --session-id session-20260424 \
+  --reply-file reply.txt
+```
+
+Explicitly remember a durable fact:
+
+```bash
+python scripts/memory_runtime.py remember \
+  --subject-id me \
+  --subject-name "Me" \
+  --title-file title.txt \
+  --content-file memory.txt \
+  --use-underlying-kind
+```
+
+Use file-based arguments for multiline text, non-ASCII text, quotes, or host-generated payloads.
+
+### Context Discipline
+
+During normal skill use, the agent should rely on `context_markdown` from `prepare-context`.
+
+Do not load these by default:
+
+- `README.md`
+- `references/`
+- `memory-data/`
+- individual memory Markdown files
+- full JSON diagnostics from runtime output
+
+Read references only when debugging, auditing, or manually deciding a loading/writeback policy.
+
+### Repository Layout
+
+```text
+SKILL.md                  Codex skill entrypoint
+agents/openai.yaml        UI metadata
+scripts/                  Runtime, indexing, retrieval, writeback, lint
+references/               On-demand design and policy references
+assets/templates/         Memory page templates
+memory-data/              Default local memory store, git-ignored
+```
+
+### Validation
+
+Compile scripts:
+
+```bash
+python -m compileall scripts
+```
+
+Validate the skill with Codex's skill validator:
+
+```bash
+python <path-to-skill-creator>/scripts/quick_validate.py .
+```
+
+Run maintenance:
+
+```bash
+python scripts/run_maintenance.py
+```
+
+## Design Notes
+
+Meta Memory intentionally combines compiled Markdown memory with lightweight retrieval. The compiled layer makes knowledge compound across sessions; retrieval and strict context rules prevent the compiled layer from becoming a new source of context bloat.
+
+The default policy is conservative: raw evidence is always preserved, candidates can be reviewed later, and long-term memory requires explicit or validated promotion.
