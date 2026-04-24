@@ -259,6 +259,25 @@ def suggested_memory_confidence(kind: str, classification_confidence: float) -> 
     return classification_confidence
 
 
+def estimate_importance(kind: str, text: str, confidence: float) -> float:
+    base = {
+        "profile": 0.85,
+        "state": 0.65,
+        "event": 0.7,
+        "relationship": 0.7,
+        "goal": 0.75,
+        "domain": 0.65,
+        "session": 0.35,
+        "candidate": 0.25,
+    }.get(kind, 0.5)
+    if re.search(r"(重要|关键|核心|必须|不能忘|长期|稳定|原则|偏好|目标|important|critical|core|must remember|long-term|principle|preference|goal)", text, flags=re.IGNORECASE):
+        base += 0.12
+    if re.search(r"(暂时|可能|也许|未验证|待确认|随口|maybe|temporary|unverified|uncertain)", text, flags=re.IGNORECASE):
+        base -= 0.12
+    base += max(0.0, confidence - 0.6) * 0.2
+    return round(max(0.1, min(base, 1.0)), 2)
+
+
 def build_reasons(
     recommended: str,
     underlying: str,
@@ -287,6 +306,7 @@ def classify(title: str, content: str, subject_id: str, subject_name: str) -> di
     status = suggest_status(recommended, text)
     confidence = estimate_confidence(recommended, kind_scores)
     payload_confidence = suggested_memory_confidence(recommended, confidence)
+    importance = estimate_importance(recommended, text, confidence)
     tags = suggest_tags(text, domain, recommended)
     reasons = build_reasons(recommended, underlying, kind_reasons, domain_reasons)
 
@@ -314,6 +334,7 @@ def classify(title: str, content: str, subject_id: str, subject_name: str) -> di
             "tags": tags,
             "status": status,
             "confidence": payload_confidence,
+            "importance": importance,
         },
     }
     return result

@@ -34,6 +34,7 @@ It follows the same core idea: raw sources stay as evidence, the agent maintains
 - 原始事件尽量 append-only；稳定 Markdown 记忆可以通过追加、替换、`supersedes` / `replaced_by` 表达更新。
 - 显式记忆可以带 `related_people`、`related_events`、`related_topics`、`related_sources`，检索会利用这些链接信号。
 - 默认不依赖 embedding；主路径是字段权重、SQLite FTS/BM25、关联扩展和生命周期排序。
+- 每条记忆有 `importance`，用于把高价值长期事实排在普通记录前面。
 
 默认记忆层：
 
@@ -129,6 +130,26 @@ python scripts/run_maintenance.py
 python scripts/lint_memory.py
 ```
 
+如果要持续验证“该召回的记忆没有漏”，准备一个 JSON 用例文件：
+
+```json
+[
+  {
+    "name": "answer style",
+    "query": "how should answers be structured",
+    "subject_id": "me",
+    "must_include": ["answer style preference"],
+    "must_not_include": ["obsolete"]
+  }
+]
+```
+
+然后运行：
+
+```bash
+python scripts/evaluate_retrieval.py --cases-file retrieval-cases.json --strict
+```
+
 生成视图：
 
 - `memory-data/index.md`: 正式记忆导航
@@ -162,6 +183,7 @@ Design choices:
 - Raw events are append-only evidence; compiled memories may be appended, replaced, or linked through `supersedes` / `replaced_by`.
 - Explicit memories can include `related_people`, `related_events`, `related_topics`, and `related_sources`; retrieval uses these link signals.
 - Embeddings are not the default path; recall uses weighted fields, SQLite FTS/BM25, association expansion, and lifecycle ranking.
+- Each memory has an `importance` score so durable high-impact facts outrank ordinary notes.
 
 The runtime flow is:
 
@@ -251,6 +273,12 @@ Run maintenance:
 
 ```bash
 python scripts/run_maintenance.py
+```
+
+Evaluate retrieval quality:
+
+```bash
+python scripts/evaluate_retrieval.py --cases-file retrieval-cases.json --strict
 ```
 
 ## Design Notes

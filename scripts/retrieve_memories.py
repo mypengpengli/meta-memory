@@ -218,6 +218,7 @@ def base_score(row: dict[str, object]) -> float:
     kind = str(row["memory_kind"])
     status = str(row["status"])
     score = rank_score + KIND_BIAS.get(kind, 0.4) + STATUS_BIAS.get(status, 0.0)
+    score += max(0.0, min(float(row.get("importance", 0.5) or 0.5), 1.0))
     page_role = str(row.get("page_role", "") or "")
     score += PAGE_ROLE_BIAS.get(page_role, 0.0)
     if int(row.get("canonical", 0) or 0) == 1:
@@ -473,6 +474,7 @@ def main() -> None:
             d.tags,
             d.summary,
             d.confidence,
+            d.importance,
             d.status,
             d.source,
             d.start_at,
@@ -508,6 +510,7 @@ def main() -> None:
         "tags",
         "summary",
         "confidence",
+        "importance",
         "status",
         "source",
         "start_at",
@@ -600,6 +603,7 @@ def main() -> None:
                     "domain": row["domain"],
                     "topic": row["topic"],
                     "summary": row["summary"],
+                    "importance": row["importance"],
                     "score": row["total_score"],
                     "query_score": row["query_score"],
                     "fts_score": row["fts_score"],

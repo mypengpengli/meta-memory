@@ -10,6 +10,7 @@ tags: []
 start_at: ""
 end_at: ""
 confidence: 0.7
+importance: 0.5
 status: active
 source: ""
 related_people: []

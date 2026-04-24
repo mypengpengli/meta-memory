@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -33,6 +34,18 @@ DEFAULT_CONFIDENCE = {
     "session": 0.5,
     "candidate": 0.3,
     "archive": 1.0,
+}
+
+DEFAULT_IMPORTANCE = {
+    "profile": 0.85,
+    "state": 0.65,
+    "event": 0.7,
+    "relationship": 0.7,
+    "goal": 0.75,
+    "domain": 0.65,
+    "session": 0.35,
+    "candidate": 0.25,
+    "archive": 0.4,
 }
 
 DEFAULT_STATUS = {
@@ -70,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-at", help="When this memory started to apply")
     parser.add_argument("--end-at", help="When this memory stopped applying")
     parser.add_argument("--confidence", type=float, help="Confidence score")
+    parser.add_argument("--importance", type=float, help="Importance score from 0.0 to 1.0")
     parser.add_argument("--status", help="Memory status")
     parser.add_argument("--tag", action="append", default=[], help="Tag; may be repeated")
     parser.add_argument(
@@ -189,8 +203,73 @@ def merge_unique(existing: object, new_items: list[str]) -> list[object]:
     return merged
 
 
-def build_meta_from_payload(payload: dict[str, object], title: str) -> dict[str, object]:
+GENERIC_TOPICS = {
+    "general",
+    "memory",
+    "note",
+    "untitled",
+    "current",
+    "active",
+    "session",
+    "candidate",
+}
+
+
+def clamp_score(value: object, default: float) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        score = default
+    return round(max(0.0, min(score, 1.0)), 2)
+
+
+def normalize_topic(value: str) -> str:
+    text = value.strip().strip("`'\"“”‘’()[]{}<>")
+    text = re.sub(r"\s+", "-", text)
+    text = text.strip("-_.:/").casefold()
+    if len(text) < 3 or text in GENERIC_TOPICS:
+        return ""
+    return text[:80]
+
+
+def derive_related_topics(title: str, content: str, payload: dict[str, object]) -> list[str]:
+    text = "\n".join(
+        [
+            title,
+            content,
+            str(payload.get("topic", "")),
+            " ".join(as_list(payload.get("tags", []))),
+        ]
+    )
+    candidates: list[str] = []
+    patterns = [
+        r"`([^`\n]{3,80})`",
+        r"#([A-Za-z0-9_\-./:\u4e00-\u9fff]{3,80})",
+        r"\b[A-Za-z][A-Za-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9_.:/-]{1,79}\b",
+        r"\b[A-Za-z0-9]+(?:[-./_][A-Za-z0-9]+){1,}\b",
+        r"\b[A-Z][A-Za-z0-9]{2,}(?:[A-Z][a-z0-9]+)+\b",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            if isinstance(match, tuple):
+                raw = next((item for item in match if item), "")
+            else:
+                raw = match
+            topic = normalize_topic(str(raw))
+            if topic and topic not in candidates:
+                candidates.append(topic)
+    explicit_topic = normalize_topic(str(payload.get("topic", "")))
+    if explicit_topic and explicit_topic not in candidates:
+        candidates.insert(0, explicit_topic)
+    return candidates[:12]
+
+
+def build_meta_from_payload(payload: dict[str, object], title: str, content: str = "") -> dict[str, object]:
     kind = str(payload.get("kind", "candidate"))
+    related_topics = merge_unique(
+        as_list(payload.get("related_topics", payload.get("related_topic", []))),
+        derive_related_topics(title, content, payload),
+    )
     return {
         "subject_id": str(payload.get("subject_id", "person-unknown")),
         "subject_name": str(payload.get("subject_name", "Unknown")),
@@ -203,11 +282,12 @@ def build_meta_from_payload(payload: dict[str, object], title: str) -> dict[str,
         "start_at": str(payload.get("start_at", "")),
         "end_at": str(payload.get("end_at", "")),
         "confidence": float(payload.get("confidence", DEFAULT_CONFIDENCE[kind])),
+        "importance": clamp_score(payload.get("importance", DEFAULT_IMPORTANCE[kind]), DEFAULT_IMPORTANCE[kind]),
         "status": str(payload.get("status", DEFAULT_STATUS[kind])),
         "source": str(payload.get("source", "")),
         "related_people": as_list(payload.get("related_people", payload.get("related_person", []))),
         "related_events": as_list(payload.get("related_events", payload.get("related_event", []))),
-        "related_topics": as_list(payload.get("related_topics", payload.get("related_topic", []))),
+        "related_topics": related_topics,
         "related_sources": as_list(payload.get("related_sources", payload.get("related_source", []))),
         "supersedes": as_list(payload.get("supersedes", [])),
         "replaced_by": as_list(payload.get("replaced_by", [])),
@@ -235,6 +315,10 @@ def build_meta(args: argparse.Namespace, payload: dict[str, object], title: str)
                 DEFAULT_CONFIDENCE[kind],
             )
         ),
+        "importance": clamp_score(
+            arg_or_payload(args, payload, "importance", DEFAULT_IMPORTANCE[kind]),
+            DEFAULT_IMPORTANCE[kind],
+        ),
         "status": str(arg_or_payload(args, payload, "status", DEFAULT_STATUS[kind])),
         "source": str(arg_or_payload(args, payload, "source", "")),
         "related_people": as_list(
@@ -252,7 +336,7 @@ def build_meta(args: argparse.Namespace, payload: dict[str, object], title: str)
         "supersedes": as_list(payload.get("supersedes", [])),
         "replaced_by": as_list(payload.get("replaced_by", [])),
     }
-    return build_meta_from_payload(merged_payload, title)
+    return build_meta_from_payload(merged_payload, title, str(payload.get("content", "")))
 
 
 def build_body(title: str, content: str) -> str:
@@ -302,7 +386,7 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
 
     slug = slugify(str(payload.get("slug", title)))
     target = resolve_path(root, kind, slug, mode, canonical=bool(payload.get("canonical", False)))
-    meta = build_meta_from_payload(payload, title)
+    meta = build_meta_from_payload(payload, title, content)
 
     if mode == "append" and target.exists():
         existing_meta, existing_body = split_frontmatter(read_text(target))
@@ -374,6 +458,10 @@ def main() -> None:
                 "confidence",
                 DEFAULT_CONFIDENCE[kind],
             )
+        ),
+        "importance": clamp_score(
+            arg_or_payload(args, payload, "importance", DEFAULT_IMPORTANCE[kind]),
+            DEFAULT_IMPORTANCE[kind],
         ),
         "status": str(arg_or_payload(args, payload, "status", DEFAULT_STATUS[kind])),
         "source": str(arg_or_payload(args, payload, "source", "")),

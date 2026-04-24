@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-at", help="Override start time")
     parser.add_argument("--end-at", help="Override end time")
     parser.add_argument("--confidence", type=float, help="Override confidence")
+    parser.add_argument("--importance", type=float, help="Override importance score from 0.0 to 1.0")
     parser.add_argument("--status", help="Override status")
     parser.add_argument("--tag", action="append", default=[], help="Additional tag; may be repeated")
     parser.add_argument("--related-person", action="append", default=[], help="Related person; may be repeated")
@@ -129,6 +130,11 @@ def build_payload(
         final_payload["confidence"] = args.confidence
     elif "confidence" in payload and payload["confidence"] not in (None, ""):
         final_payload["confidence"] = payload["confidence"]
+
+    if args.importance is not None:
+        final_payload["importance"] = args.importance
+    elif "importance" in payload and payload["importance"] not in (None, ""):
+        final_payload["importance"] = payload["importance"]
 
     final_payload["tags"] = merge_unique(
         as_list(payload.get("tags", suggested.get("tags", []))),

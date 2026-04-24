@@ -167,14 +167,15 @@ def main() -> None:
         summary = first_summary_line(path)
         memory_kind = infer_memory_kind(meta, doc_path)
         confidence = as_float(meta.get("confidence"), 0.5 if memory_kind != "candidate" else 0.3)
+        importance = as_float(meta.get("importance"), 0.5)
         conn.execute(
             """
             INSERT INTO documents(
                 path, title, subject_id, subject_name, memory_kind, page_role, canonical, domain, topic, tags, summary,
-                confidence, status, source, start_at, end_at, related_people, related_events,
+                confidence, importance, status, source, start_at, end_at, related_people, related_events,
                 related_topics, related_sources, supersedes, replaced_by, mtime
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 title=excluded.title,
                 subject_id=excluded.subject_id,
@@ -187,6 +188,7 @@ def main() -> None:
                 tags=excluded.tags,
                 summary=excluded.summary,
                 confidence=excluded.confidence,
+                importance=excluded.importance,
                 status=excluded.status,
                 source=excluded.source,
                 start_at=excluded.start_at,
@@ -212,6 +214,7 @@ def main() -> None:
                 json_text(meta.get("tags", [])),
                 summary,
                 confidence,
+                importance,
                 str(meta.get("status", "pending" if memory_kind == "candidate" else "active")),
                 json_text(meta.get("source", meta.get("related_sources", ""))),
                 str(meta.get("start_at", "")),

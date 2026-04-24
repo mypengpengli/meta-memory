@@ -114,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     remember.add_argument("--start-at", help="Override start time")
     remember.add_argument("--end-at", help="Override end time")
     remember.add_argument("--confidence", type=float, help="Override confidence")
+    remember.add_argument("--importance", type=float, help="Override importance score from 0.0 to 1.0")
     remember.add_argument("--status", help="Override status")
     remember.add_argument("--tag", action="append", default=[], help="Additional tag; may be repeated")
     remember.add_argument("--related-person", action="append", default=[], help="Related person; may be repeated")
@@ -400,6 +401,7 @@ def capture_reply_artifact(
         start_at=None,
         end_at=None,
         confidence=None,
+        importance=None,
         status=None,
         tag=args.artifact_tag or [],
         related_person=[],

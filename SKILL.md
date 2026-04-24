@@ -38,6 +38,7 @@ Default store: `memory-data/` under this skill directory. Default index: `memory
 - Direct recall: title, topic, tags, summary, relationship fields, and indexed body text.
 - Associative recall: after a direct hit, expand through shared people, events, topics, and sources for up to `--expand-hops` hops.
 - Lifecycle ranking: active and recently useful memories rise; ended, superseded, or replaced memories fall or disappear.
+- Importance ranking: `importance` is stored per memory and participates in ranking; use higher values only for durable, high-impact facts.
 - Keep `--top-k` small for prompt context; use `--candidate-pool` only to widen internal ranking.
 - Do not add embedding retrieval as the primary path unless the user explicitly chooses it; if added later, treat it as an optional fallback.
 
@@ -74,6 +75,7 @@ Stop reading references as soon as you know the next action.
 
 - Run `scripts/run_maintenance.py` to rebuild indexes, scores, generated views, and lint checks.
 - Run `scripts/lint_memory.py` when auditing for missing sources, accidental long-term promotion, duplicate canonical pages, or stale structure.
+- Run `scripts/evaluate_retrieval.py --cases-file <cases.json>` when auditing whether important queries still recall expected memories.
 - Generated views are navigation aids only:
   - `memory-data/index.md`
   - `memory-data/log.md`

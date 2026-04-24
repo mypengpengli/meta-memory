@@ -69,6 +69,7 @@ DOCUMENT_COLUMNS = {
     "tags": "TEXT",
     "summary": "TEXT",
     "confidence": "REAL",
+    "importance": "REAL DEFAULT 0.5",
     "status": "TEXT",
     "source": "TEXT",
     "start_at": "TEXT",
