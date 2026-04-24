@@ -30,6 +30,35 @@ STATUS_BIAS = {
 }
 
 BASIC_KINDS = ["profile", "state"]
+MAX_EXPAND_HOPS = 2
+STOP_TERMS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "how",
+    "is",
+    "me",
+    "my",
+    "of",
+    "the",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "我",
+    "你",
+    "什么",
+    "怎么",
+    "如何",
+    "今天",
+    "现在",
+}
 
 PAGE_ROLE_BIAS = {
     "person-profile": 1.6,
@@ -50,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", help="The current question or task")
     parser.add_argument("--query-file", help="Read the query from a UTF-8 text file")
     parser.add_argument("--top-k", type=int, default=6, help="Maximum memories to return")
+    parser.add_argument("--candidate-pool", type=int, default=24, help="Maximum internally ranked candidates before final trimming")
+    parser.add_argument("--expand-hops", type=int, default=1, help="Association expansion hops through related fields, 0-2")
     parser.add_argument("--subject-id", help="Filter by subject_id")
     parser.add_argument("--subject-name", help="Filter by subject_name")
     parser.add_argument("--domain", action="append", default=[], help="Filter by domain; may be repeated")
@@ -108,7 +139,7 @@ def query_terms(text: str) -> list[str]:
             if len(run) >= width:
                 for idx in range(0, len(run) - width + 1):
                     terms.add(run[idx : idx + width])
-    return sorted(terms, key=len, reverse=True)
+    return sorted((term for term in terms if term not in STOP_TERMS), key=len, reverse=True)
 
 
 def text_fields(row: dict[str, object]) -> dict[str, str]:
@@ -122,6 +153,7 @@ def text_fields(row: dict[str, object]) -> dict[str, str]:
         "related_people": normalize_text(" ".join(parse_json_list(str(row["related_people"])))),
         "related_events": normalize_text(" ".join(parse_json_list(str(row["related_events"])))),
         "related_topics": normalize_text(" ".join(parse_json_list(str(row["related_topics"])))),
+        "related_sources": normalize_text(" ".join(parse_json_list(str(row["related_sources"])))),
         "subject_name": normalize_text(str(row["subject_name"])),
     }
 
@@ -168,6 +200,9 @@ def relevance(row: dict[str, object], query: str, terms: list[str]) -> tuple[flo
         if term in fields["related_topics"]:
             term_score += 1.0
             term_reasons.append(f"related_topics:{term}")
+        if term in fields["related_sources"]:
+            term_score += 0.7
+            term_reasons.append(f"related_sources:{term}")
         if term in fields["subject_name"]:
             term_score += 1.0
             term_reasons.append(f"subject:{term}")
@@ -192,6 +227,24 @@ def base_score(row: dict[str, object]) -> float:
     return score
 
 
+def lifecycle_score(row: dict[str, object]) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons: list[str] = []
+    status = str(row.get("status", "") or "").casefold()
+    replaced_by = parse_json_list(str(row.get("replaced_by", "") or ""))
+    if status == "superseded" or replaced_by:
+        score -= 5.0
+        reasons.append("lifecycle:superseded")
+    if row.get("end_at"):
+        score -= 0.8
+        reasons.append("lifecycle:ended")
+    if status == "active":
+        score += 0.2
+    if row.get("last_hit_at"):
+        score += 0.2
+    return score, reasons[:2]
+
+
 def select_basics(rows: list[dict[str, object]], top_k: int) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     for kind in BASIC_KINDS:
@@ -203,6 +256,136 @@ def select_basics(rows: list[dict[str, object]], top_k: int) -> list[dict[str, o
         if preferred:
             selected.append(preferred)
     return selected
+
+
+def quote_fts_term(term: str) -> str:
+    return '"' + term.replace('"', '""') + '"'
+
+
+def fts_query(terms: list[str]) -> str:
+    selected = [term for term in terms if len(term) >= 2][:18]
+    return " OR ".join(quote_fts_term(term) for term in selected)
+
+
+def fts_scores(conn, terms: list[str], filters: dict[str, object], limit: int) -> dict[str, tuple[float, str]]:
+    query = fts_query(terms)
+    if not query:
+        return {}
+
+    clauses = ["document_fts MATCH ?"]
+    params: list[object] = [query]
+    subject_id = str(filters.get("subject_id") or "")
+    subject_name = str(filters.get("subject_name") or "")
+    domains = [str(item).casefold() for item in filters.get("domains", [])]
+    kinds = [str(item).casefold() for item in filters.get("memory_kinds", [])]
+    include_candidates = bool(filters.get("include_candidates", False))
+
+    if subject_id:
+        clauses.append("d.subject_id = ?")
+        params.append(subject_id)
+    if subject_name:
+        clauses.append("LOWER(d.subject_name) = ?")
+        params.append(subject_name.casefold())
+    if domains:
+        placeholders = ", ".join("?" for _ in domains)
+        clauses.append(f"LOWER(d.domain) IN ({placeholders})")
+        params.extend(domains)
+    if kinds:
+        placeholders = ", ".join("?" for _ in kinds)
+        clauses.append(f"LOWER(d.memory_kind) IN ({placeholders})")
+        params.extend(kinds)
+    if not include_candidates:
+        clauses.append("LOWER(d.memory_kind) != 'candidate'")
+    clauses.append("LOWER(COALESCE(d.status, '')) != 'superseded'")
+    clauses.append("(COALESCE(d.replaced_by, '') = '' OR COALESCE(d.replaced_by, '') = '[]')")
+
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT d.path, bm25(document_fts) AS rank
+            FROM document_fts
+            JOIN documents AS d ON d.path = document_fts.path
+            WHERE {' AND '.join(clauses)}
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+    except Exception:
+        return {}
+
+    scores: dict[str, tuple[float, str]] = {}
+    total = max(len(rows), 1)
+    for idx, (path, _rank) in enumerate(rows):
+        score = round(3.0 * (total - idx) / total, 4)
+        scores[str(path)] = (score, "fts/bm25")
+    return scores
+
+
+def link_values(row: dict[str, object]) -> dict[str, set[str]]:
+    values = {
+        "related_people": set(parse_json_list(str(row.get("related_people", "") or ""))),
+        "related_events": set(parse_json_list(str(row.get("related_events", "") or ""))),
+        "related_topics": set(parse_json_list(str(row.get("related_topics", "") or ""))),
+        "related_sources": set(parse_json_list(str(row.get("related_sources", "") or ""))),
+    }
+    topic = str(row.get("topic", "") or "").strip()
+    if topic:
+        values["related_topics"].add(topic)
+    source = str(row.get("source", "") or "").strip()
+    if source:
+        values["related_sources"].add(source)
+    return {key: {normalize_text(item) for item in items if normalize_text(item)} for key, items in values.items()}
+
+
+def expand_associations(items: list[dict[str, object]], expand_hops: int) -> None:
+    hops = max(0, min(expand_hops, MAX_EXPAND_HOPS))
+    if hops <= 0:
+        return
+
+    activated = {
+        str(item["path"])
+        for item in items
+        if float(item.get("query_score", 0.0) or 0.0) > 0.0 or float(item.get("fts_score", 0.0) or 0.0) > 0.0
+    }
+    frontier = [item for item in items if str(item["path"]) in activated]
+
+    for hop in range(1, hops + 1):
+        if not frontier:
+            return
+        seeds: dict[str, set[str]] = {
+            "related_people": set(),
+            "related_events": set(),
+            "related_topics": set(),
+            "related_sources": set(),
+        }
+        for item in frontier:
+            for key, values in link_values(item).items():
+                seeds[key].update(values)
+
+        next_frontier: list[dict[str, object]] = []
+        for item in items:
+            path = str(item["path"])
+            if path in activated:
+                continue
+            overlaps: list[str] = []
+            values = link_values(item)
+            for key, weight in [
+                ("related_topics", 1.2),
+                ("related_people", 1.1),
+                ("related_events", 1.0),
+                ("related_sources", 0.8),
+            ]:
+                shared = sorted(values[key] & seeds[key])
+                if shared:
+                    item["association_score"] = float(item.get("association_score", 0.0) or 0.0) + (weight / hop)
+                    overlaps.append(f"{key}:{shared[0]}")
+            if overlaps:
+                item.setdefault("reasons", [])
+                item["reasons"] = list(item["reasons"]) + [f"hop{hop}:{overlaps[0]}"]
+                activated.add(path)
+                next_frontier.append(item)
+        frontier = next_frontier
 
 
 def update_retrieval_stats(conn, selected: list[dict[str, object]], query: str, filters: dict[str, object]) -> None:
@@ -243,6 +426,15 @@ def main() -> None:
     conn = open_db(root)
     domains = [item.casefold() for item in args.domain]
     kinds = [item.casefold() for item in args.memory_kind]
+    filters = {
+        "subject_id": args.subject_id or "",
+        "subject_name": args.subject_name or "",
+        "domains": args.domain,
+        "memory_kinds": args.memory_kind,
+        "include_candidates": args.include_candidates,
+    }
+    terms = query_terms(query)
+    fts_score_map = fts_scores(conn, terms, filters, max(args.candidate_pool, args.top_k * 4))
 
     clauses = []
     params: list[object] = []
@@ -262,6 +454,8 @@ def main() -> None:
         params.extend(kinds)
     if not args.include_candidates:
         clauses.append("LOWER(d.memory_kind) != 'candidate'")
+    clauses.append("LOWER(COALESCE(d.status, '')) != 'superseded'")
+    clauses.append("(COALESCE(d.replaced_by, '') = '' OR COALESCE(d.replaced_by, '') = '[]')")
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = conn.execute(
@@ -286,6 +480,10 @@ def main() -> None:
             d.related_people,
             d.related_events,
             d.related_topics,
+            d.related_sources,
+            d.supersedes,
+            d.replaced_by,
+            d.mtime,
             COALESCE(s.hit_count, 0) AS hit_count,
             COALESCE(s.confidence, d.confidence, 0.0) AS score_confidence,
             COALESCE(s.rank_score, 0.0) AS rank_score,
@@ -317,24 +515,50 @@ def main() -> None:
         "related_people",
         "related_events",
         "related_topics",
+        "related_sources",
+        "supersedes",
+        "replaced_by",
+        "mtime",
         "hit_count",
         "score_confidence",
         "rank_score",
         "last_hit_at",
     ]
     items: list[dict[str, object]] = []
-    terms = query_terms(query)
     for raw in rows:
         row = dict(zip(columns, raw))
         rel_score, reasons = relevance(row, query, terms)
-        total_score = round(base_score(row) + rel_score, 4)
+        fts_score, fts_reason = fts_score_map.get(str(row["path"]), (0.0, ""))
+        life_score, life_reasons = lifecycle_score(row)
+        if fts_score:
+            reasons.append(fts_reason)
         row["query_score"] = round(rel_score, 4)
-        row["total_score"] = total_score
-        row["reasons"] = reasons
+        row["fts_score"] = round(fts_score, 4)
+        row["association_score"] = 0.0
+        row["lifecycle_score"] = round(life_score, 4)
+        row["total_score"] = round(base_score(row) + rel_score + fts_score + life_score, 4)
+        row["reasons"] = (reasons + life_reasons)[:6]
         items.append(row)
 
+    expand_associations(items, args.expand_hops)
+    for row in items:
+        row["total_score"] = round(float(row["total_score"]) + float(row.get("association_score", 0.0) or 0.0), 4)
+        row["query_score"] = round(
+            float(row["query_score"])
+            + float(row.get("fts_score", 0.0) or 0.0)
+            + float(row.get("association_score", 0.0) or 0.0),
+            4,
+        )
+        row["reasons"] = list(row.get("reasons", []))[:6]
+
     items.sort(key=lambda item: (float(item["total_score"]), float(item["query_score"])), reverse=True)
-    relevant_items = [item for item in items if float(item["query_score"]) > 0.0]
+    relevant_items = [
+        item
+        for item in items
+        if float(item["query_score"]) > 0.0
+        and not parse_json_list(str(item.get("replaced_by", "") or ""))
+        and str(item.get("status", "") or "").casefold() != "superseded"
+    ][: max(args.candidate_pool, args.top_k)]
 
     selected: list[dict[str, object]] = []
     selected_paths: set[str] = set()
@@ -356,13 +580,7 @@ def main() -> None:
         conn,
         selected,
         query,
-        {
-            "subject_id": args.subject_id or "",
-            "subject_name": args.subject_name or "",
-            "domains": args.domain,
-            "memory_kinds": args.memory_kind,
-            "include_candidates": args.include_candidates,
-        },
+        filters,
     )
     conn.close()
 
@@ -384,6 +602,9 @@ def main() -> None:
                     "summary": row["summary"],
                     "score": row["total_score"],
                     "query_score": row["query_score"],
+                    "fts_score": row["fts_score"],
+                    "association_score": row["association_score"],
+                    "lifecycle_score": row["lifecycle_score"],
                     "reasons": row["reasons"],
                 }
                 for row in selected

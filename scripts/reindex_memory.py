@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import re
+import sqlite3
+
 from _common import (
     as_float,
     emit,
@@ -12,6 +15,8 @@ from _common import (
     open_db,
     parse_args,
     parse_frontmatter,
+    read_text,
+    split_frontmatter,
     store_root,
 )
 
@@ -81,10 +86,59 @@ def infer_domain(meta: dict[str, object], path: str) -> str:
     return "general"
 
 
+def parse_list_text(value: object) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if str(item).strip())
+    return str(value or "")
+
+
+def search_terms(text: str) -> list[str]:
+    terms: set[str] = set()
+    normalized = text.casefold()
+    for token in re.findall(r"[a-z0-9][a-z0-9_\-./]+", normalized):
+        if len(token) >= 2:
+            terms.add(token)
+            for piece in re.split(r"[\-./_]+", token):
+                if len(piece) >= 2:
+                    terms.add(piece)
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        terms.add(run)
+        for width in (2, 3):
+            if len(run) >= width:
+                for idx in range(0, len(run) - width + 1):
+                    terms.add(run[idx : idx + width])
+    return sorted(terms)
+
+
+def ensure_fts(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(
+                path UNINDEXED,
+                title,
+                topic,
+                tags,
+                summary,
+                related_people,
+                related_events,
+                related_topics,
+                related_sources,
+                content
+            )
+            """
+        )
+        conn.execute("DELETE FROM document_fts")
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
 def main() -> None:
     args = parse_args("Reindex person memory notes into SQLite.")
     root = store_root(args.store)
     conn = open_db(root)
+    fts_enabled = ensure_fts(conn)
     files = markdown_files(indexed_roots(root))
     current_paths = {str(path) for path in files}
 
@@ -104,8 +158,13 @@ def main() -> None:
 
     indexed = 0
     for path in files:
-        meta = parse_frontmatter(path)
+        text = read_text(path)
+        meta, body = split_frontmatter(text)
+        if not meta:
+            meta = parse_frontmatter(path)
         doc_path = str(path)
+        title = first_heading(path)
+        summary = first_summary_line(path)
         memory_kind = infer_memory_kind(meta, doc_path)
         confidence = as_float(meta.get("confidence"), 0.5 if memory_kind != "candidate" else 0.3)
         conn.execute(
@@ -142,7 +201,7 @@ def main() -> None:
             """,
             (
                 doc_path,
-                first_heading(path),
+                title,
                 str(meta.get("subject_id", "")),
                 str(meta.get("subject_name", "")),
                 memory_kind,
@@ -151,7 +210,7 @@ def main() -> None:
                 infer_domain(meta, doc_path),
                 str(meta.get("topic", "")),
                 json_text(meta.get("tags", [])),
-                first_summary_line(path),
+                summary,
                 confidence,
                 str(meta.get("status", "pending" if memory_kind == "candidate" else "active")),
                 json_text(meta.get("source", meta.get("related_sources", ""))),
@@ -174,10 +233,50 @@ def main() -> None:
             """,
             (doc_path, confidence),
         )
+        if fts_enabled:
+            related_sources = parse_list_text(meta.get("related_sources", []))
+            content_terms = " ".join(
+                search_terms(
+                    "\n".join(
+                        [
+                            title,
+                            summary,
+                            body,
+                            str(meta.get("topic", "")),
+                            parse_list_text(meta.get("tags", [])),
+                            parse_list_text(meta.get("related_people", [])),
+                            parse_list_text(meta.get("related_events", [])),
+                            parse_list_text(meta.get("related_topics", [])),
+                            related_sources,
+                        ]
+                    )
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO document_fts(
+                    path, title, topic, tags, summary, related_people, related_events,
+                    related_topics, related_sources, content
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_path,
+                    title,
+                    str(meta.get("topic", "")),
+                    parse_list_text(meta.get("tags", [])),
+                    summary,
+                    parse_list_text(meta.get("related_people", [])),
+                    parse_list_text(meta.get("related_events", [])),
+                    parse_list_text(meta.get("related_topics", [])),
+                    related_sources,
+                    content_terms,
+                ),
+            )
         indexed += 1
     conn.commit()
     conn.close()
-    emit({"status": "ok", "indexed": indexed, "store": str(root)})
+    emit({"status": "ok", "indexed": indexed, "fts_enabled": fts_enabled, "store": str(root)})
 
 
 if __name__ == "__main__":

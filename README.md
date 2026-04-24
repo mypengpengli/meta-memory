@@ -33,6 +33,7 @@ It follows the same core idea: raw sources stay as evidence, the agent maintains
 - `profile` 存稳定身份和偏好，`states` 存近期状态，`sessions` 存本轮任务状态。
 - 原始事件尽量 append-only；稳定 Markdown 记忆可以通过追加、替换、`supersedes` / `replaced_by` 表达更新。
 - 显式记忆可以带 `related_people`、`related_events`、`related_topics`、`related_sources`，检索会利用这些链接信号。
+- 默认不依赖 embedding；主路径是字段权重、SQLite FTS/BM25、关联扩展和生命周期排序。
 
 默认记忆层：
 
@@ -64,6 +65,18 @@ python scripts/memory_runtime.py prepare-context \
 ```
 
 使用返回 JSON 里的 `context_markdown`，不要把完整 JSON 诊断、整个 `memory-data/` 或 `references/` 全量塞入上下文。
+
+如果想扩大内部联想但不增加最终上下文，可以调大候选池或关联跳数：
+
+```bash
+python scripts/memory_runtime.py prepare-context \
+  --subject-id me \
+  --subject-name 我 \
+  --session-id session-20260424 \
+  --query-file query.txt \
+  --candidate-pool 32 \
+  --expand-hops 2
+```
 
 回答后记录回复：
 
@@ -148,6 +161,7 @@ Design choices:
 - `profile` is static identity and preference memory; `states` is recent dynamic state; `sessions` is short-lived task state.
 - Raw events are append-only evidence; compiled memories may be appended, replaced, or linked through `supersedes` / `replaced_by`.
 - Explicit memories can include `related_people`, `related_events`, `related_topics`, and `related_sources`; retrieval uses these link signals.
+- Embeddings are not the default path; recall uses weighted fields, SQLite FTS/BM25, association expansion, and lifecycle ranking.
 
 The runtime flow is:
 
@@ -206,6 +220,8 @@ Do not load these by default:
 
 Read references only when debugging, auditing, or manually deciding a loading/writeback policy.
 
+Retrieval is intentionally explainable. Runtime results expose `query_score`, `fts_score`, `association_score`, `lifecycle_score`, and `reasons` so missed or surprising recalls can be debugged without inspecting every memory file.
+
 ### Repository Layout
 
 ```text
@@ -242,5 +258,7 @@ python scripts/run_maintenance.py
 Meta Memory intentionally combines compiled Markdown memory with lightweight retrieval. The compiled layer makes knowledge compound across sessions; retrieval and strict context rules prevent the compiled layer from becoming a new source of context bloat.
 
 The default policy is conservative: raw evidence is always preserved, candidates can be reviewed later, and long-term memory requires explicit or validated promotion.
+
+The recall path intentionally avoids making embeddings mandatory. Embeddings can be useful as a semantic fallback, but personal memory needs deterministic, inspectable signals first: exact fields, full-text search, graph-like links, recency/usefulness, and explicit lifecycle metadata.
 
 The design is informed by the scoped memory and tool-first retrieval patterns in [supermemory](https://github.com/supermemoryai/supermemory) and the User/Session/Agent memory split and retrieve-generate-store loop in [mem0](https://github.com/mem0ai/mem0), but this repository stays local-first and dependency-light.

@@ -14,6 +14,7 @@ Treat this skill as a per-turn memory runtime, not as a folder to browse manuall
    - Prefer `--query-file` for Chinese, multiline text, quotes, or host-provided content.
    - Use only the returned `context_markdown` as memory context.
    - Do not inject full `retrieved`, `raw_evidence`, `memory-data/`, or `references/` into the reply context unless debugging.
+   - Retrieval is deterministic by default: weighted fields + SQLite FTS/BM25 + 1-hop association expansion. Embeddings are not required.
 2. Answer the user with current facts first, using retrieved memories only when relevant.
 3. After answering, run `scripts/memory_runtime.py finalize-turn`.
    - Record the assistant reply with `--reply-file` when possible.
@@ -31,6 +32,14 @@ Default store: `memory-data/` under this skill directory. Default index: `memory
 - Treat `--session-id` as short-lived conversation or task state, not as long-term identity.
 - Put stable identity and preferences in `profile`; put current or time-bounded state in `states`; put task progress in `sessions`.
 - Link graph-like clues with `--related-person`, `--related-event`, `--related-topic`, and `--related-source` when writing explicit memories.
+
+## Recall Model
+
+- Direct recall: title, topic, tags, summary, relationship fields, and indexed body text.
+- Associative recall: after a direct hit, expand through shared people, events, topics, and sources for up to `--expand-hops` hops.
+- Lifecycle ranking: active and recently useful memories rise; ended, superseded, or replaced memories fall or disappear.
+- Keep `--top-k` small for prompt context; use `--candidate-pool` only to widen internal ranking.
+- Do not add embedding retrieval as the primary path unless the user explicitly chooses it; if added later, treat it as an optional fallback.
 
 ## Writeback Guardrails
 

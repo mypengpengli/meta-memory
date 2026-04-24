@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--heartbeat-min-pending", type=int, default=3)
     prepare.add_argument("--heartbeat-max-events", type=int, default=20)
     prepare.add_argument("--top-k", type=int, default=6, help="Maximum retrieved memories")
+    prepare.add_argument("--candidate-pool", type=int, default=24, help="Maximum internally ranked retrieval candidates")
+    prepare.add_argument("--expand-hops", type=int, default=1, help="Association expansion hops through related fields, 0-2")
     prepare.add_argument("--include-candidates", action="store_true", help="Allow candidate memories in retrieval")
     prepare.add_argument("--no-basics", action="store_true", help="Do not prioritize relevant profile/state memories")
     prepare.add_argument("--raw-limit", type=int, default=3, help="Maximum raw evidence snippets to include")
@@ -314,6 +316,10 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         query,
         "--top-k",
         str(args.top_k),
+        "--candidate-pool",
+        str(args.candidate_pool),
+        "--expand-hops",
+        str(args.expand_hops),
     ]
     if args.include_candidates:
         retrieve_args.append("--include-candidates")
