@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         help="Related event; may be repeated",
     )
     parser.add_argument(
+        "--related-topic",
+        action="append",
+        default=[],
+        help="Related topic/entity; may be repeated",
+    )
+    parser.add_argument(
         "--related-source",
         action="append",
         default=[],
@@ -201,6 +207,7 @@ def build_meta_from_payload(payload: dict[str, object], title: str) -> dict[str,
         "source": str(payload.get("source", "")),
         "related_people": as_list(payload.get("related_people", payload.get("related_person", []))),
         "related_events": as_list(payload.get("related_events", payload.get("related_event", []))),
+        "related_topics": as_list(payload.get("related_topics", payload.get("related_topic", []))),
         "related_sources": as_list(payload.get("related_sources", payload.get("related_source", []))),
         "supersedes": as_list(payload.get("supersedes", [])),
         "replaced_by": as_list(payload.get("replaced_by", [])),
@@ -235,6 +242,9 @@ def build_meta(args: argparse.Namespace, payload: dict[str, object], title: str)
         ),
         "related_events": as_list(
             arg_or_payload(args, payload, "related_event", payload.get("related_events", []))
+        ),
+        "related_topics": as_list(
+            arg_or_payload(args, payload, "related_topic", payload.get("related_topics", []))
         ),
         "related_sources": as_list(
             arg_or_payload(args, payload, "related_source", payload.get("related_sources", []))
@@ -372,6 +382,9 @@ def main() -> None:
         ),
         "related_events": as_list(
             arg_or_payload(args, payload, "related_event", payload.get("related_events", []))
+        ),
+        "related_topics": as_list(
+            arg_or_payload(args, payload, "related_topic", payload.get("related_topics", []))
         ),
         "related_sources": as_list(
             arg_or_payload(args, payload, "related_source", payload.get("related_sources", []))

@@ -121,6 +121,7 @@ def text_fields(row: dict[str, object]) -> dict[str, str]:
         "source": normalize_text(str(row["source"])),
         "related_people": normalize_text(" ".join(parse_json_list(str(row["related_people"])))),
         "related_events": normalize_text(" ".join(parse_json_list(str(row["related_events"])))),
+        "related_topics": normalize_text(" ".join(parse_json_list(str(row["related_topics"])))),
         "subject_name": normalize_text(str(row["subject_name"])),
     }
 
@@ -164,6 +165,9 @@ def relevance(row: dict[str, object], query: str, terms: list[str]) -> tuple[flo
         if term in fields["related_events"]:
             term_score += 0.9
             term_reasons.append(f"related_events:{term}")
+        if term in fields["related_topics"]:
+            term_score += 1.0
+            term_reasons.append(f"related_topics:{term}")
         if term in fields["subject_name"]:
             term_score += 1.0
             term_reasons.append(f"subject:{term}")
@@ -281,6 +285,7 @@ def main() -> None:
             d.end_at,
             d.related_people,
             d.related_events,
+            d.related_topics,
             COALESCE(s.hit_count, 0) AS hit_count,
             COALESCE(s.confidence, d.confidence, 0.0) AS score_confidence,
             COALESCE(s.rank_score, 0.0) AS rank_score,
@@ -311,6 +316,7 @@ def main() -> None:
         "end_at",
         "related_people",
         "related_events",
+        "related_topics",
         "hit_count",
         "score_confidence",
         "rank_score",

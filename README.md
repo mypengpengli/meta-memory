@@ -27,6 +27,13 @@ It follows the same core idea: raw sources stay as evidence, the agent maintains
 5. `finalize-turn` 在回答后记录助手回复并保守整理。
 6. `remember` 只在用户明确要求时写入长期记忆。
 
+关键设计取舍：
+
+- `subject-id` 是隔离记忆的 scope/container，可以是 `person:lp`、`project:meta-memory`、`client:acme`。
+- `profile` 存稳定身份和偏好，`states` 存近期状态，`sessions` 存本轮任务状态。
+- 原始事件尽量 append-only；稳定 Markdown 记忆可以通过追加、替换、`supersedes` / `replaced_by` 表达更新。
+- 显式记忆可以带 `related_people`、`related_events`、`related_topics`、`related_sources`，检索会利用这些链接信号。
+
 默认记忆层：
 
 - `profile`: 身份、长期偏好、稳定风格
@@ -76,6 +83,7 @@ python scripts/memory_runtime.py remember \
   --subject-name 我 \
   --title-file title.txt \
   --content-file memory.txt \
+  --related-topic answer-style \
   --use-underlying-kind
 ```
 
@@ -134,6 +142,13 @@ The system has three layers:
 - Compiled Markdown memory: stable, reviewable pages the agent maintains over time.
 - Runtime index: SQLite tables for search, scores, sources, and processing state.
 
+Design choices:
+
+- `subject-id` is the memory scope/container, for example `person:lp`, `project:meta-memory`, or `client:acme`.
+- `profile` is static identity and preference memory; `states` is recent dynamic state; `sessions` is short-lived task state.
+- Raw events are append-only evidence; compiled memories may be appended, replaced, or linked through `supersedes` / `replaced_by`.
+- Explicit memories can include `related_people`, `related_events`, `related_topics`, and `related_sources`; retrieval uses these link signals.
+
 The runtime flow is:
 
 1. `prepare-context` records the user request, organizes pending events conservatively, retrieves relevant memories, and returns `context_markdown`.
@@ -171,6 +186,7 @@ python scripts/memory_runtime.py remember \
   --subject-name "Me" \
   --title-file title.txt \
   --content-file memory.txt \
+  --related-topic answer-style \
   --use-underlying-kind
 ```
 
@@ -226,3 +242,5 @@ python scripts/run_maintenance.py
 Meta Memory intentionally combines compiled Markdown memory with lightweight retrieval. The compiled layer makes knowledge compound across sessions; retrieval and strict context rules prevent the compiled layer from becoming a new source of context bloat.
 
 The default policy is conservative: raw evidence is always preserved, candidates can be reviewed later, and long-term memory requires explicit or validated promotion.
+
+The design is informed by the scoped memory and tool-first retrieval patterns in [supermemory](https://github.com/supermemoryai/supermemory) and the User/Session/Agent memory split and retrieve-generate-store loop in [mem0](https://github.com/mem0ai/mem0), but this repository stays local-first and dependency-light.

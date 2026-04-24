@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag", action="append", default=[], help="Additional tag; may be repeated")
     parser.add_argument("--related-person", action="append", default=[], help="Related person; may be repeated")
     parser.add_argument("--related-event", action="append", default=[], help="Related event; may be repeated")
+    parser.add_argument("--related-topic", action="append", default=[], help="Related topic/entity; may be repeated")
     parser.add_argument("--related-source", action="append", default=[], help="Related source; may be repeated")
     parser.add_argument("--slug", help="Override slug")
     parser.add_argument(
@@ -140,6 +141,10 @@ def build_payload(
     final_payload["related_events"] = merge_unique(
         as_list(payload.get("related_events", [])),
         args.related_event,
+    )
+    final_payload["related_topics"] = merge_unique(
+        as_list(payload.get("related_topics", [])),
+        args.related_topic,
     )
     final_payload["related_sources"] = merge_unique(
         as_list(payload.get("related_sources", [])),

@@ -14,6 +14,7 @@ status: active
 source: ""
 related_people: []
 related_events: []
+related_topics: []
 supersedes: []
 replaced_by: []
 ---
@@ -37,6 +38,7 @@ replaced_by: []
 
 - 人物 A
 - 事件 B
+- 主题/实体 C
 
 ## 来源与可信度
 

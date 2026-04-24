@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     remember.add_argument("--tag", action="append", default=[], help="Additional tag; may be repeated")
     remember.add_argument("--related-person", action="append", default=[], help="Related person; may be repeated")
     remember.add_argument("--related-event", action="append", default=[], help="Related event; may be repeated")
+    remember.add_argument("--related-topic", action="append", default=[], help="Related topic/entity; may be repeated")
     remember.add_argument("--related-source", action="append", default=[], help="Related source; may be repeated")
     remember.add_argument("--slug", help="Override slug")
     remember.add_argument("--mode", choices=["create", "replace", "append"], default="create")
@@ -397,6 +398,7 @@ def capture_reply_artifact(
         tag=args.artifact_tag or [],
         related_person=[],
         related_event=[],
+        related_topic=[],
         related_source=[],
         slug=None,
         mode="create",

@@ -1,6 +1,6 @@
 ---
 name: memory-orchestrator
-description: Prepare and persist per-person or per-subject memory for Codex conversations. Use when an agent must load only relevant profile/state/goal/relationship/event/domain/session memories before answering, record user and assistant turns after answering, explicitly remember user-requested facts, or maintain a raw-source plus compiled Markdown memory system without bulk-loading memory files. 为具体人物或主体准备记忆上下文、记录对话事件、保守写回 session/candidate，并在用户明确要求时沉淀长期记忆；适合需要自动加载相关记忆、自动记录回合、避免全量读取和误污染长期层的场景。
+description: Prepare and persist scoped per-person, per-project, or per-subject memory for Codex conversations. Use when an agent must load only relevant profile/state/goal/relationship/event/domain/session memories before answering, record user and assistant turns after answering, explicitly remember user-requested facts, preserve raw evidence, or maintain a compiled Markdown memory/wiki without bulk-loading memory files. 为具体人物、项目或主体准备记忆上下文、记录对话事件、保守写回 session/candidate，并在用户明确要求时沉淀长期记忆；适合需要自动加载相关记忆、自动记录回合、按 scope 隔离记忆、避免全量读取和误污染长期层的场景。
 ---
 
 # Memory Orchestrator
@@ -25,11 +25,19 @@ Treat this skill as a per-turn memory runtime, not as a folder to browse manuall
 
 Default store: `memory-data/` under this skill directory. Default index: `memory-data/db/memory_index.sqlite`.
 
+## Scope Model
+
+- Treat `--subject-id` as the memory scope/container. Use a stable id such as `person:lp`, `project:meta-memory`, or `client:acme`.
+- Treat `--session-id` as short-lived conversation or task state, not as long-term identity.
+- Put stable identity and preferences in `profile`; put current or time-bounded state in `states`; put task progress in `sessions`.
+- Link graph-like clues with `--related-person`, `--related-event`, `--related-topic`, and `--related-source` when writing explicit memories.
+
 ## Writeback Guardrails
 
 - Always preserve raw evidence first in `raw_events`.
 - Automatic organization defaults to `session` or `candidate`.
 - Long-term layers (`profile`, `states`, `events`, `relationships`, `goals`, `domains`) should come from explicit `remember`, validated promotion, or intentional artifact capture.
+- Keep raw evidence append-only; update compiled memories by appending, replacing, or using `supersedes` / `replaced_by`.
 - Never promote a normal user question, one-off chat, unverified guess, or long raw transcript directly into long-term memory.
 - If unsure, keep it as `candidate` until later evidence confirms it.
 

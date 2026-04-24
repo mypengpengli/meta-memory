@@ -1,4 +1,4 @@
 interface:
   display_name: "Meta Memory / 记忆编排"
-  short_description: "Load only relevant per-person memories, record turns, and conservatively write back durable facts"
-  default_prompt: "Use $memory-orchestrator to run scripts/memory_runtime.py before answering, use only context_markdown as memory context, record the turn after answering, and write long-term memory only when explicitly requested or intentionally captured."
+  short_description: "Load only relevant scoped memories, record turns, and conservatively write back durable facts"
+  default_prompt: "Use $memory-orchestrator to run scripts/memory_runtime.py before answering, pass a stable subject-id scope, use only context_markdown as memory context, record the turn after answering, and write long-term memory only when explicitly requested or intentionally captured."
