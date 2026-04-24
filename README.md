@@ -20,7 +20,7 @@
 - 你希望记忆存在本地 Markdown 和 SQLite 里，能看、能改、能追溯来源。
 - 你不想只依赖 embedding，因为你需要更稳定、更可解释的召回。
 
-英文简版在后面。前半部分先用中文把它讲清楚。
+英文版在后面。前半部分先用中文把它讲清楚。
 
 ## 先说清楚：这是什么
 
@@ -298,30 +298,121 @@ Generated views inside `memory-data/`:
 - `log.md`: raw event timeline
 - `sources.md`: source layer and memory-source mapping
 
-## English Quick Reference
+## English Version
 
 ### What It Is
 
-Meta Memory is a local memory runtime for agents. It records raw events, writes durable memories into structured Markdown, and retrieves a small relevant context before each answer.
+Meta Memory is a local memory tool for Codex and AI agents.
 
-### Core Commands
+It solves a simple problem: you want the agent to remember useful things about you, your projects, your clients, or your long-running work, but you do not want to paste every old conversation and every project file into the prompt each time.
+
+Meta Memory does two jobs:
+
+1. **Before the answer, retrieve memory**: it finds a small amount of relevant memory for the current question.
+2. **After the answer, record what happened**: it stores raw conversation events, and only writes durable long-term memory when the user explicitly asks for it or when a workflow intentionally promotes it.
+
+In plain terms: **remember what should be remembered, retrieve what is needed, and keep unrelated history out of the context window.**
+
+### What It Is Not
+
+Meta Memory is not just a chat log backup.
+
+It is not a folder where the agent blindly reads every old note.
+
+It is not an embedding-only RAG system.
+
+It is a small local stack:
+
+- Python scripts read, write, index, and retrieve memory.
+- Markdown files store durable memories that humans can inspect and edit.
+- SQLite stores the search index, source mapping, lifecycle state, and retrieval metadata.
+
+### How It Works In One Turn
+
+The normal loop is:
+
+1. The user asks a question.
+2. The agent calls `prepare-context`.
+3. Meta Memory searches local memory for relevant items.
+4. The agent reads only the returned `context_markdown`.
+5. The agent answers the user.
+6. The agent calls `finalize-turn` to store the raw turn event.
+7. If the user explicitly says to remember something, the agent calls `remember` to write durable memory.
+
+This matters because the model is not expected to remember from vague impressions, and it is not given the entire memory folder. It gets only the small piece of memory selected for the current task.
+
+### When To Use It
+
+Use Meta Memory when:
+
+- You use Codex on the same project over many sessions.
+- You want the agent to remember preferences, writing style, working habits, or constraints.
+- You need memory for a person, project, client, product, family topic, learning plan, or long-running task.
+- You want memory that stays local, is readable as Markdown, and can be corrected later.
+- You want recall to be explainable instead of relying only on embedding similarity.
+
+### Why Retrieval Is Deterministic By Default
+
+Embeddings can be useful, but they are not the default recall path here.
+
+The practical reason is that long-term memory often needs exact, inspectable recall. If you need a specific fact, preference, decision, or project constraint, “semantically similar” is not always good enough.
+
+Meta Memory therefore starts with methods that are easier to inspect:
+
+- Field matching: title, tags, topic, people, events, and sources.
+- Full-text search: SQLite FTS/BM25 over memory text and relation fields.
+- Explicit associations: `related_topics`, `related_people`, `related_events`, and `related_sources`.
+- Importance ranking: high-impact memory is preferred.
+- Lifecycle state: expired, superseded, or replaced memory is down-ranked or removed.
+
+### Memory Layers
+
+Long-term memory is split by purpose:
+
+- `profile`: stable identity, preferences, and long-term style
+- `states`: current state and recent changes
+- `events`: important events and timeline facts
+- `relationships`: important people and relationship context
+- `goals`: goals, projects, and constraints
+- `domains`: work, study, health, finance, daily life, and other domain knowledge
+- `sessions`: current conversation and short-term task state
+- `candidates`: unverified, uncertain, or conflicting information
+- `archive`: raw sources and imported material
+
+The point is not complexity. The point is to keep stable facts, temporary state, raw evidence, and unverified guesses from mixing into one messy memory pile.
+
+### Quick Start
 
 ```bash
-python scripts/memory_runtime.py prepare-context --subject-id person:me --subject-name "Me" --session-id session-1 --query-file query.txt
-python scripts/memory_runtime.py finalize-turn --subject-id person:me --subject-name "Me" --session-id session-1 --reply-file reply.txt
-python scripts/memory_runtime.py remember --subject-id person:me --subject-name "Me" --title-file title.txt --content-file memory.txt --use-underlying-kind
+python scripts/memory_runtime.py prepare-context \
+  --subject-id person:me \
+  --subject-name "Me" \
+  --session-id session-1 \
+  --query-file query.txt
 ```
 
-### Design Choices
+Use only `context_markdown` from the returned JSON as memory context.
 
-- `subject-id` is the memory scope/container.
-- `profile` stores stable identity and preferences.
-- `states` stores recent dynamic state.
-- `sessions` stores short-lived task state.
-- Raw events are append-only evidence.
-- Compiled memories are updated through append, replace, `supersedes`, or `replaced_by`.
-- Retrieval is deterministic by default: weighted fields, SQLite FTS/BM25, association expansion, lifecycle ranking, and importance ranking.
-- Embeddings are optional future fallback, not the primary recall path.
+```bash
+python scripts/memory_runtime.py finalize-turn \
+  --subject-id person:me \
+  --subject-name "Me" \
+  --session-id session-1 \
+  --reply-file reply.txt
+```
+
+Write durable memory only when it is intentional:
+
+```bash
+python scripts/memory_runtime.py remember \
+  --subject-id person:me \
+  --subject-name "Me" \
+  --title-file title.txt \
+  --content-file memory.txt \
+  --related-topic answer-style \
+  --importance 0.9 \
+  --use-underlying-kind
+```
 
 ## Design Influences
 
