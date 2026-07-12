@@ -24,6 +24,7 @@ DEFAULT_DIRS = [
     "candidates",
     "archive/raw",
     "archive/imports",
+    "resources",
     "db",
 ]
 
@@ -192,105 +193,11 @@ def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]
 def open_db(root: Path) -> sqlite3.Connection:
     ensure_default_dirs(root)
     conn = sqlite3.connect(db_path(root))
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT UNIQUE NOT NULL
-        )
-        """
-    )
-    ensure_columns(conn, "documents", DOCUMENT_COLUMNS)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scores (
-            path TEXT PRIMARY KEY
-        )
-        """
-    )
-    ensure_columns(conn, "scores", SCORE_COLUMNS)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS retrieval_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            used_paths TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS raw_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-        """
-    )
-    ensure_columns(conn, "raw_events", RAW_EVENT_COLUMNS)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS maintenance_cursor (
-            subject_id TEXT PRIMARY KEY
-        )
-        """
-    )
-    ensure_columns(conn, "maintenance_cursor", CURSOR_COLUMNS)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memory_sources (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-        """
-    )
-    ensure_columns(conn, "memory_sources", MEMORY_SOURCE_COLUMNS)
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_raw_events_subject_state
-        ON raw_events(subject_id, processed_state, id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_raw_events_subject_hash
-        ON raw_events(subject_id, content_hash)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_raw_events_created_at
-        ON raw_events(created_at)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_raw_events_subject_event_time
-        ON raw_events(subject_id, event_time, id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_raw_events_topic_domain
-        ON raw_events(topic_hint, domain_hint)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_memory_sources_raw_event
-        ON memory_sources(raw_event_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_memory_sources_memory_path
-        ON memory_sources(memory_path)
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_sources_unique_link
-        ON memory_sources(memory_path, raw_event_id, link_role)
-        """
-    )
-    conn.commit()
+    # Schema changes are deliberately centralized in versioned migrations.
+    # Import lazily to keep every standalone script executable from this folder.
+    from db_migrations import run_migrations
+
+    run_migrations(conn)
     return conn
 
 

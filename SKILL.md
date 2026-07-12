@@ -21,7 +21,7 @@ Treat this skill as a per-turn memory runtime, not as a folder to browse manuall
    - Let the runtime organize conservatively.
 4. When the user explicitly says to remember/save a fact, run `scripts/memory_runtime.py remember`.
    - Use `--title-file`, `--content-file`, or `--payload-file` for nontrivial text.
-   - Add `--use-underlying-kind` when accepting the classifier's long-term kind.
+   - Add `--use-underlying-kind` when accepting the classifier's long-term kind. This command creates a sourced, validated memory plan; it does not bypass deduplication or conflict checks.
 5. Use `finalize-turn --capture-artifact` only when the assistant reply itself is durable knowledge worth filing.
 
 Default store: `memory-data/` under this skill directory. Default index: `memory-data/db/memory_index.sqlite`.
@@ -45,7 +45,9 @@ Default store: `memory-data/` under this skill directory. Default index: `memory
 ## Writeback Guardrails
 
 - Always preserve raw evidence first in `raw_events`.
-- Automatic organization defaults to `session` or `candidate`.
+- Heartbeat only builds source-linked `session_cards`; it never edits a long-term Markdown page.
+- Deferred processing extracts one-fact `memory_units`, then proposes a six-action consolidation plan (`CREATE`, `CORROBORATE`, `REFINE`, `CORRECT`, `SUPERSEDE`, `IGNORE`).
+- Every durable write must pass `validate_memory_plan.py` and `apply_memory_plan.py`; `CORRECT` and `SUPERSEDE` enter review by default.
 - Long-term layers (`profile`, `states`, `events`, `relationships`, `goals`, `domains`) should come from explicit `remember`, validated promotion, or intentional artifact capture.
 - Keep raw evidence append-only; update compiled memories by appending, replacing, or using `supersedes` / `replaced_by`.
 - Never promote a normal user question, one-off chat, unverified guess, or long raw transcript directly into long-term memory.
@@ -73,10 +75,21 @@ Stop reading references as soon as you know the next action.
 
 ## Maintenance
 
-- Run `scripts/run_maintenance.py` to rebuild indexes, scores, generated views, and lint checks.
+- Run `scripts/run_maintenance.py` to rebuild indexes, chunk indexes, scores, generated views, and lint checks.
 - Run `scripts/lint_memory.py` when auditing for missing sources, accidental long-term promotion, duplicate canonical pages, or stale structure.
 - Run `scripts/evaluate_retrieval.py --cases-file <cases.json>` when auditing whether important queries still recall expected memories.
+- Run `scripts/run_dream.py --subject-id <id>` for a shadow consolidation cycle. Add `--apply` only after inspecting its validated plan.
+- Use `scripts/review_memory_plan.py` to inspect or approve high-risk corrections.
 - Generated views are navigation aids only:
   - `memory-data/index.md`
   - `memory-data/log.md`
   - `memory-data/sources.md`
+
+## Meta Memory 2.0 Safety Contract
+
+- Do not directly edit `raw_events`, `claims`, or canonical Markdown from an agent workflow.
+- Do not use `write_memory.py --mode append` for a canonical page. Use a `REFINE` plan instead.
+- Do not treat an assistant reply as user profile evidence. Assistant artifacts remain sourced candidates unless deliberately reviewed.
+- Retrieval alone is not usage. Call `mark_memory_usage.py` only after a memory was actually used or confirmed helpful.
+- Use `node_search.py` for scoped deduplication context. It returns summaries, not full source material.
+- Keep embeddings optional. The field/BM25/chunk/association retrieval path must remain functional with no embedding provider configured.

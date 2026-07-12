@@ -1,68 +1,21 @@
 #!/usr/bin/env python3
+"""Audit candidate metadata without silently rewriting evidence-bearing files."""
 from __future__ import annotations
 
-from pathlib import Path
-
-from _common import compose_markdown, emit, parse_args, read_text, split_frontmatter, store_root
+from _common import emit, open_db, parse_args, store_root
 
 
-DEFAULT_META = {
-    "subject_id": "person-unknown",
-    "subject_name": "Unknown",
-    "memory_kind": "candidate",
-    "domain": "general",
-    "topic": "candidate",
-    "tags": [],
-    "start_at": "",
-    "end_at": "",
-    "confidence": 0.3,
-    "status": "pending",
-    "source": "",
-    "related_people": [],
-    "related_events": [],
-    "related_sources": [],
-    "supersedes": [],
-    "replaced_by": [],
-}
-
-
-def has_heading(body: str) -> bool:
-    return any(line.startswith("# ") for line in body.splitlines())
-
-
-def normalize_candidate(path: Path) -> bool:
-    meta, body = split_frontmatter(read_text(path))
-    changed = False
-
-    for key, value in DEFAULT_META.items():
-        if key not in meta:
-            meta[key] = value if not isinstance(value, list) else list(value)
-            changed = True
-
-    if meta.get("topic") in ("", "candidate"):
-        meta["topic"] = path.stem
-        changed = True
-
-    if not body.strip():
-        body = f"# {path.stem}\n\n待整理。"
-        changed = True
-    elif not has_heading(body):
-        body = f"# {path.stem}\n\n{body.lstrip()}"
-        changed = True
-
-    if changed:
-        path.write_text(compose_markdown(meta, body), encoding="utf-8")
-    return changed
+REQUIRED = {"subject_id", "memory_kind", "topic", "confidence", "status", "memory_id", "schema_version"}
 
 
 def main() -> None:
-    args = parse_args("Normalize candidate markdown notes for the person-centered schema.")
+    args = parse_args("Report candidate pages that need a validated REFINE plan; never rewrite them directly.")
     root = store_root(args.store)
-    changed = 0
-    for path in sorted((root / "candidates").rglob("*.md")):
-        if normalize_candidate(path):
-            changed += 1
-    emit({"status": "ok", "normalized": changed, "store": str(root)})
+    conn = open_db(root)
+    rows = conn.execute("SELECT id, memory_path, topic, confidence, status FROM claims WHERE memory_kind='candidate' ORDER BY created_at").fetchall()
+    conn.close()
+    findings = [{"claim_id": row[0], "path": row[1], "topic": row[2], "confidence": row[3], "status": row[4], "suggestion": "Use a REFINE plan if metadata or content needs correction."} for row in rows]
+    emit({"status": "ok", "normalized": 0, "audited": len(findings), "findings": findings, "store": str(root)})
 
 
 if __name__ == "__main__":

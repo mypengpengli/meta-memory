@@ -8,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from _common import emit
+from config import get
+from llm_client import complete
 
 
 LONG_TERM_KINDS = ["profile", "state", "event", "relationship", "goal", "domain"]
@@ -100,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     parser.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     parser.add_argument("--out-file", help="Write classification JSON to a UTF-8 file")
+    parser.add_argument("--llm-fallback", action="store_true", help="Use the optional external LLM adapter for low-confidence rule results")
     return parser.parse_args()
 
 
@@ -296,7 +299,7 @@ def build_reasons(
     return unique[:6]
 
 
-def classify(title: str, content: str, subject_id: str, subject_name: str) -> dict[str, object]:
+def classify(title: str, content: str, subject_id: str, subject_name: str, llm_fallback: bool = False) -> dict[str, object]:
     text = lower_text(title, content)
     kind_scores, kind_reasons = score_kinds(text)
     recommended, underlying = pick_kind(kind_scores)
@@ -337,6 +340,31 @@ def classify(title: str, content: str, subject_id: str, subject_name: str) -> di
             "importance": importance,
         },
     }
+    if (llm_fallback or bool(get("llm.enable_fallback"))) and confidence < 0.62:
+        prompt_file = Path(__file__).resolve().parent.parent / "prompts" / "classify_memory.md"
+        try:
+            fallback = complete(prompt_file.read_text(encoding="utf-8"), {"title": title, "content": content, "rule_result": result})
+        except Exception as exc:
+            result["llm_fallback"] = {"used": False, "error": str(exc)}
+            return result
+        if fallback and str(fallback.get("kind", "")) in ALL_KINDS:
+            proposed_kind = str(fallback["kind"])
+            proposed_domain = str(fallback.get("domain", domain))
+            if proposed_domain not in list(DOMAIN_RULES) + ["general"]:
+                proposed_domain = domain
+            proposed_confidence = max(0.0, min(float(fallback.get("confidence", confidence)), 1.0))
+            # The LLM is a fallback classifier, never a promotion authority.
+            result["recommended_kind"] = proposed_kind
+            result["underlying_long_term_kind"] = proposed_kind if proposed_kind in LONG_TERM_KINDS else underlying
+            result["recommended_domain"] = proposed_domain
+            result["classification_confidence"] = round(proposed_confidence, 2)
+            result["recommended_action"] = recommend_action(proposed_kind)
+            result["suggested_payload"]["kind"] = proposed_kind
+            result["suggested_payload"]["domain"] = proposed_domain
+            result["suggested_payload"]["confidence"] = suggested_memory_confidence(proposed_kind, proposed_confidence)
+            result["llm_fallback"] = {"used": True, "reason": str(fallback.get("reason", ""))}
+        else:
+            result["llm_fallback"] = {"used": False, "reason": "adapter unavailable or invalid response"}
     return result
 
 
@@ -344,7 +372,7 @@ def main() -> None:
     args = parse_args()
     payload = load_payload(args.payload_file)
     title, content = read_content(args, payload)
-    result = classify(title, content, args.subject_id, args.subject_name)
+    result = classify(title, content, args.subject_id, args.subject_name, llm_fallback=args.llm_fallback)
 
     if args.out_file:
         Path(args.out_file).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

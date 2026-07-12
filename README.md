@@ -287,6 +287,9 @@ The evaluator reports `recall_at_k`, selected titles, missing expectations, and 
 SKILL.md                  Agent-facing runtime contract
 agents/openai.yaml        UI metadata
 scripts/                  Runtime, indexing, retrieval, writeback, lint, evaluation
+config/default.yaml       Conservative 2.0 runtime defaults
+migrations/               Transactional, checksummed SQLite schema migrations
+prompts/                  Optional LLM fallback contracts
 references/               On-demand design and policy references
 assets/templates/         Memory note templates
 memory-data/              Default local memory store, git-ignored
@@ -297,6 +300,48 @@ Generated views inside `memory-data/`:
 - `index.md`: compiled memory navigation
 - `log.md`: raw event timeline
 - `sources.md`: source layer and memory-source mapping
+
+## Meta Memory 2.0: Auditable Memory Formation
+
+The 2.0 runtime preserves the project's local-first design while adding a safe
+path from raw conversation to durable memory:
+
+```text
+raw_events → session_cards → memory_units → consolidation plan → validated claims
+                                                ↓
+                                         review queue for CORRECT/SUPERSEDE
+```
+
+- SQLite changes are checksummed, transactional migrations in `migrations/`.
+- A heartbeat only builds incremental session cards; it never directly appends
+  a conversation into a profile or other long-term page.
+- `run_dream.py` is shadow-mode by default. It produces inspectable plans with
+  `CREATE`, `CORROBORATE`, `REFINE`, `CORRECT`, `SUPERSEDE`, or `IGNORE`.
+- Every durable change validates sources, subject scope, sensitivity, temporal
+  rules, and path safety before an atomic Markdown + SQLite update.
+- Retrieval fuses field match, document BM25, chunk BM25, and explicit graph
+  links via RRF. Embeddings are optional and never a hard dependency.
+- Retrieval telemetry is separate from usefulness: use
+  `mark_memory_usage.py` only after a memory was actually used or confirmed.
+
+Typical deferred processing:
+
+```bash
+# Inspect the proposed writes without changing long-term memory.
+python scripts/run_dream.py --subject-id person:me
+
+# Apply only low-risk validated actions.
+python scripts/run_dream.py --subject-id person:me --apply
+
+# Inspect or explicitly approve temporal corrections.
+python scripts/review_memory_plan.py
+```
+
+Optional external integrations are command adapters, not required packages:
+
+- `META_MEMORY_LLM_COMMAND` enables low-confidence classification fallback.
+- `META_MEMORY_EMBEDDINGS_COMMAND` enables `embedding_index.py` and optional
+  embedding RRF. Without either variable, all deterministic functionality still works.
 
 ## English Version
 

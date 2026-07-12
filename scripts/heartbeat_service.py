@@ -14,7 +14,7 @@ from _common import DEFAULT_STORE_HELP, emit, store_root
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the heartbeat organizer on a repeating timer so the memory system can organize incrementally."
+        description="Run the session-card heartbeat on a repeating timer without directly writing long-term memory."
     )
     parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Limit to one subject_id")
@@ -26,9 +26,9 @@ def parse_args() -> argparse.Namespace:
         "--policy",
         choices=["conservative", "balanced", "aggressive"],
         default="conservative",
-        help="How aggressively to write directly into long-term layers",
+        help="Policy carried into telemetry; heartbeat itself only builds session cards",
     )
-    parser.add_argument("--skip-index", action="store_true", help="Skip the reindex/rescore pass")
+    parser.add_argument("--extract-units", action="store_true", help="Extract candidate units after building session cards")
     parser.add_argument("--run-once", action="store_true", help="Run a single heartbeat tick and exit")
     parser.add_argument("--iterations", type=int, help="Maximum ticks to run before exiting")
     return parser.parse_args()
@@ -57,8 +57,8 @@ def build_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.subject_id:
         command.extend(["--subject-id", args.subject_id])
-    if args.skip_index:
-        command.append("--skip-index")
+    if args.extract_units:
+        command.append("--extract-units")
     return command
 
 

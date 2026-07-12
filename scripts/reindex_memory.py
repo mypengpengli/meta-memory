@@ -16,9 +16,11 @@ from _common import (
     parse_args,
     parse_frontmatter,
     read_text,
+    sha256_text,
     split_frontmatter,
     store_root,
 )
+from config import get
 
 
 def infer_memory_kind(meta: dict[str, object], path: str) -> str:
@@ -134,6 +136,87 @@ def ensure_fts(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def body_start_line(text: str) -> int:
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for index, line in enumerate(lines[1:], start=2):
+            if line.strip() == "---":
+                return index + 1
+    return 1
+
+
+def build_chunks(text: str) -> list[dict[str, object]]:
+    """Split Markdown on H1/H2 boundaries then on paragraph lines with overlap."""
+    max_chars = int(get("retrieval.chunk_chars"))
+    overlap = int(get("retrieval.chunk_overlap_chars"))
+    start = body_start_line(text)
+    lines = text.splitlines()
+    body_lines = lines[start - 1 :]
+    sections: list[tuple[str, int, list[str]]] = []
+    heading = ""
+    section_start = start
+    current: list[str] = []
+    for offset, line in enumerate(body_lines, start=start):
+        if re.match(r"^#{1,2}\s+", line):
+            if current:
+                sections.append((heading, section_start, current))
+            heading = re.sub(r"^#{1,2}\s+", "", line).strip()
+            section_start = offset
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append((heading, section_start, current))
+    if not sections and body_lines:
+        sections.append(("", start, body_lines))
+
+    chunks: list[dict[str, object]] = []
+    for heading, line_start, section in sections:
+        buffer: list[str] = []
+        buffer_start = line_start
+        for offset, line in enumerate(section, start=line_start):
+            candidate = "\n".join(buffer + [line]).strip()
+            if buffer and len(candidate) > max_chars:
+                content = "\n".join(buffer).strip()
+                if content:
+                    chunks.append({"heading": heading, "start_line": buffer_start, "end_line": offset - 1, "content": content})
+                tail = content[-overlap:] if overlap else ""
+                buffer = [tail, line] if tail else [line]
+                buffer_start = max(line_start, offset - 1)
+            else:
+                buffer.append(line)
+        content = "\n".join(buffer).strip()
+        if content:
+            chunks.append({"heading": heading, "start_line": buffer_start, "end_line": line_start + len(section) - 1, "content": content})
+    return chunks
+
+
+def sync_chunks(conn: sqlite3.Connection, doc_path: str, text: str) -> tuple[int, bool]:
+    source_hash = sha256_text(text)
+    previous = conn.execute("SELECT source_hash FROM chunks WHERE doc_path=? LIMIT 1", (doc_path,)).fetchone()
+    if previous and str(previous[0]) == source_hash:
+        return 0, False
+    conn.execute("DELETE FROM chunks WHERE doc_path=?", (doc_path,))
+    try:
+        conn.execute("DELETE FROM chunk_fts WHERE doc_path=?", (doc_path,))
+        chunk_fts = True
+    except sqlite3.OperationalError:
+        chunk_fts = False
+    created = 0
+    for index, chunk in enumerate(build_chunks(text)):
+        cursor = conn.execute(
+            """
+            INSERT INTO chunks(doc_path, chunk_index, heading, start_line, end_line, content, content_hash, source_hash)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (doc_path, index, chunk["heading"], chunk["start_line"], chunk["end_line"], chunk["content"], sha256_text(str(chunk["content"])), source_hash),
+        )
+        if chunk_fts:
+            conn.execute("INSERT INTO chunk_fts(chunk_id, doc_path, heading, content) VALUES(?, ?, ?, ?)", (int(cursor.lastrowid), doc_path, chunk["heading"], chunk["content"]))
+        created += 1
+    return created, True
+
+
 def main() -> None:
     args = parse_args("Reindex person memory notes into SQLite.")
     root = store_root(args.store)
@@ -152,11 +235,26 @@ def main() -> None:
             f"DELETE FROM scores WHERE path NOT IN ({placeholders})",
             tuple(sorted(current_paths)),
         )
+        conn.execute(
+            f"DELETE FROM chunks WHERE doc_path NOT IN ({placeholders})",
+            tuple(sorted(current_paths)),
+        )
+        try:
+            conn.execute(f"DELETE FROM chunk_fts WHERE doc_path NOT IN ({placeholders})", tuple(sorted(current_paths)))
+        except sqlite3.OperationalError:
+            pass
     else:
         conn.execute("DELETE FROM documents")
         conn.execute("DELETE FROM scores")
+        conn.execute("DELETE FROM chunks")
+        try:
+            conn.execute("DELETE FROM chunk_fts")
+        except sqlite3.OperationalError:
+            pass
 
     indexed = 0
+    chunks_indexed = 0
+    chunks_reused = 0
     for path in files:
         text = read_text(path)
         meta, body = split_frontmatter(text)
@@ -229,6 +327,10 @@ def main() -> None:
             ),
         )
         conn.execute(
+            "UPDATE documents SET memory_id=?, schema_version=?, content_hash=? WHERE path=?",
+            (str(meta.get("memory_id", "")), int(meta.get("schema_version", 1) or 1), sha256_text(text), doc_path),
+        )
+        conn.execute(
             """
             INSERT INTO scores(path, confidence)
             VALUES(?, ?)
@@ -236,6 +338,9 @@ def main() -> None:
             """,
             (doc_path, confidence),
         )
+        chunk_count, changed = sync_chunks(conn, doc_path, text)
+        chunks_indexed += chunk_count
+        chunks_reused += 0 if changed else 1
         if fts_enabled:
             related_sources = parse_list_text(meta.get("related_sources", []))
             content_terms = " ".join(
@@ -279,7 +384,7 @@ def main() -> None:
         indexed += 1
     conn.commit()
     conn.close()
-    emit({"status": "ok", "indexed": indexed, "fts_enabled": fts_enabled, "store": str(root)})
+    emit({"status": "ok", "indexed": indexed, "chunks_indexed": chunks_indexed, "chunks_reused": chunks_reused, "fts_enabled": fts_enabled, "store": str(root)})
 
 
 if __name__ == "__main__":

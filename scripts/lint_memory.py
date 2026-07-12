@@ -49,6 +49,10 @@ def main() -> None:
         if not path.exists():
             issues.append(issue("warning", "missing_view", f"Missing generated view `{filename}`.", path=str(path)))
 
+    migration_rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+    if [str(row[0]) for row in migration_rows] != ["001", "002", "003", "004"]:
+        issues.append(issue("error", "schema_migrations_incomplete", "The store has not completed all Meta Memory 2.0 migrations."))
+
     rows = conn.execute(
         """
         SELECT
@@ -63,6 +67,12 @@ def main() -> None:
         GROUP BY d.path, d.subject_id, d.memory_kind, d.page_role, d.canonical
         """
     ).fetchall()
+    claim_backed_paths = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT memory_path FROM claims WHERE COALESCE(memory_path, '') != '' AND EXISTS (SELECT 1 FROM claim_sources WHERE claim_sources.claim_id = claims.id)"
+        ).fetchall()
+    }
 
     canonical_counts: dict[tuple[str, str], int] = Counter()
     long_term_notes: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -71,7 +81,7 @@ def main() -> None:
         key = (str(subject_id or ""), str(memory_kind or ""))
         if int(canonical or 0) == 1:
             canonical_counts[key] += 1
-        if str(memory_kind) in LONG_TERM_KINDS and int(source_count or 0) == 0:
+        if str(memory_kind) in LONG_TERM_KINDS and int(source_count or 0) == 0 and str(path) not in claim_backed_paths:
             issues.append(
                 issue(
                     "warning",
@@ -176,6 +186,28 @@ def main() -> None:
                     age_hours=age_hours,
                 )
             )
+
+    claim_rows = conn.execute(
+        """SELECT c.id, c.subject_id, c.valid_from, c.valid_to, c.memory_path, COUNT(cs.raw_event_id)
+           FROM claims c LEFT JOIN claim_sources cs ON cs.claim_id=c.id
+           GROUP BY c.id, c.subject_id, c.valid_from, c.valid_to, c.memory_path"""
+    ).fetchall()
+    for claim_id, subject_id, valid_from, valid_to, memory_path, source_count in claim_rows:
+        if int(source_count or 0) == 0:
+            issues.append(issue("warning", "claim_without_sources", "Claim has no raw-event evidence.", claim_id=claim_id, subject_id=subject_id))
+        if valid_from and valid_to and str(valid_to) <= str(valid_from):
+            issues.append(issue("error", "invalid_claim_interval", "Claim validity interval ends before it starts.", claim_id=claim_id))
+        if memory_path and not Path(str(memory_path)).exists():
+            issues.append(issue("warning", "missing_claim_file", "Claim points to a missing Markdown file.", claim_id=claim_id, path=memory_path))
+
+    card_rows = conn.execute("SELECT id, subject_id, source_event_ids FROM session_cards").fetchall()
+    for card_id, subject_id, raw_ids in card_rows:
+        try:
+            ids = [int(value) for value in __import__("json").loads(raw_ids or "[]")]
+        except (ValueError, TypeError):
+            ids = []
+        if not ids:
+            issues.append(issue("warning", "empty_session_card", "Session card has no source event IDs.", card_id=card_id, subject_id=subject_id))
 
     conn.close()
     emit(

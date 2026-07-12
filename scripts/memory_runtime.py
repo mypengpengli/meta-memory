@@ -5,13 +5,16 @@ import argparse
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
+from assemble_context import assemble_context
 from classify_memory import classify
+from extract_memory_units import sensitivity as detect_sensitivity
 from ingest_memory import build_payload, load_payload as load_memory_payload, read_input
 from ingest_raw_event import insert_raw_event
 from write_memory import write_payload
-from _common import DEFAULT_STORE_HELP, emit, ensure_store_ready, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, ensure_store_ready, open_db, sha256_text, store_root
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--no-basics", action="store_true", help="Do not prioritize relevant profile/state memories")
     prepare.add_argument("--raw-limit", type=int, default=3, help="Maximum raw evidence snippets to include")
     prepare.add_argument("--skip-raw-evidence", action="store_true", help="Do not search raw events for evidence snippets")
+    prepare.add_argument("--context-token-budget", type=int, default=1800, help="Maximum estimated tokens in context_markdown")
     prepare.add_argument("--context-out-file", help="Write the rendered prompt context to a UTF-8 text file")
     prepare.add_argument("--out-file", help="Write the full JSON result to a UTF-8 file")
 
@@ -321,6 +325,8 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         str(args.candidate_pool),
         "--expand-hops",
         str(args.expand_hops),
+        "--session-id",
+        args.session_id,
     ]
     if args.include_candidates:
         retrieve_args.append("--include-candidates")
@@ -360,7 +366,7 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
             allow_duplicate=args.allow_duplicate,
         )
 
-    context = format_memory_context(retrieved, raw_evidence)
+    context = assemble_context(retrieved, raw_evidence, token_budget=args.context_token_budget)
     if args.context_out_file:
         Path(args.context_out_file).write_text(context, encoding="utf-8")
 
@@ -424,114 +430,132 @@ def capture_reply_artifact(
             related_sources.append(raw_source)
         final_payload["related_sources"] = related_sources
 
-    written = write_payload(root, final_payload, skip_index=False)
+    if not raw_record or not raw_record.get("inserted"):
+        return {"status": "skipped", "reason": "artifact_requires_raw_source"}
+    action = {
+        "plan_id": str(uuid.uuid4()),
+        "action": "CREATE",
+        "subject_id": args.subject_id,
+        "subject_name": args.subject_name,
+        "source_event_ids": [int(raw_record["raw_event_id"])],
+        "memory_kind": str(final_payload["kind"]),
+        "topic": str(final_payload["topic"]),
+        "title": title,
+        "content": reply,
+        "confidence": float(final_payload["confidence"]),
+        "uncertainty": 0.5,
+        "importance": float(final_payload["importance"]),
+        "sensitivity": detect_sensitivity(reply),
+        "verification_state": "unverified",
+    }
+    from apply_memory_plan import apply_plan
 
-    if raw_record and raw_record.get("inserted"):
-        mark_raw_event_organized(
-            root,
-            int(raw_record["raw_event_id"]),
-            classifier_kind=str(classification["recommended_kind"]),
-            classifier_domain=str(classification["recommended_domain"]),
-            target_memory_kind=str(final_payload["kind"]),
-            target_memory_path=str(written["path"]),
-            note={
-                "origin": "reply-artifact",
-                "recommended_kind": classification["recommended_kind"],
-                "underlying_long_term_kind": classification["underlying_long_term_kind"],
-                "classification_confidence": classification["classification_confidence"],
-                "final_kind": final_payload["kind"],
-            },
-            link_role="reply-artifact",
-        )
+    applied = apply_plan(root, {"schema_version": 2, "subject_id": args.subject_id, "policy": "conservative", "actions": [action]})
+    if applied["status"] != "ok" or applied["results"][0]["status"] != "applied":
+        return {"status": "pending_review", "classification": classification, "plan": action, "applied": applied}
+    written = applied["results"][0]
+    mark_raw_event_organized(
+        root,
+        int(raw_record["raw_event_id"]),
+        classifier_kind=str(classification["recommended_kind"]),
+        classifier_domain=str(classification["recommended_domain"]),
+        target_memory_kind=str(final_payload["kind"]),
+        target_memory_path=str(written.get("path", "")),
+        note={"origin": "reply-artifact-v2", "plan_id": action["plan_id"], "final_kind": final_payload["kind"]},
+        link_role="reply-artifact",
+    )
 
     return {
         "status": "ok",
         "classification": classification,
-        "final_payload": final_payload,
+        "plan": action,
         "written": written,
+        "applied": applied,
     }
 
 
 def remember_memory(args: argparse.Namespace) -> dict[str, object]:
     root = store_root(args.store)
     bootstrap = ensure_store_ready(root)
+    if args.skip_raw_record:
+        raise SystemExit("V2 remember requires a raw source record so it can deduplicate and validate provenance.")
     payload = load_memory_payload(args.payload_file)
     title, content = read_input(args, payload)
     subject_id = str(payload.get("subject_id", args.subject_id))
     subject_name = str(payload.get("subject_name", args.subject_name))
 
-    raw_record = None
-    if not args.skip_raw_record:
-        raw_record = insert_raw_event(
-            root,
-            subject_id=subject_id,
-            subject_name=subject_name,
-            session_id=args.session_id,
-            source_type="explicit-memory",
-            source_ref=args.source_ref,
-            topic_hint=args.topic_hint or args.topic or "",
-            domain_hint=args.domain_hint or args.domain or "",
-            event_time=args.event_time,
-            content=content,
-            allow_duplicate=args.allow_duplicate,
-        )
-        if raw_record.get("inserted"):
-            set_raw_event_state(
-                root,
-                int(raw_record["raw_event_id"]),
-                "in_progress",
-                {"origin": "explicit-remember", "stage": "writing"},
-            )
-
+    raw_record = insert_raw_event(
+        root,
+        subject_id=subject_id,
+        subject_name=subject_name,
+        session_id=args.session_id,
+        source_type="explicit-memory",
+        source_ref=args.source_ref,
+        topic_hint=args.topic_hint or args.topic or "",
+        domain_hint=args.domain_hint or args.domain or "",
+        event_time=args.event_time,
+        content=content,
+        allow_duplicate=args.allow_duplicate,
+    )
+    if not raw_record.get("inserted"):
+        return {"status": "ok", "command": "remember", "store_bootstrap": bootstrap, "raw_event": raw_record, "deduplicated": True}
+    set_raw_event_state(root, int(raw_record["raw_event_id"]), "in_progress", {"origin": "explicit-remember", "stage": "planning"})
     classification = classify(title, content, subject_id, subject_name)
-    final_payload = build_payload(classification, payload, args, title, content)
+    recommended = str(classification["recommended_kind"])
+    kind = args.force_kind or (str(classification["underlying_long_term_kind"]) if args.use_underlying_kind or recommended in {"candidate", "session"} else recommended)
+    confidence = max(float(classification["suggested_payload"]["confidence"]), 0.95)
+    conn = open_db(root)
+    existing = conn.execute("SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected')", (subject_id, sha256_text(content))).fetchone()
+    conn.close()
+    action = {
+        "plan_id": str(uuid.uuid4()),
+        "subject_id": subject_id,
+        "subject_name": subject_name,
+        "unit_id": None,
+        "source_event_ids": [int(raw_record["raw_event_id"])],
+        "topic": args.topic or str(classification["suggested_payload"]["topic"]),
+        "confidence": confidence,
+        "uncertainty": 0.0,
+        "importance": args.importance if args.importance is not None else float(classification["suggested_payload"]["importance"]),
+        "sensitivity": detect_sensitivity(content),
+        "memory_kind": kind,
+        "title": title,
+        "content": content,
+        "verification_state": "verified" if kind not in {"candidate", "session"} else "unverified",
+        "valid_from": args.start_at or args.event_time or "",
+        "valid_to": args.end_at or "",
+    }
+    if existing:
+        action.update({"action": "CORROBORATE", "target_claim_id": str(existing[0]), "title": str(existing[1]), "memory_kind": str(existing[2]), "content": ""})
+    else:
+        action["action"] = "CREATE"
+    from apply_memory_plan import apply_plan
 
-    if raw_record and raw_record.get("inserted"):
-        raw_source = f"raw_event:{raw_record['raw_event_id']}"
-        final_payload["source"] = raw_source
-        related_sources = list(final_payload.get("related_sources", []))
-        if raw_source not in related_sources:
-            related_sources.append(raw_source)
-        final_payload["related_sources"] = related_sources
-
-    try:
-        written = write_payload(root, final_payload, skip_index=args.skip_index)
-    except Exception:
-        if raw_record and raw_record.get("inserted"):
-            set_raw_event_state(
-                root,
-                int(raw_record["raw_event_id"]),
-                "pending",
-                {"origin": "explicit-remember", "stage": "write_failed"},
-            )
-        raise
-
-    if raw_record and raw_record.get("inserted"):
-        mark_raw_event_organized(
-            root,
-            int(raw_record["raw_event_id"]),
-            classifier_kind=str(classification["recommended_kind"]),
-            classifier_domain=str(classification["recommended_domain"]),
-            target_memory_kind=str(final_payload["kind"]),
-            target_memory_path=str(written["path"]),
-            note={
-                "origin": "explicit-remember",
-                "recommended_kind": classification["recommended_kind"],
-                "underlying_long_term_kind": classification["underlying_long_term_kind"],
-                "classification_confidence": classification["classification_confidence"],
-                "final_kind": final_payload["kind"],
-            },
-            link_role="explicit-remember",
-        )
+    applied = apply_plan(root, {"schema_version": 2, "subject_id": subject_id, "policy": "balanced", "actions": [action]}, skip_index=args.skip_index)
+    if applied["status"] != "ok" or not applied["results"] or applied["results"][0]["status"] != "applied":
+        set_raw_event_state(root, int(raw_record["raw_event_id"]), "pending", {"origin": "explicit-remember", "stage": "validation_or_apply_failed", "result": applied})
+        return {"status": "invalid", "command": "remember", "store_bootstrap": bootstrap, "classification": classification, "raw_event": raw_record, "plan": action, "applied": applied}
+    written = applied["results"][0]
+    mark_raw_event_organized(
+        root,
+        int(raw_record["raw_event_id"]),
+        classifier_kind=str(classification["recommended_kind"]),
+        classifier_domain=str(classification["recommended_domain"]),
+        target_memory_kind=kind,
+        target_memory_path=str(written.get("path", "")),
+        note={"origin": "explicit-remember-v2", "plan_id": action["plan_id"], "final_kind": kind},
+        link_role="explicit-remember",
+    )
 
     result = {
         "status": "ok",
         "command": "remember",
         "store_bootstrap": bootstrap,
         "classification": classification,
-        "final_payload": final_payload,
+        "plan": action,
         "raw_event": raw_record,
         "written": written,
+        "applied": applied,
     }
     write_json_file(args.out_file, result)
     return result

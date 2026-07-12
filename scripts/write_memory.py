@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -271,6 +273,8 @@ def build_meta_from_payload(payload: dict[str, object], title: str, content: str
         derive_related_topics(title, content, payload),
     )
     return {
+        "schema_version": int(payload.get("schema_version", 2) or 2),
+        "memory_id": str(payload.get("memory_id", "")),
         "subject_id": str(payload.get("subject_id", "person-unknown")),
         "subject_name": str(payload.get("subject_name", "Unknown")),
         "memory_kind": kind,
@@ -291,6 +295,9 @@ def build_meta_from_payload(payload: dict[str, object], title: str, content: str
         "related_sources": as_list(payload.get("related_sources", payload.get("related_source", []))),
         "supersedes": as_list(payload.get("supersedes", [])),
         "replaced_by": as_list(payload.get("replaced_by", [])),
+        "verification_state": str(payload.get("verification_state", "")),
+        "sensitivity": str(payload.get("sensitivity", "normal")),
+        "source_event_ids": as_list(payload.get("source_event_ids", [])),
     }
 
 
@@ -351,6 +358,19 @@ def append_body(existing_body: str, content: str) -> str:
     return section
 
 
+def atomic_write(path: Path, content: str) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def run_indexing(store: Path) -> list[dict[str, object]]:
     base = Path(__file__).resolve().parent
     steps: list[dict[str, object]] = []
@@ -389,6 +409,8 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
     meta = build_meta_from_payload(payload, title, content)
 
     if mode == "append" and target.exists():
+        if bool(payload.get("canonical", False)):
+            raise ValueError("Canonical memories cannot use append mode; submit a validated REFINE plan instead.")
         existing_meta, existing_body = split_frontmatter(read_text(target))
         if not existing_meta:
             existing_meta = parse_frontmatter(target)
@@ -401,10 +423,10 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
             elif key not in merged:
                 merged[key] = value
         body = append_body(existing_body, content)
-        target.write_text(compose_markdown(merged, body), encoding="utf-8")
+        atomic_write(target, compose_markdown(merged, body))
     else:
         body = build_body(title, content)
-        target.write_text(compose_markdown(meta, body), encoding="utf-8")
+        atomic_write(target, compose_markdown(meta, body))
 
     steps: list[dict[str, object]] = []
     if not skip_index:

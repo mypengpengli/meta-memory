@@ -15,6 +15,8 @@ def main() -> None:
     ).fetchall()
     updated = 0
     for path, hit_count, confidence in rows:
+        # `hit_count` moves only through mark_memory_usage.py, never merely
+        # because a result was injected into context.
         score = round(math.log1p(hit_count) + float(confidence), 4)
         conn.execute(
             "UPDATE scores SET rank_score = ? WHERE path = ?",

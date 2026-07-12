@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Validate memory plans before they can affect claims or Markdown files."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
+from config import get
+
+
+ACTIONS = {"CREATE", "CORROBORATE", "REFINE", "CORRECT", "SUPERSEDE", "IGNORE"}
+LONG_TERM = {"profile", "state", "event", "relationship", "goal", "domain"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate a JSON memory consolidation plan.")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
+    parser.add_argument("--plan-file", required=True)
+    return parser.parse_args()
+
+
+def load_plan(path: str) -> dict[str, object]:
+    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict) or not isinstance(value.get("actions"), list):
+        raise ValueError("Memory plan must be an object with an actions array.")
+    return value
+
+
+def source_ids(action: dict[str, object]) -> list[int]:
+    values = action.get("source_event_ids", [])
+    if not isinstance(values, list):
+        return []
+    result: list[int] = []
+    for value in values:
+        try:
+            result.append(int(value))
+        except (TypeError, ValueError):
+            pass
+    return list(dict.fromkeys(result))
+
+
+def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
+    conn = open_db(root)
+    errors: list[dict[str, object]] = []
+    warnings: list[dict[str, object]] = []
+    plan_subject = str(plan.get("subject_id", ""))
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(plan.get("actions", [])):
+        if not isinstance(raw, dict):
+            errors.append({"index": index, "code": "invalid_action", "message": "Action must be an object."})
+            continue
+        action = raw
+        action_id = str(action.get("plan_id", ""))
+        action_name = str(action.get("action", "")).upper()
+        subject_id = str(action.get("subject_id", plan_subject))
+        if not action_id or action_id in seen_ids:
+            errors.append({"index": index, "code": "plan_id", "message": "Every action needs a unique plan_id."})
+        seen_ids.add(action_id)
+        if action_name not in ACTIONS:
+            errors.append({"index": index, "code": "action", "message": f"Unsupported action: {action_name}."})
+        if not subject_id:
+            errors.append({"index": index, "code": "subject", "message": "A subject_id is required."})
+        ids = source_ids(action)
+        if action_name != "IGNORE" and not ids:
+            errors.append({"index": index, "code": "sources", "message": "Non-IGNORE actions require source_event_ids."})
+        if ids:
+            placeholders = ", ".join("?" for _ in ids)
+            found = conn.execute(f"SELECT id, subject_id, source_type FROM raw_events WHERE id IN ({placeholders})", tuple(ids)).fetchall()
+            if len(found) != len(ids):
+                errors.append({"index": index, "code": "sources_missing", "message": "One or more source events do not exist."})
+            if any(str(row[1]) != subject_id for row in found):
+                errors.append({"index": index, "code": "cross_subject_source", "message": "Sources must belong to the action subject."})
+            if str(action.get("memory_kind", "")) == "profile" and all(str(row[2]) == "conversation-assistant" for row in found):
+                errors.append({"index": index, "code": "assistant_profile", "message": "Assistant-only evidence cannot modify a profile."})
+        requested_path = str(action.get("target_path", ""))
+        if requested_path:
+            candidate = Path(requested_path).expanduser().resolve()
+            try:
+                candidate.relative_to(root.resolve())
+            except ValueError:
+                errors.append({"index": index, "code": "path_traversal", "message": "target_path must stay inside memory-data."})
+        target_id = str(action.get("target_claim_id", ""))
+        if action_name in {"CORROBORATE", "REFINE", "CORRECT", "SUPERSEDE"}:
+            if not target_id:
+                errors.append({"index": index, "code": "target", "message": f"{action_name} requires target_claim_id."})
+            else:
+                row = conn.execute("SELECT subject_id FROM claims WHERE id=?", (target_id,)).fetchone()
+                if row is None:
+                    errors.append({"index": index, "code": "target_missing", "message": "Target claim does not exist."})
+                elif str(row[0]) != subject_id:
+                    errors.append({"index": index, "code": "cross_subject_target", "message": "Target claim belongs to another subject."})
+        if action_name in {"CORRECT", "SUPERSEDE"} and len(ids) < 2:
+            errors.append({"index": index, "code": "weak_temporal_change", "message": "CORRECT and SUPERSEDE require at least two evidence events."})
+        kind = str(action.get("memory_kind", "candidate"))
+        confidence = float(action.get("confidence", 0.0) or 0.0)
+        sensitive = str(action.get("sensitivity", "normal")) == "sensitive"
+        if kind == "profile" and confidence < float(get("consolidation.profile_confidence_threshold")):
+            errors.append({"index": index, "code": "profile_threshold", "message": "Profile changes require high confidence."})
+        if sensitive and confidence < float(get("consolidation.sensitive_confidence_threshold")):
+            errors.append({"index": index, "code": "sensitivity_threshold", "message": "Sensitive facts require the stricter confidence threshold."})
+        if kind in LONG_TERM and str(action.get("verification_state", "unverified")) == "verified" and confidence < 0.8:
+            errors.append({"index": index, "code": "unverified_promotion", "message": "Low-confidence candidate cannot become verified long-term memory."})
+        if action_name == "CREATE" and not str(action.get("content", "")).strip():
+            errors.append({"index": index, "code": "content", "message": "CREATE requires claim content."})
+        if action_name in {"CORRECT", "SUPERSEDE"} and not str(action.get("content", "")).strip():
+            errors.append({"index": index, "code": "replacement_content", "message": f"{action_name} requires replacement content."})
+        if action_name in {"CORRECT", "SUPERSEDE"}:
+            warnings.append({"index": index, "code": "review_recommended", "message": f"{action_name} is a high-risk historical change and normally enters review."})
+    conn.close()
+    return {"status": "ok", "valid": not errors, "errors": errors, "warnings": warnings, "action_count": len(plan.get("actions", []))}
+
+
+def main() -> None:
+    args = parse_args()
+    emit(validate_plan(store_root(args.store), load_plan(args.plan_file)))
+
+
+if __name__ == "__main__":
+    main()

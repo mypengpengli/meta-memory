@@ -1,0 +1,19 @@
+# Meta Memory 2.0 defaults.  The runtime remains dependency-light and reads
+# these values through scripts/config.py; explicit CLI flags always win.
+schema_version: 3
+heartbeat:
+  session_flush_min_events: 5
+  max_events: 20
+  interval_minutes: 30
+consolidation:
+  default_policy: conservative
+  profile_confidence_threshold: 0.9
+  sensitive_confidence_threshold: 0.97
+retrieval:
+  context_token_budget: 1800
+  chunk_chars: 1200
+  chunk_overlap_chars: 150
+  rrf_k: 60
+  enable_embeddings: false
+llm:
+  enable_fallback: false
