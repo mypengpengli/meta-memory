@@ -81,7 +81,13 @@ def run_retrieve(root: Path, case: dict[str, object], args: argparse.Namespace) 
     if bool(case.get("include_candidates", False)):
         command.append("--include-candidates")
 
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        # Preserve the child process error in CI.  Otherwise platform-specific
+        # retrieval failures are reduced to an unhelpful exit code here.
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"retrieve_memories failed for query {query!r}: {detail}") from exc
     return json.loads(result.stdout)
 
 
