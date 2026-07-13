@@ -136,6 +136,55 @@ def parse_args() -> argparse.Namespace:
     remember.add_argument("--skip-index", action="store_true", help="Do not reindex/rescore after writing")
     remember.add_argument("--out-file", help="Write the full JSON result to a UTF-8 file")
 
+    session_flush = subparsers.add_parser("session-flush", help="Build a session card and queue restricted review")
+    session_flush.add_argument("--store", help=DEFAULT_STORE_HELP); session_flush.add_argument("--subject-id", required=True); session_flush.add_argument("--session-id", default="")
+    session_search = subparsers.add_parser("session-search", help="Discover original archived sessions")
+    session_search.add_argument("--store", help=DEFAULT_STORE_HELP); session_search.add_argument("--subject-id", required=True); session_search.add_argument("--query", required=True)
+    session_scroll = subparsers.add_parser("session-scroll", help="Scroll original messages around an anchor")
+    session_scroll.add_argument("--store", help=DEFAULT_STORE_HELP); session_scroll.add_argument("--session-id", required=True); session_scroll.add_argument("--around-message-id", type=int, required=True); session_scroll.add_argument("--window", type=int, default=6)
+    extract = subparsers.add_parser("extract-units", help="Extract atomic units from session cards")
+    extract.add_argument("--store", help=DEFAULT_STORE_HELP); extract.add_argument("--subject-id"); extract.add_argument("--limit", type=int, default=20)
+    dream = subparsers.add_parser("dream", help="Run deferred extraction and semantic consolidation")
+    dream.add_argument("--store", help=DEFAULT_STORE_HELP); dream.add_argument("--subject-id", required=True); dream.add_argument("--policy", default="conservative"); dream.add_argument("--apply", action="store_true")
+    review_run = subparsers.add_parser("review-run", help="Process durable background review jobs")
+    review_run.add_argument("--store", help=DEFAULT_STORE_HELP); review_run.add_argument("--max-jobs", type=int, default=10); review_run.add_argument("--apply-low-risk", action="store_true")
+    review_status = subparsers.add_parser("review-status", help="Show durable background review jobs")
+    review_status.add_argument("--store", help=DEFAULT_STORE_HELP)
+    for name, help_text in [("proposals-list", "List pending memory proposals"), ("proposals-list", "List pending memory proposals")]:
+        if name not in subparsers.choices:
+            item = subparsers.add_parser(name, help=help_text); item.add_argument("--store", help=DEFAULT_STORE_HELP)
+    proposal_show = subparsers.add_parser("proposal-show", help="Show a memory proposal")
+    proposal_show.add_argument("--store", help=DEFAULT_STORE_HELP); proposal_show.add_argument("--id", required=True)
+    proposal_diff = subparsers.add_parser("proposal-diff", help="Show a memory proposal diff")
+    proposal_diff.add_argument("--store", help=DEFAULT_STORE_HELP); proposal_diff.add_argument("--id", required=True)
+    proposal_approve = subparsers.add_parser("proposal-approve", help="Approve exactly one staged memory proposal")
+    proposal_approve.add_argument("--store", help=DEFAULT_STORE_HELP); proposal_approve.add_argument("--id"); proposal_approve.add_argument("--all-low-risk", action="store_true")
+    proposal_reject = subparsers.add_parser("proposal-reject", help="Reject a staged memory proposal")
+    proposal_reject.add_argument("--store", help=DEFAULT_STORE_HELP); proposal_reject.add_argument("--id", required=True); proposal_reject.add_argument("--note", default="")
+    for command, feedback in [("mark-used", "used"), ("mark-helpful", "helpful"), ("mark-unhelpful", "unhelpful"), ("mark-outdated", "outdated"), ("mark-incorrect", "incorrect")]:
+        marker = subparsers.add_parser(command, help=f"Record {feedback} memory feedback")
+        marker.add_argument("--store", help=DEFAULT_STORE_HELP); marker.add_argument("--claim-id", required=True); marker.add_argument("--note", default="")
+    for command, help_text in [("hot-memory-build", "Compile bounded hot-memory files"), ("hot-memory-show", "Show the frozen hot-memory projection"), ("hot-memory-status", "Show hot-memory snapshot metadata")]:
+        hot = subparsers.add_parser(command, help=help_text); hot.add_argument("--store", help=DEFAULT_STORE_HELP); hot.add_argument("--subject-id", required=True)
+    skills_pending = subparsers.add_parser("skills-pending", help="List skill changes awaiting approval")
+    skills_pending.add_argument("--store", help=DEFAULT_STORE_HELP)
+    skill_diff = subparsers.add_parser("skill-diff", help="Show a staged skill diff")
+    skill_diff.add_argument("--store", help=DEFAULT_STORE_HELP); skill_diff.add_argument("--id", required=True)
+    skill_approve = subparsers.add_parser("skill-approve", help="Approve and write a staged skill change")
+    skill_approve.add_argument("--store", help=DEFAULT_STORE_HELP); skill_approve.add_argument("--id", required=True)
+    skill_reject = subparsers.add_parser("skill-reject", help="Reject a staged skill change")
+    skill_reject.add_argument("--store", help=DEFAULT_STORE_HELP); skill_reject.add_argument("--id", required=True); skill_reject.add_argument("--note", default="")
+    explain = subparsers.add_parser("explain-recall", help="Explain deterministic recall candidates")
+    explain.add_argument("--store", help=DEFAULT_STORE_HELP); explain.add_argument("--subject-id", required=True); explain.add_argument("--query", required=True)
+    provider_status = subparsers.add_parser("provider-status", help="Show provider and runtime health")
+    provider_status.add_argument("--store", help=DEFAULT_STORE_HELP)
+    worker_status = subparsers.add_parser("worker-status", help="Show durable worker queue state")
+    worker_status.add_argument("--store", help=DEFAULT_STORE_HELP)
+    maintenance = subparsers.add_parser("maintenance", help="Run the complete 2.1 maintenance sequence")
+    maintenance.add_argument("--store", help=DEFAULT_STORE_HELP); maintenance.add_argument("--policy", default="conservative"); maintenance.add_argument("--max-review-jobs", type=int, default=20); maintenance.add_argument("--shadow-high-risk", action="store_true")
+    doctor = subparsers.add_parser("doctor", help="Report store health without changing data")
+    doctor.add_argument("--store", help=DEFAULT_STORE_HELP)
+
     return parser.parse_args()
 
 
@@ -294,6 +343,11 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     if not query:
         raise SystemExit("Query is required via --query or --query-file.")
 
+    from build_hot_memory import build_hot_memory, load_hot_memory
+    from query_router import route_query
+    route = route_query(query)
+    build_hot_memory(root, subject_id=args.subject_id)
+    hot_context, hot_snapshot_hash = load_hot_memory(root)
     heartbeat = None
     if not args.skip_heartbeat:
         heartbeat_args = [
@@ -375,6 +429,9 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         "command": "prepare-context",
         "store_bootstrap": bootstrap,
         "query": query,
+        "query_route": route,
+        "hot_memory_snapshot_hash": hot_snapshot_hash,
+        "static_hot_context": hot_context,
         "recorded_raw_event": recorded,
         "heartbeat": heartbeat,
         "retrieved": retrieved,
@@ -504,31 +561,25 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
     recommended = str(classification["recommended_kind"])
     kind = args.force_kind or (str(classification["underlying_long_term_kind"]) if args.use_underlying_kind or recommended in {"candidate", "session"} else recommended)
     confidence = max(float(classification["suggested_payload"]["confidence"]), 0.95)
-    conn = open_db(root)
-    existing = conn.execute("SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected')", (subject_id, sha256_text(content))).fetchone()
-    conn.close()
-    action = {
-        "plan_id": str(uuid.uuid4()),
-        "subject_id": subject_id,
-        "subject_name": subject_name,
-        "unit_id": None,
-        "source_event_ids": [int(raw_record["raw_event_id"])],
-        "topic": args.topic or str(classification["suggested_payload"]["topic"]),
-        "confidence": confidence,
-        "uncertainty": 0.0,
-        "importance": args.importance if args.importance is not None else float(classification["suggested_payload"]["importance"]),
-        "sensitivity": detect_sensitivity(content),
-        "memory_kind": kind,
-        "title": title,
-        "content": content,
-        "verification_state": "verified" if kind not in {"candidate", "session"} else "unverified",
-        "valid_from": args.start_at or args.event_time or "",
-        "valid_to": args.end_at or "",
+    # Explicit remember uses the same semantic consolidation path as the
+    # background pipeline. Hash equality is only the first fast-path; same
+    # predicate/object and state changes are handled as corroborate/refine/
+    # reviewable temporal actions as well.
+    from consolidate_memories import build_plan_for_unit
+    from extract_memory_units import structured_fields
+    fields = structured_fields(content, args.topic or str(classification["suggested_payload"]["topic"]), args.domain or "")
+    unit = {
+        "id": None, "subject_id": subject_id, "source_event_ids": [int(raw_record["raw_event_id"])], "topic": args.topic or str(fields["topic"]),
+        "domain": args.domain or str(fields["domain"]), "content": content, "content_hash": sha256_text(content), "confidence": confidence,
+        "uncertainty": 0.0, "importance": args.importance if args.importance is not None else float(classification["suggested_payload"]["importance"]),
+        "durability": float(fields["durability"]), "sensitivity": detect_sensitivity(content), "unit_kind": kind,
+        "predicate": str(fields["predicate"]), "subject_text": str(fields["subject_text"]), "object_text": str(fields["object_text"]), "qualifiers": {},
+        "valid_from": args.start_at or args.event_time or "", "valid_to": args.end_at or "", "observed_at": "", "entities": [],
     }
-    if existing:
-        action.update({"action": "CORROBORATE", "target_claim_id": str(existing[0]), "title": str(existing[1]), "memory_kind": str(existing[2]), "content": ""})
-    else:
-        action["action"] = "CREATE"
+    action = build_plan_for_unit(root, unit, policy="balanced")
+    action.update({"subject_name": subject_name, "title": title, "origin": "explicit_remember"})
+    if action["action"] == "CREATE":
+        action.update({"memory_kind": kind, "verification_state": "verified" if kind not in {"candidate", "session"} else "unverified"})
     from apply_memory_plan import apply_plan
 
     applied = apply_plan(root, {"schema_version": 2, "subject_id": subject_id, "policy": "balanced", "actions": [action]}, skip_index=args.skip_index)
@@ -653,6 +704,82 @@ def main() -> None:
     if args.command == "finalize-turn":
         emit(finalize_turn(args))
         return
+    root = store_root(getattr(args, "store", None))
+    if args.command == "session-flush":
+        from background_review import enqueue_review
+        from build_session_card import build_cards
+        cards = build_cards(root, subject_id=args.subject_id, session_id=args.session_id or None, force=True)
+        event_ids = [event_id for card in cards["cards"] for event_id in card.get("source_event_ids", [])]
+        emit({"status": "ok", "cards": cards, "review": enqueue_review(root, subject_id=args.subject_id, session_id=args.session_id, event_start_id=min(event_ids) if event_ids else 0, event_end_id=max(event_ids) if event_ids else 0, trigger_type="explicit_flush")})
+        return
+    if args.command == "session-search":
+        from session_search import discovery
+        emit(discovery(root, subject_id=args.subject_id, query=args.query)); return
+    if args.command == "session-scroll":
+        from session_search import scroll
+        emit(scroll(root, session_id=args.session_id, around_message_id=args.around_message_id, window=args.window)); return
+    if args.command == "extract-units":
+        from extract_memory_units import extract_units
+        emit(extract_units(root, subject_id=args.subject_id, limit=args.limit)); return
+    if args.command == "dream":
+        from consolidate_memories import build_plan
+        from extract_memory_units import extract_units
+        units = extract_units(root, subject_id=args.subject_id)
+        plan = build_plan(root, args.subject_id, policy=args.policy)
+        from apply_memory_plan import apply_plan
+        emit({"status": "ok", "units": units, "plan": plan, "result": apply_plan(root, plan) if args.apply else {"status": "shadow", "actions": plan["actions"]}}); return
+    if args.command == "review-run":
+        from background_review import run_pending
+        emit(run_pending(root, max_jobs=args.max_jobs, apply_low_risk=args.apply_low_risk)); return
+    if args.command == "review-status":
+        conn = open_db(root); rows = conn.execute("SELECT job_uid, subject_id, session_id, trigger_type, status, attempt_count, last_error, created_at FROM review_jobs ORDER BY created_at DESC").fetchall(); conn.close()
+        emit({"status": "ok", "jobs": [{"id": row[0], "subject_id": row[1], "session_id": row[2], "trigger": row[3], "status": row[4], "attempts": row[5], "error": row[6], "created_at": row[7]} for row in rows]}); return
+    if args.command.startswith("proposal-") or args.command == "proposals-list":
+        from proposal_manager import get_proposal, list_proposals, reject_proposal
+        if args.command == "proposals-list": emit({"status": "ok", "proposals": list_proposals(root)}); return
+        if args.command in {"proposal-show", "proposal-diff"}:
+            proposal = get_proposal(root, args.id)
+            emit({"status": "ok", "proposal": proposal if args.command == "proposal-show" else {"id": args.id, "diff": proposal["diff"] if proposal else ""}}); return
+        if args.command == "proposal-reject": emit({"status": "ok", "rejected": reject_proposal(root, args.id, note=args.note)}); return
+        if args.command == "proposal-approve":
+            proposals = [get_proposal(root, args.id)] if args.id else [get_proposal(root, item["id"]) for item in list_proposals(root)]
+            results = []
+            for proposal in proposals:
+                if not proposal or (args.all_low_risk and str(proposal["action"]) in {"CORRECT", "SUPERSEDE"}): continue
+                from apply_memory_plan import apply_plan
+                result = apply_plan(root, {"schema_version": 3, "subject_id": proposal["subject_id"], "policy": "balanced", "actions": [proposal["plan"]]}, review_approved=True)
+                conn = open_db(root); conn.execute("UPDATE write_proposals SET status='approved', reviewed_at=CURRENT_TIMESTAMP WHERE proposal_uid=? AND status='pending'", (proposal["id"],)); conn.commit(); conn.close(); results.append(result)
+            emit({"status": "ok", "results": results}); return
+    if args.command.startswith("mark-"):
+        from feedback_memory import record_feedback
+        emit(record_feedback(root, claim_id=args.claim_id, feedback_type=args.command.removeprefix("mark-").replace("helpful", "helpful"), note=args.note)); return
+    if args.command.startswith("hot-memory-"):
+        from build_hot_memory import build_hot_memory, load_hot_memory
+        if args.command == "hot-memory-build": emit(build_hot_memory(root, subject_id=args.subject_id, force=True)); return
+        if args.command == "hot-memory-show":
+            build_hot_memory(root, subject_id=args.subject_id); text, digest = load_hot_memory(root); emit({"status": "ok", "snapshot_hash": digest, "content": text}); return
+        snapshot = root / "hot" / "snapshot.json"; emit({"status": "ok", "snapshot": json.loads(snapshot.read_text(encoding="utf-8")) if snapshot.exists() else {}}); return
+    if args.command.startswith("skill") or args.command == "skills-pending":
+        from procedural_learning import approve_skill, skill_diff
+        from proposal_manager import list_proposals, reject_proposal
+        if args.command == "skills-pending": emit({"status": "ok", "proposals": list_proposals(root, kind="skill")}); return
+        if args.command == "skill-diff": emit({"status": "ok", "diff": skill_diff(root, args.id)}); return
+        if args.command == "skill-approve": emit(approve_skill(root, args.id)); return
+        emit({"status": "ok", "rejected": reject_proposal(root, args.id, note=args.note, kind="skill")}); return
+    if args.command == "explain-recall":
+        from node_search import search_nodes
+        from query_router import route_query
+        emit({"status": "ok", "route": route_query(args.query), "candidates": search_nodes(root, args.subject_id, args.query, include_units=True)}); return
+    if args.command == "provider-status":
+        from doctor import doctor as run_doctor
+        emit({"status": "ok", "builtin_provider": "meta-memory", "external_provider_limit": 1, "health": run_doctor(root)}); return
+    if args.command == "worker-status":
+        conn = open_db(root); rows = conn.execute("SELECT status, COUNT(*) FROM review_jobs GROUP BY status").fetchall(); conn.close(); emit({"status": "ok", "durable_jobs": {str(row[0]): int(row[1]) for row in rows}}); return
+    if args.command == "maintenance":
+        result = run_json_script("run_maintenance.py", "--store", str(root), "--policy", args.policy, "--max-review-jobs", str(args.max_review_jobs), *( ["--shadow-high-risk"] if args.shadow_high_risk else [])); emit(result); return
+    if args.command == "doctor":
+        from doctor import doctor as run_doctor
+        emit(run_doctor(root)); return
     raise SystemExit(f"Unsupported command: {args.command}")
 
 

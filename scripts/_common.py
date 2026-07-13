@@ -22,6 +22,7 @@ DEFAULT_DIRS = [
     "domains",
     "sessions",
     "candidates",
+    "hot",
     "archive/raw",
     "archive/imports",
     "resources",
@@ -37,6 +38,7 @@ REPORTABLE_LAYOUT = [
     "domains",
     "sessions",
     "candidates",
+    "hot",
     "archive/raw",
     "archive/imports",
 ]
@@ -81,6 +83,11 @@ DOCUMENT_COLUMNS = {
     "related_sources": "TEXT",
     "supersedes": "TEXT",
     "replaced_by": "TEXT",
+    "valid_from": "TEXT",
+    "valid_to": "TEXT",
+    "verification_state": "TEXT",
+    "security_state": "TEXT DEFAULT 'clean'",
+    "prompt_eligible": "INTEGER DEFAULT 1",
     "mtime": "REAL",
 }
 
@@ -199,6 +206,13 @@ def open_db(root: Path) -> sqlite3.Connection:
 
     run_migrations(conn)
     return conn
+
+
+def utc_now() -> str:
+    """Return an ISO timestamp in UTC without relying on local host timezone."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def markdown_files(paths: Iterable[Path]) -> list[Path]:

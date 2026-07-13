@@ -231,7 +231,7 @@ def base_score(row: dict[str, object]) -> float:
     score += PAGE_ROLE_BIAS.get(page_role, 0.0)
     if int(row.get("canonical", 0) or 0) == 1:
         score += 0.6
-    if row["end_at"]:
+    if row.get("valid_to") or row["end_at"]:
         score -= 0.2
     return score
 
@@ -244,7 +244,7 @@ def lifecycle_score(row: dict[str, object]) -> tuple[float, list[str]]:
     if status == "superseded" or replaced_by:
         score -= 5.0
         reasons.append("lifecycle:superseded")
-    if row.get("end_at"):
+    if row.get("valid_to") or row.get("end_at"):
         score -= 0.8
         reasons.append("lifecycle:ended")
     if status == "active":
@@ -259,7 +259,7 @@ def select_basics(rows: list[dict[str, object]], top_k: int) -> list[dict[str, o
     for kind in BASIC_KINDS:
         if len(selected) >= top_k:
             break
-        candidates = [row for row in rows if row["memory_kind"] == kind and row["status"] != "superseded"]
+        candidates = [row for row in rows if row["memory_kind"] == kind and row["status"] not in {"superseded", "corrected"} and int(row.get("prompt_eligible", 1) or 0) == 1]
         canonical = [row for row in candidates if int(row.get("canonical", 0) or 0) == 1]
         preferred = canonical[0] if canonical else (candidates[0] if candidates else None)
         if preferred:
@@ -306,10 +306,12 @@ def fts_scores(conn, terms: list[str], filters: dict[str, object], limit: int) -
         params.extend(kinds)
     if not include_candidates:
         clauses.append("LOWER(d.memory_kind) != 'candidate'")
-    clauses.append("LOWER(COALESCE(d.status, '')) != 'superseded'")
+    clauses.append("LOWER(COALESCE(d.status, '')) NOT IN ('superseded', 'corrected')")
+    clauses.append("COALESCE(d.security_state, 'clean') NOT IN ('blocked', 'suspicious')")
+    clauses.append("COALESCE(d.prompt_eligible, 1)=1")
     clauses.append("(COALESCE(d.replaced_by, '') = '' OR COALESCE(d.replaced_by, '') = '[]')")
     if valid_at:
-        clauses.append("(COALESCE(d.end_at, '') = '' OR d.end_at > ?)")
+        clauses.append("(COALESCE(d.valid_to, d.end_at, '') = '' OR COALESCE(d.valid_to, d.end_at) > ?)")
         params.append(valid_at)
 
     try:
@@ -350,8 +352,10 @@ def chunk_scores(conn, terms: list[str], filters: dict[str, object], limit: int)
     if not include_candidates:
         clauses.append("LOWER(d.memory_kind) != 'candidate'")
     clauses.append("LOWER(COALESCE(d.status, '')) NOT IN ('superseded', 'corrected')")
+    clauses.append("COALESCE(d.security_state, 'clean') NOT IN ('blocked', 'suspicious')")
+    clauses.append("COALESCE(d.prompt_eligible, 1)=1")
     if valid_at:
-        clauses.append("(COALESCE(d.end_at, '') = '' OR d.end_at > ?)")
+        clauses.append("(COALESCE(d.valid_to, d.end_at, '') = '' OR COALESCE(d.valid_to, d.end_at) > ?)")
         params.append(valid_at)
     try:
         rows = conn.execute(
@@ -478,7 +482,7 @@ def expand_associations(items: list[dict[str, object]], expand_hops: int) -> Non
 
 
 def rrf_fuse(items: list[dict[str, object]], rrf_k: int) -> None:
-    signals = ["field_score", "fts_score", "chunk_score", "embedding_score", "association_score"]
+    signals = ["field_score", "fts_score", "chunk_score", "embedding_score", "entity_score", "graph_score", "association_score"]
     for row in items:
         row["rrf_score"] = 0.0
     for signal in signals:
@@ -556,9 +560,11 @@ def main() -> None:
         params.extend(kinds)
     if not args.include_candidates:
         clauses.append("LOWER(d.memory_kind) != 'candidate'")
-    clauses.append("LOWER(COALESCE(d.status, '')) != 'superseded'")
+    clauses.append("LOWER(COALESCE(d.status, '')) NOT IN ('superseded', 'corrected')")
+    clauses.append("COALESCE(d.security_state, 'clean') NOT IN ('blocked', 'suspicious')")
+    clauses.append("COALESCE(d.prompt_eligible, 1)=1")
     clauses.append("(COALESCE(d.replaced_by, '') = '' OR COALESCE(d.replaced_by, '') = '[]')")
-    clauses.append("(COALESCE(d.end_at, '') = '' OR d.end_at > ?)")
+    clauses.append("(COALESCE(d.valid_to, d.end_at, '') = '' OR COALESCE(d.valid_to, d.end_at) > ?)")
     params.append(str(filters["valid_at"]))
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -588,6 +594,12 @@ def main() -> None:
             d.related_sources,
             d.supersedes,
             d.replaced_by,
+            d.valid_from,
+            d.valid_to,
+            d.verification_state,
+            d.security_state,
+            d.prompt_eligible,
+            d.memory_id,
             d.mtime,
             COALESCE(s.hit_count, 0) AS hit_count,
             COALESCE(s.confidence, d.confidence, 0.0) AS score_confidence,
@@ -624,6 +636,12 @@ def main() -> None:
         "related_sources",
         "supersedes",
         "replaced_by",
+        "valid_from",
+        "valid_to",
+        "verification_state",
+        "security_state",
+        "prompt_eligible",
+        "memory_id",
         "mtime",
         "hit_count",
         "score_confidence",
@@ -647,12 +665,17 @@ def main() -> None:
         row["fts_score"] = round(fts_score, 4)
         row["chunk_score"] = round(chunk_score, 4)
         row["embedding_score"] = round(float(embedding_score_map.get(str(row["path"]), 0.0) or 0.0), 4)
+        row["entity_score"] = 0.0
+        row["graph_score"] = 0.0
         row["best_chunk"] = {key: chunk[key] for key in ("heading", "start_line", "end_line", "content") if key in chunk}
         row["association_score"] = 0.0
         row["lifecycle_score"] = round(life_score, 4)
         row["total_score"] = round(base_score(row) + life_score, 4)
         row["reasons"] = (reasons + life_reasons)[:6]
         items.append(row)
+
+    from entity_resolution import enrich_retrieval_scores
+    enrich_retrieval_scores(conn, items, terms)
 
     expand_associations(items, args.expand_hops)
     rrf_fuse(items, args.rrf_k)
@@ -663,6 +686,8 @@ def main() -> None:
             + float(row.get("fts_score", 0.0) or 0.0)
             + float(row.get("chunk_score", 0.0) or 0.0)
             + float(row.get("embedding_score", 0.0) or 0.0)
+            + float(row.get("entity_score", 0.0) or 0.0)
+            + float(row.get("graph_score", 0.0) or 0.0)
             + float(row.get("association_score", 0.0) or 0.0),
             4,
         )

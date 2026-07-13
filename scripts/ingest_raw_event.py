@@ -123,6 +123,32 @@ def insert_raw_event(
     event_id = int(cursor.lastrowid)
     conn.close()
 
+    try:
+        from session_archive import record_session_message
+        record_session_message(root, subject_id=subject_id, session_id=session_id, source_type=source_type, content=content, raw_event_id=event_id, timestamp=event_time)
+    except Exception:
+        # The raw evidence write is authoritative. Archive/FTS failure is a
+        # recoverable projection failure and must never drop a user turn.
+        pass
+
+    # Raw evidence and the original dialogue archive deliberately coexist:
+    # provenance needs the former, while user-visible historical discovery
+    # needs the latter.  A failure to index FTS never loses the raw event.
+    try:
+        from session_archive import record_session_message
+
+        record_session_message(
+            root,
+            subject_id=subject_id,
+            session_id=session_id,
+            source_type=source_type,
+            content=content,
+            raw_event_id=event_id,
+            timestamp=event_time,
+        )
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "inserted": True,

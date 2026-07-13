@@ -59,17 +59,19 @@ def snippet(value: str, limit: int = 220) -> str:
 def search_nodes(root, subject_id: str, query: str, *, limit: int = 12, include_units: bool = False, valid_at: str | None = None) -> dict[str, object]:
     conn = open_db(root)
     instant = valid_at or datetime.now(timezone.utc).isoformat()
+    historical = valid_at is not None
     nodes: list[dict[str, object]] = []
     claims = conn.execute(
         """
         SELECT id, memory_kind, topic, title, content, confidence, importance, status, verification_state,
                valid_from, valid_to, support_count, memory_path
         FROM claims
-        WHERE subject_id=? AND status NOT IN ('superseded', 'corrected')
+        WHERE subject_id=? AND status != 'corrected'
+          AND (?=1 OR status != 'superseded')
           AND (valid_from IS NULL OR valid_from='' OR valid_from<=?)
           AND (valid_to IS NULL OR valid_to='' OR valid_to>?)
         """,
-        (subject_id, instant, instant),
+        (subject_id, 1 if historical else 0, instant, instant),
     ).fetchall()
     for row in claims:
         value = f"{row[2]} {row[3]} {row[4]}"

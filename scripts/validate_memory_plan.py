@@ -8,6 +8,7 @@ from pathlib import Path
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 from config import get
+from security_scan import scan_memory_content, security_state
 
 
 ACTIONS = {"CREATE", "CORROBORATE", "REFINE", "CORRECT", "SUPERSEDE", "IGNORE"}
@@ -91,7 +92,7 @@ def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
                     errors.append({"index": index, "code": "target_missing", "message": "Target claim does not exist."})
                 elif str(row[0]) != subject_id:
                     errors.append({"index": index, "code": "cross_subject_target", "message": "Target claim belongs to another subject."})
-        if action_name in {"CORRECT", "SUPERSEDE"} and len(ids) < 2:
+        if action_name in {"CORRECT", "SUPERSEDE"} and len(ids) < 2 and bool(get("consolidation.require_two_sources_for_correct")):
             errors.append({"index": index, "code": "weak_temporal_change", "message": "CORRECT and SUPERSEDE require at least two evidence events."})
         kind = str(action.get("memory_kind", "candidate"))
         confidence = float(action.get("confidence", 0.0) or 0.0)
@@ -108,6 +109,15 @@ def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
             errors.append({"index": index, "code": "replacement_content", "message": f"{action_name} requires replacement content."})
         if action_name in {"CORRECT", "SUPERSEDE"}:
             warnings.append({"index": index, "code": "review_recommended", "message": f"{action_name} is a high-risk historical change and normally enters review."})
+        content = str(action.get("content", ""))
+        findings = scan_memory_content(content, source_type="memory_plan")
+        state, _ = security_state(findings)
+        if state == "blocked":
+            errors.append({"index": index, "code": "blocked_memory_content", "message": "Unsafe or instruction-like memory content cannot be applied."})
+        valid_from = str(action.get("valid_from") or action.get("start_at") or "")
+        valid_to = str(action.get("valid_to") or action.get("end_at") or "")
+        if valid_from and valid_to and valid_from > valid_to:
+            errors.append({"index": index, "code": "invalid_time_range", "message": "valid_from must not be later than valid_to."})
     conn.close()
     return {"status": "ok", "valid": not errors, "errors": errors, "warnings": warnings, "action_count": len(plan.get("actions", []))}
 

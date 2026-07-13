@@ -66,6 +66,16 @@ def ensure_optional_fts(conn: sqlite3.Connection) -> bool:
             )
             """
         )
+        # Keep this independent from session_messages so a build of SQLite
+        # without FTS5 degrades to deterministic LIKE search instead of
+        # failing the whole store migration.
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+                content, tool_name
+            )
+            """
+        )
         return True
     except sqlite3.OperationalError:
         return False

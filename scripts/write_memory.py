@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from _common import DEFAULT_STORE_HELP, compose_markdown, emit, ensure_default_dirs, parse_frontmatter, read_text, split_frontmatter, store_root
+from security_scan import scan_memory_content, security_state
 
 
 KIND_DIRS = {
@@ -395,6 +396,10 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
     content = str(payload.get("content", "")).strip()
     if not content:
         raise ValueError("payload.content is required")
+    findings = scan_memory_content(content, source_type="direct_write")
+    state, _ = security_state(findings)
+    if state == "blocked":
+        raise ValueError("Unsafe instruction-like content cannot be written as memory; submit it as blocked evidence for review instead.")
 
     kind = str(payload.get("kind", "candidate") or "candidate")
     if kind not in KIND_DIRS:
@@ -407,6 +412,9 @@ def write_payload(root: Path, payload: dict[str, object], skip_index: bool = Fal
     slug = slugify(str(payload.get("slug", title)))
     target = resolve_path(root, kind, slug, mode, canonical=bool(payload.get("canonical", False)))
     meta = build_meta_from_payload(payload, title, content)
+    if state == "suspicious":
+        meta["security_state"] = "suspicious"
+        meta["prompt_eligible"] = False
 
     if mode == "append" and target.exists():
         if bool(payload.get("canonical", False)):

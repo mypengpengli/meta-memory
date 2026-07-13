@@ -1,6 +1,57 @@
 # Meta Memory 2.0 defaults.  The runtime remains dependency-light and reads
 # these values through scripts/config.py; explicit CLI flags always win.
-schema_version: 3
+schema_version: 4
+identity:
+  profile_id: default
+  workspace_id: default
+  agent_id: meta-memory
+providers:
+  builtin:
+    enabled: true
+  external:
+    enabled: false
+    name: mem0
+hot_memory:
+  enabled: true
+  user_max_chars: 2400
+  agent_max_chars: 1800
+  current_max_chars: 2400
+  rebuild_on_session_start: true
+  rebuild_after_approved_write: true
+  frozen_during_session: true
+  quotas:
+    profile: 5
+    state: 3
+    goal: 3
+    relationship: 2
+    domain: 3
+sessions:
+  store_messages: true
+  enable_fts: true
+  lineage_dedup: true
+  hide_sources: [subagent, tool]
+  demote_sources: [cron]
+review:
+  enabled: true
+  every_n_user_turns: 4
+  session_end: true
+  pre_compress: true
+  provider: auto
+  model: auto
+  recent_messages: 20
+  max_digest_chars: 12000
+  max_jobs_per_cycle: 10
+  default_mode: shadow
+approvals:
+  create_candidate: auto
+  corroborate: auto
+  refine_candidate: auto
+  create_verified: review
+  refine_active: review
+  correct: review
+  supersede: review
+  delete: review
+  sensitive: review
 heartbeat:
   session_flush_min_events: 5
   max_events: 20
@@ -9,11 +60,37 @@ consolidation:
   default_policy: conservative
   profile_confidence_threshold: 0.9
   sensitive_confidence_threshold: 0.97
+  correct_confidence_threshold: 0.94
+  supersede_confidence_threshold: 0.90
+  require_two_sources_for_correct: true
 retrieval:
   context_token_budget: 1800
   chunk_chars: 1200
   chunk_overlap_chars: 150
   rrf_k: 60
   enable_embeddings: false
+  top_k: 8
+  candidate_pool: 50
+  weights:
+    field: 0.30
+    document_bm25: 0.15
+    chunk_bm25: 0.20
+    embedding: 0.20
+    entity: 0.10
+    graph: 0.05
+feedback:
+  enabled: true
+  allow_negative_feedback: true
+  retrieval_does_not_increase_utility: true
+security:
+  scan_memory_writes: true
+  scan_prompt_snapshot: true
+  block_invisible_unicode: true
+  block_memory_context_tags: true
+worker:
+  enabled: true
+  max_workers_per_store: 1
+  shutdown_timeout_seconds: 5
+  retry_limit: 5
 llm:
   enable_fallback: false

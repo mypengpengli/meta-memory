@@ -264,6 +264,15 @@ def main() -> None:
         title = first_heading(path)
         summary = first_summary_line(path)
         memory_kind = infer_memory_kind(meta, doc_path)
+        # Claim pages are compiled projections.  If somebody edited their
+        # Markdown manually, preserve readability but never let that revive a
+        # superseded/corrected claim in the retrieval index.
+        claim_row = None
+        claim_id = str(meta.get("memory_id", "") or "")
+        if claim_id:
+            claim_row = conn.execute("SELECT domain, status, valid_from, valid_to, verification_state, security_state, prompt_eligible, replaced_by FROM claims WHERE id=?", (claim_id,)).fetchone()
+        if claim_row:
+            meta["domain"], meta["status"], meta["valid_from"], meta["valid_to"], meta["verification_state"], meta["security_state"], meta["prompt_eligible"], meta["replaced_by"] = claim_row
         confidence = as_float(meta.get("confidence"), 0.5 if memory_kind != "candidate" else 0.3)
         importance = as_float(meta.get("importance"), 0.5)
         conn.execute(
@@ -271,9 +280,10 @@ def main() -> None:
             INSERT INTO documents(
                 path, title, subject_id, subject_name, memory_kind, page_role, canonical, domain, topic, tags, summary,
                 confidence, importance, status, source, start_at, end_at, related_people, related_events,
-                related_topics, related_sources, supersedes, replaced_by, mtime
+                related_topics, related_sources, supersedes, replaced_by, valid_from, valid_to, verification_state,
+                security_state, prompt_eligible, mtime
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 title=excluded.title,
                 subject_id=excluded.subject_id,
@@ -297,6 +307,11 @@ def main() -> None:
                 related_sources=excluded.related_sources,
                 supersedes=excluded.supersedes,
                 replaced_by=excluded.replaced_by,
+                valid_from=excluded.valid_from,
+                valid_to=excluded.valid_to,
+                verification_state=excluded.verification_state,
+                security_state=excluded.security_state,
+                prompt_eligible=excluded.prompt_eligible,
                 mtime=excluded.mtime
             """,
             (
@@ -323,6 +338,11 @@ def main() -> None:
                 json_text(meta.get("related_sources", [])),
                 json_text(meta.get("supersedes", [])),
                 json_text(meta.get("replaced_by", [])),
+                str(meta.get("valid_from", meta.get("start_at", ""))),
+                str(meta.get("valid_to", meta.get("end_at", ""))),
+                str(meta.get("verification_state", "")),
+                str(meta.get("security_state", "clean")),
+                1 if bool(meta.get("prompt_eligible", True)) else 0,
                 path.stat().st_mtime,
             ),
         )

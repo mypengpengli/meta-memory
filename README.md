@@ -22,6 +22,27 @@
 
 英文版在后面。前半部分先用中文把它讲清楚。
 
+## Meta Memory 2.1：现在多了什么
+
+2.1 将按需检索的长期记忆与每轮固定注入的核心记忆分开，并补齐了长运行 Agent 的运行时能力：
+
+- `hot/USER.md`、`AGENT.md`、`CURRENT.md` 只从有来源、已验证、仍有效的 claim 编译；带严格预算和冻结快照哈希。
+- `sessions` / `session_messages` 保存原始对话，支持 discovery、scroll、browse 三种无需 LLM 的历史查询。
+- 原子 unit 含 `subject/predicate/object`、实体、限定词和时间字段；整合器支持语义佐证、细化、纠正、替代与冲突暂存。
+- `claims` 是事实源；Markdown、documents、chunks 都是投影。替代或纠正会同步写回旧 Markdown。
+- 高风险写入、冲突、负反馈和所有 skill 修改都会成为可审计 proposal，批准后才生效。
+- Provider 生命周期、持久化 review job、单主体顺序 worker、压缩前 flush、实体/边/反馈、查询路由和安全扫描均已实现。
+
+常用的 2.1 运维命令：
+
+```bash
+python scripts/memory_runtime.py hot-memory-build --subject-id person:me
+python scripts/memory_runtime.py session-search --subject-id person:me --query "上次 Docker UFW 如何解决"
+python scripts/memory_runtime.py proposals-list
+python scripts/memory_runtime.py maintenance --shadow-high-risk
+python scripts/memory_runtime.py doctor
+```
+
 ## 先说清楚：这是什么
 
 Meta Memory 不是一个聊天记录备份器。
@@ -287,7 +308,7 @@ The evaluator reports `recall_at_k`, selected titles, missing expectations, and 
 SKILL.md                  Agent-facing runtime contract
 agents/openai.yaml        UI metadata
 scripts/                  Runtime, indexing, retrieval, writeback, lint, evaluation
-config/default.yaml       Conservative 2.0 runtime defaults
+config/default.yaml       Conservative 2.1 runtime defaults
 migrations/               Transactional, checksummed SQLite schema migrations
 prompts/                  Optional LLM fallback contracts
 references/               On-demand design and policy references
@@ -301,15 +322,15 @@ Generated views inside `memory-data/`:
 - `log.md`: raw event timeline
 - `sources.md`: source layer and memory-source mapping
 
-## Meta Memory 2.0: Auditable Memory Formation
+## Meta Memory 2.1: Auditable Memory Formation
 
 The 2.0 runtime preserves the project's local-first design while adding a safe
 path from raw conversation to durable memory:
 
 ```text
-raw_events → session_cards → memory_units → consolidation plan → validated claims
-                                                ↓
-                                         review queue for CORRECT/SUPERSEDE
+hot snapshot ← eligible active claims ← validated plans ← semantic consolidation ← atomic units ← session cards ← raw events
+                                  ↓                          ↓
+                           fixed session prompt       durable approval/review queue
 ```
 
 - SQLite changes are checksummed, transactional migrations in `migrations/`.
@@ -319,8 +340,8 @@ raw_events → session_cards → memory_units → consolidation plan → validat
   `CREATE`, `CORROBORATE`, `REFINE`, `CORRECT`, `SUPERSEDE`, or `IGNORE`.
 - Every durable change validates sources, subject scope, sensitivity, temporal
   rules, and path safety before an atomic Markdown + SQLite update.
-- Retrieval fuses field match, document BM25, chunk BM25, and explicit graph
-  links via RRF. Embeddings are optional and never a hard dependency.
+- Retrieval fuses field match, document BM25, chunk BM25, typed graph/entity
+  signals, and optional embeddings via RRF. Embeddings are never a hard dependency.
 - Retrieval telemetry is separate from usefulness: use
   `mark_memory_usage.py` only after a memory was actually used or confirmed.
 

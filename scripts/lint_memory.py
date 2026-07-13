@@ -50,8 +50,9 @@ def main() -> None:
             issues.append(issue("warning", "missing_view", f"Missing generated view `{filename}`.", path=str(path)))
 
     migration_rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    if [str(row[0]) for row in migration_rows] != ["001", "002", "003", "004"]:
-        issues.append(issue("error", "schema_migrations_incomplete", "The store has not completed all Meta Memory 2.0 migrations."))
+    required_versions = ["001", "002", "003", "004", "005", "006", "007", "008"]
+    if [str(row[0]) for row in migration_rows] != required_versions:
+        issues.append(issue("error", "schema_migrations_incomplete", "The store has not completed all Meta Memory 2.1 migrations."))
 
     rows = conn.execute(
         """
@@ -199,6 +200,9 @@ def main() -> None:
             issues.append(issue("error", "invalid_claim_interval", "Claim validity interval ends before it starts.", claim_id=claim_id))
         if memory_path and not Path(str(memory_path)).exists():
             issues.append(issue("warning", "missing_claim_file", "Claim points to a missing Markdown file.", claim_id=claim_id, path=memory_path))
+    security_rows = conn.execute("SELECT id FROM claims WHERE security_state='blocked' AND prompt_eligible!=0").fetchall()
+    for (claim_id,) in security_rows:
+        issues.append(issue("error", "blocked_claim_prompt_eligible", "Blocked claim must never be prompt eligible.", claim_id=claim_id))
 
     card_rows = conn.execute("SELECT id, subject_id, source_event_ids FROM session_cards").fetchall()
     for card_id, subject_id, raw_ids in card_rows:
