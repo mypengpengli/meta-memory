@@ -10,7 +10,7 @@ Treat this skill as a per-turn memory runtime, not as a folder to browse manuall
 ## Runtime Contract
 
 1. Before answering, run `scripts/memory_runtime.py prepare-context`.
-   - Pass `--subject-id`, `--subject-name`, `--session-id`, and the current user request.
+   - Pass `--subject-id`, `--subject-name`, `--profile-id`, `--workspace-id`, `--agent-id`, `--session-id`, and the current user request. In a shared store, require `--shared-mode` and use a host-generated agent-prefixed session id.
    - Prefer `--query-file` for Chinese, multiline text, quotes, or host-provided content.
    - Inject `static_hot_context` once at session start, keep its
      `hot_memory_snapshot_hash` fixed for that session, and use only the
@@ -32,6 +32,7 @@ Default store: `memory-data/` under this skill directory. Default index: `memory
 ## Scope Model
 
 - Treat `--subject-id` as the memory scope/container. Use a stable id such as `person:lp`, `project:meta-memory`, or `client:acme`.
+- Treat `--profile-id`, `--workspace-id`, and `--agent-id` as mandatory identity boundaries in a shared deployment. Use `global` only for deliberately profile-wide facts, `workspace` for project facts, and `agent` only with an explicit owner.
 - Treat `--session-id` as short-lived conversation or task state, not as long-term identity.
 - Put stable identity and preferences in `profile`; put current or time-bounded state in `states`; put task progress in `sessions`.
 - Link graph-like clues with `--related-person`, `--related-event`, `--related-topic`, and `--related-source` when writing explicit memories.
@@ -81,7 +82,7 @@ Stop reading references as soon as you know the next action.
 
 ## Maintenance
 
-- Run `scripts/run_maintenance.py` to rebuild indexes, chunk indexes, scores, generated views, and lint checks.
+- Run `scripts/run_maintenance.py` for migration/backfill, lease recovery, snapshot retention, projections, generated views, and lint. It must not perform consolidation; use the single durable review worker for that path.
 - Run `scripts/lint_memory.py` when auditing for missing sources, accidental long-term promotion, duplicate canonical pages, or stale structure.
 - Run `scripts/evaluate_retrieval.py --cases-file <cases.json>` when auditing whether important queries still recall expected memories.
 - Run `scripts/run_dream.py --subject-id <id>` for a shadow consolidation cycle. Add `--apply` only after inspecting its validated plan.

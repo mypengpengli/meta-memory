@@ -32,9 +32,9 @@ def stage_memory_proposal(conn, action: dict[str, object], *, origin: str = "bac
     plan_text = json.dumps(action, ensure_ascii=False, sort_keys=True)
     diff = "\n".join([f"action: {action.get('action')}", f"target_claim_id: {action.get('target_claim_id', '')}", f"content: {action.get('content', '')}", f"reason: {reason}"])
     conn.execute(
-        """INSERT INTO write_proposals(proposal_uid, subject_id, session_id, origin, action, risk_level, plan_json, summary, diff_text)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (uid, str(action.get("subject_id", "")), str(action.get("session_id") or ""), origin, str(action.get("action", "")), risk_level(action), plan_text, proposal_summary(action), diff),
+        """INSERT INTO write_proposals(proposal_uid, subject_id, session_id, origin, action, risk_level, plan_json, summary, diff_text, profile_id, workspace_id, origin_agent_id)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (uid, str(action.get("subject_id", "")), str(action.get("session_id") or ""), origin, str(action.get("action", "")), risk_level(action), plan_text, proposal_summary(action), diff, str(action.get("profile_id") or "default"), str(action.get("workspace_id") or "global"), str(action.get("origin_agent_id") or "")),
     )
     return uid
 

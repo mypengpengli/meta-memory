@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 from config import get
 from llm_client import embed
+from runtime_identity import identity_from, visibility_sql
 
 
 KIND_BIAS = {
@@ -86,12 +87,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expand-hops", type=int, default=1, help="Association expansion hops through related fields, 0-2")
     parser.add_argument("--session-id", default="", help="Optional session id recorded with retrieval telemetry")
     parser.add_argument("--workspace-id", default="default", help="Entity/graph workspace scope")
+    parser.add_argument("--profile-id", default="default", help="Profile identity scope")
+    parser.add_argument("--agent-id", default="", help="Agent identity for agent-private memory")
     parser.add_argument("--valid-at", help="Retrieve facts valid at this ISO timestamp; defaults to now")
     parser.add_argument("--no-chunks", action="store_true", help="Disable chunk-level BM25 recall")
     parser.add_argument("--include-embeddings", action="store_true", help="Fuse optional external embedding results when available")
     parser.add_argument("--embedding-model", default="external")
     parser.add_argument("--rrf-k", type=int, default=60, help="Reciprocal-rank-fusion constant")
     parser.add_argument("--subject-id", help="Filter by subject_id")
+    parser.add_argument("--active-subject-id", action="append", default=[], help="Additional active subject; may be repeated")
     parser.add_argument("--subject-name", help="Filter by subject_name")
     parser.add_argument("--domain", action="append", default=[], help="Filter by domain; may be repeated")
     parser.add_argument(
@@ -278,6 +282,20 @@ def fts_query(terms: list[str]) -> str:
     return " OR ".join(quote_fts_term(term) for term in selected)
 
 
+def scoped_subject_clauses(filters: dict[str, object], *, alias: str) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    subjects = list(dict.fromkeys([str(filters.get("subject_id") or ""), *[str(item) for item in filters.get("active_subject_ids", []) if str(item)]]))
+    subjects = [item for item in subjects if item]
+    if subjects:
+        clauses.append(f"{alias}.subject_id IN ({', '.join('?' for _ in subjects)})")
+        params.extend(subjects)
+    scope_sql, scope_params = visibility_sql(identity_from(profile_id=str(filters.get("profile_id") or "default"), workspace_id=str(filters.get("workspace_id") or "default"), agent_id=str(filters.get("agent_id") or "")), alias=alias)
+    clauses.append(scope_sql)
+    params.extend(scope_params)
+    return clauses, params
+
+
 def fts_scores(conn, terms: list[str], filters: dict[str, object], limit: int) -> dict[str, tuple[float, str]]:
     query = fts_query(terms)
     if not query:
@@ -292,9 +310,8 @@ def fts_scores(conn, terms: list[str], filters: dict[str, object], limit: int) -
     include_candidates = bool(filters.get("include_candidates", False))
     valid_at = str(filters.get("valid_at") or "")
 
-    if subject_id:
-        clauses.append("d.subject_id = ?")
-        params.append(subject_id)
+    scope_clauses, scope_params = scoped_subject_clauses(filters, alias="d")
+    clauses.extend(scope_clauses); params.extend(scope_params)
     if subject_name:
         clauses.append("LOWER(d.subject_name) = ?")
         params.append(subject_name.casefold())
@@ -348,9 +365,8 @@ def chunk_scores(conn, terms: list[str], filters: dict[str, object], limit: int)
     subject_id = str(filters.get("subject_id") or "")
     include_candidates = bool(filters.get("include_candidates", False))
     valid_at = str(filters.get("valid_at") or "")
-    if subject_id:
-        clauses.append("d.subject_id = ?")
-        params.append(subject_id)
+    scope_clauses, scope_params = scoped_subject_clauses(filters, alias="d")
+    clauses.extend(scope_clauses); params.extend(scope_params)
     if not include_candidates:
         clauses.append("LOWER(d.memory_kind) != 'candidate'")
     clauses.append("LOWER(COALESCE(d.status, '')) NOT IN ('superseded', 'corrected')")
@@ -393,12 +409,11 @@ def embedding_scores(conn, query: str, filters: dict[str, object], model: str) -
         return {}
     clauses = ["e.node_type='chunk'", "e.model=?"]
     params: list[object] = [model]
-    if filters.get("subject_id"):
-        clauses.append("e.subject_id=?")
-        params.append(str(filters["subject_id"]))
+    scope_clauses, scope_params = scoped_subject_clauses(filters, alias="d")
+    clauses.extend(scope_clauses); params.extend(scope_params)
     try:
         rows = conn.execute(
-            f"SELECT c.doc_path, e.vector_json FROM embeddings e JOIN chunks c ON c.id=CAST(e.node_id AS INTEGER) WHERE {' AND '.join(clauses)}",
+        f"SELECT c.doc_path, e.vector_json FROM embeddings e JOIN chunks c ON c.id=CAST(e.node_id AS INTEGER) JOIN documents d ON d.path=c.doc_path WHERE {' AND '.join(clauses)}",
             tuple(params),
         ).fetchall()
     except sqlite3.OperationalError:
@@ -543,6 +558,10 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
     kinds = [item.casefold() for item in args.memory_kind]
     filters = {
         "subject_id": args.subject_id or "",
+        "active_subject_ids": args.active_subject_id,
+        "profile_id": args.profile_id,
+        "workspace_id": args.workspace_id,
+        "agent_id": args.agent_id,
         "subject_name": args.subject_name or "",
         "domains": args.domain,
         "memory_kinds": args.memory_kind,
@@ -556,9 +575,8 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
 
     clauses = []
     params: list[object] = []
-    if args.subject_id:
-        clauses.append("d.subject_id = ?")
-        params.append(args.subject_id)
+    scope_clauses, scope_params = scoped_subject_clauses(filters, alias="d")
+    clauses.extend(scope_clauses); params.extend(scope_params)
     if args.subject_name:
         clauses.append("LOWER(d.subject_name) = ?")
         params.append(args.subject_name.casefold())

@@ -10,6 +10,7 @@ from pathlib import Path
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
 from node_search import search_nodes
 from llm_client import complete
+from runtime_identity import add_identity_args
 
 
 RELATION_TO_ACTION = {
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", choices=["conservative", "balanced", "aggressive"], default="conservative")
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--out-file")
+    add_identity_args(parser)
     return parser.parse_args()
 
 
@@ -104,21 +106,27 @@ def _sources(conn, claim_id: str) -> list[int]:
 
 def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> dict[str, object]:
     conn = open_db(root)
-    exact = conn.execute("SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected')", (unit["subject_id"], unit["content_hash"])).fetchone()
-    base = {"plan_id": str(uuid.uuid4()), "subject_id": unit["subject_id"], "unit_id": unit["id"], "source_event_ids": list(unit["source_event_ids"]), "topic": unit["topic"], "domain": unit["domain"], "confidence": round(float(unit["confidence"]), 3), "uncertainty": round(float(unit["uncertainty"]), 3), "importance": round(float(unit["importance"]), 3), "durability": round(float(unit["durability"]), 3), "sensitivity": unit["sensitivity"], "predicate": unit["predicate"], "subject_text": unit["subject_text"], "object_text": unit["object_text"], "qualifiers": unit["qualifiers"], "valid_from": unit["valid_from"], "valid_to": unit["valid_to"], "observed_at": unit["observed_at"], "entities": unit["entities"]}
+    profile, workspace = str(unit.get("profile_id") or "default"), str(unit.get("workspace_id") or "global")
+    # API callers predating RuntimeIdentity did not carry a scope; retain
+    # their historical profile-wide behavior. Runtime/extractor callers now
+    # always supply an explicit workspace or agent visibility.
+    visibility, owner = str(unit.get("visibility_scope") or "global"), str(unit.get("owner_agent_id") or "")
+    exact_scope = "profile_id=? AND workspace_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=?"
+    exact = conn.execute(f"SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected') AND {exact_scope}", (unit["subject_id"], unit["content_hash"], profile, workspace, visibility, owner)).fetchone()
+    base = {"plan_id": str(uuid.uuid4()), "subject_id": unit["subject_id"], "unit_id": unit["id"], "source_event_ids": list(unit["source_event_ids"]), "topic": unit["topic"], "domain": unit["domain"], "confidence": round(float(unit["confidence"]), 3), "uncertainty": round(float(unit["uncertainty"]), 3), "importance": round(float(unit["importance"]), 3), "durability": round(float(unit["durability"]), 3), "sensitivity": unit["sensitivity"], "predicate": unit["predicate"], "subject_text": unit["subject_text"], "object_text": unit["object_text"], "qualifiers": unit["qualifiers"], "valid_from": unit["valid_from"], "valid_to": unit["valid_to"], "observed_at": unit["observed_at"], "entities": unit["entities"], "profile_id": profile, "workspace_id": workspace, "visibility_scope": visibility, "owner_agent_id": owner, "origin_agent_id": str(unit.get("origin_agent_id") or "")}
     if exact:
         conn.close()
         return {**base, "action": "CORROBORATE", "relation": "EXACT_SAME", "target_claim_id": str(exact[0]), "memory_kind": str(exact[2]), "title": str(exact[1]), "content": ""}
     candidate_rows = conn.execute(
         """SELECT id, memory_kind, title, content, content_hash, predicate, subject_text, object_text, status, qualifiers_json, valid_from, observed_at
-           FROM claims WHERE subject_id=? AND status='active' AND security_state!='blocked' ORDER BY importance DESC LIMIT 20""",
-        (unit["subject_id"],),
+           FROM claims WHERE subject_id=? AND status='active' AND security_state!='blocked' AND """ + exact_scope + " ORDER BY importance DESC LIMIT 20",
+        (unit["subject_id"], profile, workspace, visibility, owner),
     ).fetchall()
     conn.close()
     candidates = [{"id": str(row[0]), "memory_kind": str(row[1]), "title": str(row[2]), "content": str(row[3]), "content_hash": str(row[4]), "predicate": str(row[5] or ""), "subject_text": str(row[6] or ""), "object_text": str(row[7] or ""), "status": str(row[8]), "qualifiers": json.loads(str(row[9] or "{}")), "valid_from": str(row[10] or ""), "observed_at": str(row[11] or "")} for row in candidate_rows]
     # Node search supplies text/topic candidates that may not match structured
     # predicates; append only unseen claim ids to preserve scope boundaries.
-    found = search_nodes(root, str(unit["subject_id"]), str(unit["content"]), limit=20).get("nodes", [])
+    found = search_nodes(root, str(unit["subject_id"]), str(unit["content"]), limit=20, profile_id=profile, workspace_id=workspace, agent_id=str(unit.get("origin_agent_id") or "")).get("nodes", [])
     known = {item["id"] for item in candidates}
     for item in found:
         if item.get("node_type") == "claim" and str(item.get("node_id")) not in known:
@@ -146,20 +154,27 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
     return result
 
 
-def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", limit: int = 20, unit_ids: list[int] | None = None) -> dict[str, object]:
+def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", limit: int = 20, unit_ids: list[int] | None = None, profile_id: str | None = None, workspace_id: str | None = None, origin_agent_id: str = "") -> dict[str, object]:
+    if unit_ids is not None and not unit_ids:
+        return {"schema_version": 3, "subject_id": subject_id, "policy": policy, "actions": []}
     conn = open_db(root)
     scope, scope_params = "", []
     if unit_ids:
         scope = " AND id IN ({})".format(", ".join("?" for _ in unit_ids))
         scope_params = list(unit_ids)
+    if profile_id is not None:
+        scope += " AND profile_id=?"; scope_params.append(profile_id)
+    if workspace_id is not None:
+        scope += " AND workspace_id=?"; scope_params.append(workspace_id)
     rows = conn.execute(
         """SELECT id, unit_kind, domain, topic, content, content_hash, confidence, uncertainty, importance, durability,
-                  sensitivity, source_event_ids, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json
+                  sensitivity, source_event_ids, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json,
+                  profile_id, workspace_id, visibility_scope, origin_agent_id, owner_agent_id
            FROM memory_units WHERE subject_id=? AND status='pending' AND security_state!='blocked'""" + scope + " ORDER BY id LIMIT ?",
         (subject_id, *scope_params, max(1, limit)),
     ).fetchall()
     conn.close()
-    keys = ["id", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json"]
+    keys = ["id", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json", "profile_id", "workspace_id", "visibility_scope", "origin_agent_id", "owner_agent_id"]
     actions: list[dict[str, object]] = []
     for row in rows:
         unit = dict(zip(keys, row))
@@ -167,13 +182,16 @@ def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", lim
         unit["source_event_ids"] = json.loads(str(unit.pop("source_event_ids") or "[]"))
         unit["qualifiers"] = json.loads(str(unit.pop("qualifiers_json") or "{}"))
         unit["entities"] = json.loads(str(unit.pop("entities_json") or "[]"))
-        actions.append(build_plan_for_unit(root, unit, policy=policy))
+        action = build_plan_for_unit(root, unit, policy=policy)
+        if origin_agent_id:
+            action["origin_agent_id"] = origin_agent_id
+        actions.append(action)
     return {"schema_version": 3, "subject_id": subject_id, "policy": policy, "actions": actions}
 
 
 def main() -> None:
     args = parse_args()
-    plan = build_plan(store_root(args.store), args.subject_id, policy=args.policy, limit=args.limit)
+    plan = build_plan(store_root(args.store), args.subject_id, policy=args.policy, limit=args.limit, profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id)
     if args.out_file:
         Path(args.out_file).write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     emit(plan)

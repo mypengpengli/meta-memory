@@ -27,10 +27,12 @@ def external_session_id(session_id: str, subject_id: str) -> str:
 
 
 def scope_key(*, workspace_id: str, profile_id: str, subject_id: str, session_id: str) -> str:
-    return sha256_text(f"{workspace_id}:{profile_id}:{subject_id}:{external_session_id(session_id, subject_id)}")
+    return sha256_text(json.dumps([workspace_id, profile_id, subject_id, external_session_id(session_id, subject_id)], ensure_ascii=False, separators=(",", ":")))
 
 
-def ensure_session(root, *, subject_id: str, session_id: str, profile_id: str = "default", workspace_id: str = "default", source: str = "interactive", parent_session_id: str = "", title: str = "", metadata: dict[str, object] | None = None, conn=None) -> str:
+def ensure_session(root, *, subject_id: str, session_id: str, profile_id: str = "default", workspace_id: str = "default", source: str = "interactive", parent_session_id: str = "", title: str = "", metadata: dict[str, object] | None = None, shared_mode: bool = False, conn=None) -> str:
+    if shared_mode and not session_id.strip():
+        raise ValueError("A stable unique session_id is required in shared mode.")
     own = conn is None
     conn = conn or open_db(root)
     external = external_session_id(session_id, subject_id)
@@ -63,9 +65,9 @@ def resolve_session(root, *, subject_id: str, session_id: str, profile_id: str =
     return str(row[0]) if row else None
 
 
-def record_session_message(root, *, subject_id: str, session_id: str, source_type: str, content: str, raw_event_id: int | None = None, timestamp: str = "", profile_id: str = "default", workspace_id: str = "default", parent_session_id: str = "", tool_name: str = "", tool_call_id: str = "", tool_calls: list[dict[str, object]] | None = None, conn=None) -> dict[str, object]:
+def record_session_message(root, *, subject_id: str, session_id: str, source_type: str, content: str, raw_event_id: int | None = None, timestamp: str = "", profile_id: str = "default", workspace_id: str = "default", parent_session_id: str = "", tool_name: str = "", tool_call_id: str = "", tool_calls: list[dict[str, object]] | None = None, shared_mode: bool = False, conn=None) -> dict[str, object]:
     own = conn is None; conn = conn or open_db(root)
-    internal = ensure_session(root, subject_id=subject_id, session_id=session_id, profile_id=profile_id, workspace_id=workspace_id, source=source_from_event(source_type), parent_session_id=parent_session_id, conn=conn)
+    internal = ensure_session(root, subject_id=subject_id, session_id=session_id, profile_id=profile_id, workspace_id=workspace_id, source=source_from_event(source_type), parent_session_id=parent_session_id, shared_mode=shared_mode, conn=conn)
     cursor = conn.execute("INSERT OR IGNORE INTO session_messages(session_id, raw_event_id, role, content, tool_name, tool_call_id, tool_calls_json, timestamp, content_hash) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", (internal, raw_event_id, role_from_event(source_type), content or "", tool_name or None, tool_call_id or None, json.dumps(tool_calls or [], ensure_ascii=False), timestamp or utc_now(), sha256_text(content or "")))
     message_id = int(cursor.lastrowid) if cursor.rowcount else None
     if message_id is not None:

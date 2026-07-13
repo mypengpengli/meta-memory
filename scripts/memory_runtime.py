@@ -8,13 +8,14 @@ import sys
 import uuid
 from pathlib import Path
 
-from assemble_context import assemble_context
+from assemble_context import assemble_context, estimate_tokens
 from classify_memory import classify
 from extract_memory_units import sensitivity as detect_sensitivity
 from ingest_memory import build_payload, load_payload as load_memory_payload, read_input
 from ingest_raw_event import insert_raw_event
 from write_memory import write_payload
 from _common import DEFAULT_STORE_HELP, emit, ensure_store_ready, open_db, sha256_text, store_root
+from config import get
 
 
 def _retrieval_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -27,7 +28,7 @@ def _retrieval_args(args: argparse.Namespace) -> argparse.Namespace:
         store=str(store_root(args.store)), query=None, query_file=None,
         top_k=args.top_k, candidate_pool=args.candidate_pool,
         expand_hops=args.expand_hops, session_id=args.session_id,
-        workspace_id=args.workspace_id, valid_at=None, no_chunks=False,
+        workspace_id=args.workspace_id, profile_id=args.profile_id, agent_id=args.agent_id, active_subject_id=[], valid_at=None, no_chunks=False,
         include_embeddings=False, embedding_model="external", rrf_k=60,
         subject_id=args.subject_id, subject_name=args.subject_name,
         domain=[], memory_kind=[], include_candidates=args.include_candidates,
@@ -40,7 +41,8 @@ def _raw_search_args(args: argparse.Namespace) -> argparse.Namespace:
         store=str(store_root(args.store)), subject_id=args.subject_id,
         session_id=args.session_id, query=None, query_file=None, topic=[],
         domain=[], source_type=[], processed_state=["organized"], since=None,
-        until=None, limit=args.raw_limit, full_content=False,
+        until=None, limit=args.raw_limit, full_content=False, profile_id=args.profile_id,
+        workspace_id=args.workspace_id, agent_id=args.agent_id,
     )
 
 
@@ -56,6 +58,23 @@ def _auxiliary_context(*, sessions: dict[str, object] | None, procedures: list[d
         for item in procedures[:4]:
             lines.append(f"- {item.get('task_class', 'procedure')}: {item.get('instruction_text', '')}")
     return "\n".join(lines).strip()
+
+
+def _append_auxiliary_within_budget(context: str, auxiliary: str, budget: int) -> str:
+    """Append session/procedure context inside the same hard prompt budget."""
+    if not auxiliary.strip():
+        return context
+    closing = "\n</memory-context>"
+    body, marker = (context.rsplit(closing, 1) + [""])[:2] if closing in context else (context, "")
+    accepted: list[str] = []
+    for line in auxiliary.splitlines():
+        candidate = "\n".join(accepted + [line])
+        if estimate_tokens(body + "\n" + candidate + (closing if marker is not None else "")) > budget:
+            break
+        accepted.append(line)
+    if not accepted:
+        return context
+    return body.rstrip() + "\n\n" + "\n".join(accepted).rstrip() + (closing if closing in context else "\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     prepare.add_argument("--session-id", default="", help="Session id")
     prepare.add_argument("--profile-id", default="default")
-    prepare.add_argument("--workspace-id", default="default")
+    prepare.add_argument("--workspace-id", default="default"); prepare.add_argument("--agent-id", default=""); prepare.add_argument("--visibility-scope", choices=["global", "workspace", "agent"], default="workspace"); prepare.add_argument("--shared-mode", action="store_true")
     prepare.add_argument("--hot-snapshot-policy", choices=["frozen", "refresh", "manual"], default="frozen")
     prepare.add_argument("--query", help="Current user query")
     prepare.add_argument("--query-file", help="Read the current user query from a UTF-8 text file")
@@ -106,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     finalize.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     finalize.add_argument("--session-id", default="", help="Session id")
     finalize.add_argument("--profile-id", default="default")
-    finalize.add_argument("--workspace-id", default="default")
+    finalize.add_argument("--workspace-id", default="default"); finalize.add_argument("--agent-id", default=""); finalize.add_argument("--visibility-scope", choices=["global", "workspace", "agent"], default="workspace"); finalize.add_argument("--shared-mode", action="store_true")
     finalize.add_argument("--reply", help="Assistant reply text")
     finalize.add_argument("--reply-file", help="Read the assistant reply from a UTF-8 text file")
     finalize.add_argument("--topic-hint", default="", help="Optional topic hint")
@@ -143,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     remember.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     remember.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     remember.add_argument("--session-id", default="", help="Session id")
+    remember.add_argument("--profile-id", default="default"); remember.add_argument("--workspace-id", default="default"); remember.add_argument("--agent-id", default=""); remember.add_argument("--visibility-scope", choices=["global", "workspace", "agent"], default="workspace"); remember.add_argument("--shared-mode", action="store_true")
     remember.add_argument("--title", help="Memory title")
     remember.add_argument("--title-file", help="Read the memory title from a UTF-8 text file")
     remember.add_argument("--content", help="Memory content")
@@ -239,6 +259,7 @@ def add_shared_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     parser.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     parser.add_argument("--session-id", default="", help="Session id")
+    parser.add_argument("--profile-id", default="default"); parser.add_argument("--workspace-id", default="default"); parser.add_argument("--agent-id", default=""); parser.add_argument("--visibility-scope", choices=["global", "workspace", "agent"], default="workspace"); parser.add_argument("--shared-mode", action="store_true")
     parser.add_argument("--source-type", default="conversation", help="Raw event source type")
     parser.add_argument("--source-ref", default="", help="Optional raw event source reference")
     parser.add_argument("--topic-hint", default="", help="Optional topic hint")
@@ -397,8 +418,8 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     from session_search import discovery
     from procedural_learning import retrieve_procedures
     route = route_query(query)
-    internal_session_id = ensure_session(root, subject_id=args.subject_id, session_id=args.session_id, profile_id=args.profile_id, workspace_id=args.workspace_id)
-    hot_snapshot = freeze_hot_snapshot(root, internal_session_id=internal_session_id, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, policy=args.hot_snapshot_policy)
+    internal_session_id = ensure_session(root, subject_id=args.subject_id, session_id=args.session_id, profile_id=args.profile_id, workspace_id=args.workspace_id, shared_mode=args.shared_mode)
+    hot_snapshot = freeze_hot_snapshot(root, internal_session_id=internal_session_id, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id, policy=args.hot_snapshot_policy)
     hot_context, hot_snapshot_hash = str(hot_snapshot["content"]), str(hot_snapshot["content_hash"])
     retrieved = retrieve(_retrieval_args(args), query=query) if bool(route.get("needs_deep_memory", True)) else {"status": "ok", "selected": [], "query": query}
 
@@ -410,7 +431,7 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         root, subject_id=args.subject_id, query=query, limit=3,
         workspace_id=args.workspace_id, profile_id=args.profile_id,
     ) if route.get("needs_session_search") else None
-    procedures = retrieve_procedures(root, subject_id=args.subject_id, query=query) if route.get("needs_procedure") else []
+    procedures = retrieve_procedures(root, subject_id=args.subject_id, query=query, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id) if route.get("needs_procedure") else []
 
     recorded = None
     if not args.skip_record_query:
@@ -428,12 +449,14 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
             allow_duplicate=args.allow_duplicate,
             profile_id=args.profile_id,
             workspace_id=args.workspace_id,
+            origin_agent_id=args.agent_id,
+            visibility_scope=args.visibility_scope,
+            shared_mode=args.shared_mode,
         )
 
     context = assemble_context(retrieved, raw_evidence, token_budget=args.context_token_budget)
     auxiliary = _auxiliary_context(sessions=session_evidence, procedures=procedures)
-    if auxiliary:
-        context = context.rstrip() + "\n\n" + auxiliary + "\n"
+    context = _append_auxiliary_within_budget(context, auxiliary, args.context_token_budget)
     if args.context_out_file:
         Path(args.context_out_file).write_text(context, encoding="utf-8")
 
@@ -512,7 +535,7 @@ def capture_reply_artifact(
         "subject_id": args.subject_id,
         "subject_name": args.subject_name,
         "source_event_ids": [int(raw_record["raw_event_id"])],
-        "memory_kind": str(final_payload["kind"]),
+        "memory_kind": "candidate",
         "topic": str(final_payload["topic"]),
         "title": title,
         "content": reply,
@@ -521,6 +544,12 @@ def capture_reply_artifact(
         "importance": float(final_payload["importance"]),
         "sensitivity": detect_sensitivity(reply),
         "verification_state": "unverified",
+        "prompt_eligible": False,
+        "profile_id": args.profile_id,
+        "workspace_id": args.workspace_id,
+        "origin_agent_id": args.agent_id,
+        "visibility_scope": args.visibility_scope,
+        "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else "",
     }
     from apply_memory_plan import apply_plan
 
@@ -570,6 +599,11 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         event_time=args.event_time,
         content=content,
         allow_duplicate=args.allow_duplicate,
+        profile_id=args.profile_id,
+        workspace_id=args.workspace_id,
+        origin_agent_id=args.agent_id,
+        visibility_scope=args.visibility_scope,
+        shared_mode=args.shared_mode,
     )
     if not raw_record.get("inserted"):
         return {"status": "ok", "command": "remember", "store_bootstrap": bootstrap, "raw_event": raw_record, "deduplicated": True}
@@ -592,9 +626,11 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         "durability": float(fields["durability"]), "sensitivity": detect_sensitivity(content), "unit_kind": kind,
         "predicate": str(fields["predicate"]), "subject_text": str(fields["subject_text"]), "object_text": str(fields["object_text"]), "qualifiers": {},
         "valid_from": args.start_at or args.event_time or "", "valid_to": args.end_at or "", "observed_at": "", "entities": [],
+        "profile_id": args.profile_id, "workspace_id": args.workspace_id, "origin_agent_id": args.agent_id,
+        "visibility_scope": args.visibility_scope, "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else "",
     }
     action = build_plan_for_unit(root, unit, policy="balanced")
-    action.update({"subject_name": subject_name, "title": title, "origin": "explicit_remember"})
+    action.update({"subject_name": subject_name, "title": title, "origin": "explicit_remember", "profile_id": args.profile_id, "workspace_id": args.workspace_id, "origin_agent_id": args.agent_id, "visibility_scope": args.visibility_scope, "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else ""})
     if action["action"] == "CREATE":
         action.update({"memory_kind": kind, "verification_state": "verified" if kind not in {"candidate", "session"} else "unverified"})
     from apply_memory_plan import apply_plan
@@ -614,6 +650,11 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         note={"origin": "explicit-remember-v2", "plan_id": action["plan_id"], "final_kind": kind},
         link_role="explicit-remember",
     )
+    if not args.skip_index:
+        from projection_outbox import process_projection_outbox
+        projection = process_projection_outbox(root, limit=10)
+    else:
+        projection = {"status": "deferred", "reason": "skip_index"}
 
     result = {
         "status": "ok",
@@ -624,6 +665,7 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         "raw_event": raw_record,
         "written": written,
         "applied": applied,
+        "projection": projection,
     }
     write_json_file(args.out_file, result)
     return result
@@ -648,6 +690,11 @@ def record_event(args: argparse.Namespace) -> dict[str, object]:
         event_time=str(payload.get("event_time", args.event_time)),
         content=content,
         allow_duplicate=bool(payload.get("allow_duplicate", False) or args.allow_duplicate),
+        profile_id=str(payload.get("profile_id", args.profile_id)),
+        workspace_id=str(payload.get("workspace_id", args.workspace_id)),
+        origin_agent_id=str(payload.get("agent_id", args.agent_id)),
+        visibility_scope=str(payload.get("visibility_scope", args.visibility_scope)),
+        shared_mode=bool(payload.get("shared_mode", args.shared_mode)),
     )
     return {"status": "ok", "command": "record-event", "store_bootstrap": bootstrap, "result": result}
 
@@ -675,6 +722,9 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
             allow_duplicate=args.allow_duplicate,
             profile_id=args.profile_id,
             workspace_id=args.workspace_id,
+            origin_agent_id=args.agent_id,
+            visibility_scope=args.visibility_scope,
+            shared_mode=args.shared_mode,
         )
 
     artifact = capture_reply_artifact(root, args, reply, recorded)
@@ -684,18 +734,20 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
         from background_review import enqueue_review
         conn = open_db(root)
         bounds = conn.execute(
-            "SELECT MIN(id), MAX(id) FROM raw_events WHERE subject_id=? AND COALESCE(session_id, '')=? AND processed_state IN ('pending', 'sessionized')",
-            (args.subject_id, args.session_id),
+            "SELECT MIN(id), MAX(id) FROM raw_events WHERE subject_id=? AND COALESCE(session_id, '')=? AND profile_id=? AND workspace_id=? AND processed_state IN ('pending', 'sessionized')",
+            (args.subject_id, args.session_id, args.profile_id, args.workspace_id),
         ).fetchone()
+        user_turns = conn.execute("SELECT COUNT(*) FROM raw_events WHERE subject_id=? AND COALESCE(session_id,'')=? AND profile_id=? AND workspace_id=? AND source_type='conversation-user'", (args.subject_id, args.session_id, args.profile_id, args.workspace_id)).fetchone()[0]
         conn.close()
-        if bounds and bounds[0] is not None:
+        interval = max(1, int(get("review.every_n_user_turns")))
+        if bounds and bounds[0] is not None and int(user_turns) % interval == 0:
             heartbeat = enqueue_review(
                 root, subject_id=args.subject_id, session_id=args.session_id,
                 event_start_id=int(bounds[0]), event_end_id=int(bounds[1]),
-                trigger_type="turn_end", workspace_id=args.workspace_id,
+                trigger_type="turn_end", profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id,
             )
         else:
-            heartbeat = {"status": "not_scheduled", "reason": "no pending session events"}
+            heartbeat = {"status": "not_scheduled", "reason": "review_interval_not_reached" if bounds and bounds[0] is not None else "no pending session events", "every_n_user_turns": interval}
 
     result = {
         "status": "ok",
@@ -790,7 +842,7 @@ def main() -> None:
     if args.command == "worker-status":
         conn = open_db(root); rows = conn.execute("SELECT status, COUNT(*) FROM review_jobs GROUP BY status").fetchall(); conn.close(); emit({"status": "ok", "durable_jobs": {str(row[0]): int(row[1]) for row in rows}}); return
     if args.command == "maintenance":
-        result = run_json_script("run_maintenance.py", "--store", str(root), "--policy", args.policy, "--max-review-jobs", str(args.max_review_jobs), *( ["--shadow-high-risk"] if args.shadow_high_risk else [])); emit(result); return
+        result = run_json_script("run_maintenance.py", "--store", str(root), "--max-projection-jobs", str(args.max_review_jobs)); emit(result); return
     if args.command == "doctor":
         from doctor import doctor as run_doctor
         emit(run_doctor(root)); return

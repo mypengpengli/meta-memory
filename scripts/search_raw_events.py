@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
+from runtime_identity import identity_from, visibility_sql
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--until", help="Only include events at or before this ISO-like time")
     parser.add_argument("--limit", type=int, default=20, help="Maximum results to return")
     parser.add_argument("--full-content", action="store_true", help="Return the full raw content")
+    parser.add_argument("--profile-id", default="default")
+    parser.add_argument("--workspace-id", default="default")
+    parser.add_argument("--agent-id", default="")
     return parser.parse_args()
 
 
@@ -151,20 +155,27 @@ def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict
 
     clauses = []
     params: list[object] = []
+    scope_sql, scope_params = visibility_sql(identity_from(profile_id=str(getattr(args, "profile_id", "default")), workspace_id=str(getattr(args, "workspace_id", "default")), agent_id=str(getattr(args, "agent_id", ""))), alias="r", owner_column="origin_agent_id")
+    clauses.append(scope_sql); params.extend(scope_params)
     if args.subject_id:
-        clauses.append("subject_id = ?")
+        clauses.append("r.subject_id = ?")
         params.append(args.subject_id)
     if args.session_id:
-        clauses.append("COALESCE(session_id, '') = ?")
+        clauses.append("COALESCE(r.session_id, '') = ?")
         params.append(args.session_id)
     if source_types:
         placeholders = ", ".join("?" for _ in source_types)
-        clauses.append(f"LOWER(source_type) IN ({placeholders})")
+        clauses.append(f"LOWER(r.source_type) IN ({placeholders})")
         params.extend(source_types)
     if processed_states:
         placeholders = ", ".join("?" for _ in processed_states)
-        clauses.append(f"LOWER(processed_state) IN ({placeholders})")
+        clauses.append(f"LOWER(r.processed_state) IN ({placeholders})")
         params.extend(processed_states)
+    if terms:
+        fts = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:18])
+        if fts:
+            clauses.append("r.id IN (SELECT CAST(raw_event_id AS INTEGER) FROM raw_events_fts WHERE raw_events_fts MATCH ?)")
+            params.append(fts)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = conn.execute(
@@ -189,7 +200,7 @@ def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict
             classifier_domain,
             target_memory_kind,
             target_memory_path
-        FROM raw_events
+        FROM raw_events r
         {where}
         ORDER BY id DESC
         """,

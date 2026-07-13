@@ -33,7 +33,7 @@ class MetaMemoryV2Tests(unittest.TestCase):
         conn = open_db(self.root)
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
         conn.close()
-        self.assertEqual(versions, ["001", "002", "003", "004", "005", "006", "007", "008", "009"])
+        self.assertEqual(versions, ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013"])
         first = insert_raw_event(self.root, subject_id="person:test", subject_name="Test", session_id="s1", source_type="conversation-user", content="I prefer troubleshooting answers with causes and executable steps.")
         self.assertTrue(first["inserted"])
         cards = build_cards(self.root, subject_id="person:test", force=True)
@@ -70,7 +70,7 @@ class MetaMemoryV2Tests(unittest.TestCase):
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
         columns = [row[1] for row in conn.execute("PRAGMA table_info(raw_events)")]
         conn.close()
-        self.assertEqual(versions, ["001", "002", "003", "004", "005", "006", "007", "008", "009"])
+        self.assertEqual(versions, ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013"])
         self.assertIn("content", columns)
         self.assertIn("session_card_id", columns)
 

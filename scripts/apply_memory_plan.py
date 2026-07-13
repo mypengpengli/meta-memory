@@ -11,6 +11,7 @@ from pathlib import Path
 
 from _common import DEFAULT_STORE_HELP, compose_markdown, emit, open_db, sha256_text, store_root, utc_now
 from proposal_manager import stage_memory_proposal
+from runtime_identity import validate_visibility
 from security_scan import findings_json, scan_memory_content, security_state
 from validate_memory_plan import load_plan, validate_plan
 from write_memory import KIND_DIRS, slugify
@@ -49,6 +50,9 @@ def claim_markdown(claim: dict[str, object], source_ids: list[int]) -> str:
         "prompt_eligible": bool(claim.get("prompt_eligible", 1)), "source_event_ids": source_ids, "source": ", ".join(f"raw_event:{value}" for value in source_ids),
         "related_people": [], "related_events": [], "related_topics": [claim["topic"]], "related_sources": [f"raw_event:{value}" for value in source_ids],
         "supersedes": [claim["supersedes"]] if claim.get("supersedes") else [], "replaced_by": [claim["replaced_by"]] if claim.get("replaced_by") else [], "corrected_by": [claim["corrected_by"]] if claim.get("corrected_by") else [],
+        "profile_id": claim.get("profile_id", "default"), "workspace_id": claim.get("workspace_id", "global"),
+        "visibility_scope": claim.get("visibility_scope", "workspace"), "owner_agent_id": claim.get("owner_agent_id") or "",
+        "origin_agent_id": claim.get("origin_agent_id", ""),
     }
     validity = str(claim.get("valid_to") or "") or "仍有效"
     body = "\n".join([f"# {claim['title']}", "", "## Claim", "", str(claim["content"]).strip(), "", "## Structured meaning", "", f"- {claim.get('subject_text', '')} — {claim.get('predicate', '')} → {claim.get('object_text', '')}", "", "## Time boundary", "", f"- Valid from: {claim.get('valid_from') or '未指定'}", f"- Valid to: {validity}", "", "## Evidence", "", *[f"- raw_event:{value}" for value in source_ids]])
@@ -78,7 +82,7 @@ def restore(path: Path, old: str | None) -> None:
 
 
 def fetch_claim(conn, claim_id: str) -> dict[str, object]:
-    columns = "id, subject_id, subject_name, memory_kind, domain, topic, title, content, status, verification_state, confidence, importance, sensitivity, valid_from, valid_to, observed_at, support_count, memory_path, predicate, subject_text, object_text, qualifiers_json, durability, confirmed_utility, replaced_by, corrected_by, supersedes, security_state, security_findings_json, prompt_eligible"
+    columns = "id, subject_id, subject_name, memory_kind, domain, topic, title, content, status, verification_state, confidence, importance, sensitivity, valid_from, valid_to, observed_at, support_count, memory_path, predicate, subject_text, object_text, qualifiers_json, durability, confirmed_utility, replaced_by, corrected_by, supersedes, security_state, security_findings_json, prompt_eligible, profile_id, workspace_id, visibility_scope, owner_agent_id, origin_agent_id, semantic_key"
     row = conn.execute(f"SELECT {columns} FROM claims WHERE id=?", (claim_id,)).fetchone()
     if row is None:
         raise ValueError(f"Claim not found: {claim_id}")
@@ -117,8 +121,27 @@ def create_claim(conn, root: Path, action: dict[str, object], *, replacement_of:
     content = str(action["content"])
     findings = scan_memory_content(content, source_type="memory_plan")
     state, eligible = security_state(findings)
-    claim = {"id": claim_id, "subject_id": action["subject_id"], "subject_name": action.get("subject_name", "Unknown"), "memory_kind": action.get("memory_kind", "candidate"), "domain": action.get("domain", "general"), "topic": action.get("topic", "memory"), "title": action.get("title", action.get("topic", "Memory claim")), "content": content, "status": "active" if action.get("memory_kind") != "candidate" else "candidate", "verification_state": action.get("verification_state", "unverified"), "confidence": float(action.get("confidence", 0.3)), "importance": float(action.get("importance", 0.3)), "durability": float(action.get("durability", 0.5)), "sensitivity": action.get("sensitivity", "normal"), "valid_from": action.get("valid_from") or utc_now(), "valid_to": action.get("valid_to", ""), "observed_at": action.get("observed_at") or utc_now(), "support_count": len(ids), "memory_path": "", "predicate": action.get("predicate", "states"), "subject_text": action.get("subject_text", "user"), "object_text": action.get("object_text", content[:240]), "qualifiers": action.get("qualifiers", {}), "confirmed_utility": 0.0, "replaced_by": "", "corrected_by": "", "supersedes": replacement_of, "security_state": state, "prompt_eligible": eligible}
-    conn.execute("""INSERT INTO claims(id, subject_id, subject_name, memory_kind, domain, topic, title, content, content_hash, status, verification_state, confidence, importance, sensitivity, valid_from, valid_to, observed_at, support_count, memory_path, predicate, subject_text, object_text, qualifiers_json, durability, confirmed_utility, replaced_by, corrected_by, supersedes, security_state, security_findings_json, prompt_eligible, source_unit_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (claim_id, claim["subject_id"], claim["subject_name"], claim["memory_kind"], claim["domain"], claim["topic"], claim["title"], content, sha256_text(content), claim["status"], claim["verification_state"], claim["confidence"], claim["importance"], claim["sensitivity"], claim["valid_from"], claim["valid_to"], claim["observed_at"], claim["support_count"], "", claim["predicate"], claim["subject_text"], claim["object_text"], json.dumps(claim["qualifiers"], ensure_ascii=False), claim["durability"], 0.0, "", "", replacement_of, state, json.dumps(findings_json(findings), ensure_ascii=False), eligible, action.get("unit_id")))
+    eligible = bool(eligible and action.get("prompt_eligible", True))
+    profile_id, workspace_id = str(action.get("profile_id") or "default"), str(action.get("workspace_id") or "global")
+    agent = str(action.get("origin_agent_id") or "")
+    owner = str(action.get("owner_agent_id") or agent if action.get("visibility_scope") == "agent" else action.get("owner_agent_id") or "")
+    # Old callers without an explicit scope retain profile-wide visibility;
+    # every runtime write now supplies an explicit workspace/agent scope.
+    visibility = validate_visibility(str(action.get("visibility_scope") or "global"), owner)
+    claim = {"id": claim_id, "subject_id": action["subject_id"], "subject_name": action.get("subject_name", "Unknown"), "memory_kind": action.get("memory_kind", "candidate"), "domain": action.get("domain", "general"), "topic": action.get("topic", "memory"), "title": action.get("title", action.get("topic", "Memory claim")), "content": content, "status": "active" if action.get("memory_kind") != "candidate" else "candidate", "verification_state": action.get("verification_state", "unverified"), "confidence": float(action.get("confidence", 0.3)), "importance": float(action.get("importance", 0.3)), "durability": float(action.get("durability", 0.5)), "sensitivity": action.get("sensitivity", "normal"), "valid_from": action.get("valid_from") or utc_now(), "valid_to": action.get("valid_to", ""), "observed_at": action.get("observed_at") or utc_now(), "support_count": len(ids), "memory_path": "", "predicate": action.get("predicate", "states"), "subject_text": action.get("subject_text", "user"), "object_text": action.get("object_text", content[:240]), "qualifiers": action.get("qualifiers", {}), "confirmed_utility": 0.0, "replaced_by": "", "corrected_by": "", "supersedes": replacement_of, "security_state": state, "prompt_eligible": eligible, "profile_id":profile_id, "workspace_id":workspace_id, "visibility_scope":visibility, "owner_agent_id":owner, "origin_agent_id":agent}
+    claim["semantic_key"] = sha256_text(json.dumps([profile_id, workspace_id, claim["subject_id"], visibility, claim["predicate"], claim["subject_text"], claim["object_text"], claim["qualifiers"]], ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    # A second writer may construct an equivalent plan while the first writer
+    # is committing.  The semantic unique key is the final guard; treat this
+    # path as corroboration instead of failing or creating a duplicate claim.
+    existing = conn.execute("SELECT id FROM claims WHERE semantic_key=? AND status='active'", (claim["semantic_key"],)).fetchone()
+    if existing:
+        existing_id = str(existing[0]); link_sources(conn, existing_id, ids)
+        current = fetch_claim(conn, existing_id); source_ids = all_sources(conn, existing_id)
+        current["support_count"] = len(source_ids)
+        conn.execute("UPDATE claims SET support_count=?, updated_at=? WHERE id=?", (len(source_ids), utc_now(), existing_id))
+        path, old = save_claim_file(root, conn, current, source_ids, "semantic_corroboration")
+        return existing_id, path, old
+    conn.execute("""INSERT INTO claims(id, subject_id, subject_name, memory_kind, domain, topic, title, content, content_hash, status, verification_state, confidence, importance, sensitivity, valid_from, valid_to, observed_at, support_count, memory_path, predicate, subject_text, object_text, qualifiers_json, durability, confirmed_utility, replaced_by, corrected_by, supersedes, security_state, security_findings_json, prompt_eligible, source_unit_id, profile_id, workspace_id, visibility_scope, owner_agent_id, origin_agent_id, semantic_key) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (claim_id, claim["subject_id"], claim["subject_name"], claim["memory_kind"], claim["domain"], claim["topic"], claim["title"], content, sha256_text(content), claim["status"], claim["verification_state"], claim["confidence"], claim["importance"], claim["sensitivity"], claim["valid_from"], claim["valid_to"], claim["observed_at"], claim["support_count"], "", claim["predicate"], claim["subject_text"], claim["object_text"], json.dumps(claim["qualifiers"], ensure_ascii=False), claim["durability"], 0.0, "", "", replacement_of, state, json.dumps(findings_json(findings), ensure_ascii=False), eligible, action.get("unit_id"), profile_id, workspace_id, visibility, owner or None, agent, claim["semantic_key"]))
     link_sources(conn, claim_id, ids)
     path, old = save_claim_file(root, conn, claim, ids, "create")
     if replacement_of and edge_type:
@@ -135,10 +158,6 @@ def queue_review(conn, action: dict[str, object], reason: str) -> str:
 
 def apply_action(root: Path, action: dict[str, object], policy: str, review_approved: bool) -> dict[str, object]:
     conn = open_db(root)
-    previous = conn.execute("SELECT status FROM consolidation_runs WHERE plan_id=?", (action["plan_id"],)).fetchone()
-    if previous and str(previous[0]) == "applied":
-        conn.close()
-        return {"plan_id": action["plan_id"], "status": "skipped", "reason": "already_applied"}
     name = str(action["action"]).upper()
     must_review = name in HIGH_RISK or bool(action.get("requires_review")) or (name == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("origin", "")) == "background_review")
     if must_review and not review_approved:
@@ -148,6 +167,10 @@ def apply_action(root: Path, action: dict[str, object], policy: str, review_appr
     backups: list[tuple[Path, str | None]] = []
     try:
         conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute("SELECT status FROM consolidation_runs WHERE plan_id=?", (action["plan_id"],)).fetchone()
+        if previous and str(previous[0]) == "applied":
+            conn.commit(); conn.close()
+            return {"plan_id": action["plan_id"], "status": "skipped", "reason": "already_applied"}
         result: dict[str, object] = {"plan_id": action["plan_id"], "action": name}
         if name == "IGNORE":
             if action.get("unit_id"):
@@ -174,12 +197,16 @@ def apply_action(root: Path, action: dict[str, object], policy: str, review_appr
             conn.execute("UPDATE memory_units SET status='consolidated', updated_at=? WHERE id=?", (utc_now(), action["unit_id"]))
         if result.get("claim_id"):
             from projection_outbox import enqueue_projection
-            claim_id = str(result["claim_id"])
-            path_row = conn.execute("SELECT memory_path, content_hash FROM claims WHERE id=?", (claim_id,)).fetchone()
-            enqueue_projection(conn, entity_type="claim", entity_id=claim_id, operation="reindex", payload={"path": str(path_row[0] or "") if path_row else "", "content_hash": str(path_row[1] or "") if path_row else ""})
+            dirty_claim_ids = [str(result["claim_id"])]
+            if result.get("replaces"):
+                dirty_claim_ids.append(str(result["replaces"]))
+            for claim_id in dict.fromkeys(dirty_claim_ids):
+                path_row = conn.execute("SELECT memory_path, content_hash FROM claims WHERE id=?", (claim_id,)).fetchone()
+                enqueue_projection(conn, entity_type="claim", entity_id=claim_id, operation="reindex", payload={"path": str(path_row[0] or "") if path_row else "", "content_hash": str(path_row[1] or "") if path_row else ""})
             profile_id = str(action.get("profile_id") or "default")
             workspace_id = str(action.get("workspace_id") or "default")
-            enqueue_projection(conn, entity_type="hot", entity_id=f"{action['subject_id']}\x1f{profile_id}\x1f{workspace_id}", operation="refresh", payload={"claim_id": claim_id, "content_hash": str(path_row[1] or "") if path_row else ""})
+            agent_id = str(action.get("origin_agent_id") or "")
+            enqueue_projection(conn, entity_type="hot", entity_id=f"{action['subject_id']}\x1f{profile_id}\x1f{workspace_id}\x1f{agent_id}", operation="refresh", payload={"claim_id": claim_id, "content_hash": str(path_row[1] or "") if path_row else ""})
         conn.execute("INSERT INTO consolidation_runs(plan_id, subject_id, policy, action, status, payload, applied_at) VALUES(?, ?, ?, ?, 'applied', ?, ?) ON CONFLICT(plan_id) DO UPDATE SET status='applied', applied_at=excluded.applied_at, error=NULL", (action["plan_id"], action["subject_id"], policy, name, json.dumps(action, ensure_ascii=False), utc_now()))
         conn.commit(); conn.close()
         return {**result, "status": "applied"}
@@ -197,7 +224,7 @@ def apply_plan(root: Path, plan: dict[str, object], *, review_approved: bool = F
     from entity_resolution import resolve_claim_entities
     for action, result in zip(plan["actions"], results):
         if result.get("status") == "applied" and result.get("claim_id"):
-            resolve_claim_entities(root, str(result["claim_id"]), list(action.get("entities") or []))
+            resolve_claim_entities(root, str(result["claim_id"]), list(action.get("entities") or []), workspace_id=str(action.get("workspace_id") or "global"))
     indexing: list[dict[str, object]] = []
     if not skip_index and any(item["status"] == "applied" for item in results):
         indexing = [{"status": "queued", "projection": "outbox"}]

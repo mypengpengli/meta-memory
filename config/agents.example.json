@@ -1,0 +1,11 @@
+{
+  "agents": {
+    "codex": {
+      "token_env": "META_MEMORY_TOKEN_CODEX",
+      "profile_id": "li-peng",
+      "agent_id": "codex",
+      "workspaces": ["global", "project:meta-memory"],
+      "permissions": ["read", "record", "remember", "feedback", "proposals"]
+    }
+  }
+}

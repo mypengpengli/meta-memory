@@ -18,6 +18,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--store", help=DEFAULT_STORE_HELP)
     parser.add_argument("--subject-id", help="Limit to one subject_id")
+    parser.add_argument("--profile-id", help="Limit to one profile identity")
+    parser.add_argument("--workspace-id", help="Limit to one workspace identity")
+    parser.add_argument("--agent-id", help="Limit to one originating agent")
     parser.add_argument("--check-every-minutes", type=float, default=10.0, help="Heartbeat check interval")
     parser.add_argument("--organize-interval-minutes", type=int, default=30, help="Minimum organize interval")
     parser.add_argument("--min-pending", type=int, default=3, help="Pending raw event threshold")
@@ -57,6 +60,12 @@ def build_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.subject_id:
         command.extend(["--subject-id", args.subject_id])
+    if args.profile_id:
+        command.extend(["--profile-id", args.profile_id])
+    if args.workspace_id:
+        command.extend(["--workspace-id", args.workspace_id])
+    if args.agent_id:
+        command.extend(["--agent-id", args.agent_id])
     if args.extract_units:
         command.append("--extract-units")
     return command

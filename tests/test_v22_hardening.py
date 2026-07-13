@@ -42,14 +42,15 @@ class MetaMemoryV22HardeningTests(unittest.TestCase):
             source_type="conversation-user", content=content, event_time=event_time,
         )["raw_event_id"])
 
-    def claim(self, content: str, event_id: int, *, topic: str = "profile", predicate: str = "prefers") -> str:
+    def claim(self, content: str, event_id: int, *, topic: str = "profile", predicate: str = "prefers", profile_id: str = "default", workspace_id: str = "global", visibility_scope: str = "global") -> str:
         plan = {"subject_id": self.subject, "policy": "balanced", "actions": [{
             "plan_id": str(uuid.uuid4()), "action": "CREATE", "subject_id": self.subject,
             "source_event_ids": [event_id], "memory_kind": "profile", "domain": "general",
             "topic": topic, "title": topic, "content": content, "predicate": predicate,
             "subject_text": "user", "object_text": content, "confidence": .95,
             "importance": .9, "durability": .9, "sensitivity": "normal",
-            "verification_state": "verified",
+            "verification_state": "verified", "profile_id": profile_id,
+            "workspace_id": workspace_id, "visibility_scope": visibility_scope,
         }]}
         result = apply_plan(self.root, plan, skip_index=True)
         self.assertEqual(result["results"][0]["status"], "applied")
@@ -57,14 +58,14 @@ class MetaMemoryV22HardeningTests(unittest.TestCase):
 
     def test_hot_memory_is_scoped_and_frozen_per_session(self) -> None:
         first = self.event("I prefer direct answers.")
-        self.claim("I prefer direct answers.", first)
+        self.claim("I prefer direct answers.", first, profile_id="main", workspace_id="alpha", visibility_scope="workspace")
         alpha = build_hot_memory(self.root, subject_id=self.subject, workspace_id="alpha", profile_id="main")
         beta = build_hot_memory(self.root, subject_id=self.subject, workspace_id="beta", profile_id="main")
         self.assertNotEqual(alpha["scope"], beta["scope"])
         session_one = ensure_session(self.root, subject_id=self.subject, session_id="same", workspace_id="alpha", profile_id="main")
         frozen = freeze_hot_snapshot(self.root, internal_session_id=session_one, subject_id=self.subject, workspace_id="alpha", profile_id="main")
         second = self.event("I prefer concise examples.")
-        self.claim("I prefer concise examples.", second, topic="examples")
+        self.claim("I prefer concise examples.", second, topic="examples", profile_id="main", workspace_id="alpha", visibility_scope="workspace")
         build_hot_memory(self.root, subject_id=self.subject, workspace_id="alpha", profile_id="main")
         unchanged = freeze_hot_snapshot(self.root, internal_session_id=session_one, subject_id=self.subject, workspace_id="alpha", profile_id="main")
         self.assertEqual(frozen["snapshot_uid"], unchanged["snapshot_uid"])

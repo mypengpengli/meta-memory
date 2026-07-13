@@ -194,8 +194,9 @@ def build_chunks(text: str) -> list[dict[str, object]]:
     return chunks
 
 
-def sync_chunks(conn: sqlite3.Connection, doc_path: str, text: str) -> tuple[int, bool]:
+def sync_chunks(conn: sqlite3.Connection, doc_path: str, text: str, *, profile_id: str, workspace_id: str, visibility_scope: str, owner_agent_id: str) -> tuple[int, bool]:
     source_hash = sha256_text(text)
+    conn.execute("UPDATE chunks SET profile_id=?, workspace_id=?, visibility_scope=?, owner_agent_id=? WHERE doc_path=?", (profile_id, workspace_id, visibility_scope, owner_agent_id or None, doc_path))
     previous = conn.execute("SELECT source_hash FROM chunks WHERE doc_path=? LIMIT 1", (doc_path,)).fetchone()
     if previous and str(previous[0]) == source_hash:
         return 0, False
@@ -209,10 +210,10 @@ def sync_chunks(conn: sqlite3.Connection, doc_path: str, text: str) -> tuple[int
     for index, chunk in enumerate(build_chunks(text)):
         cursor = conn.execute(
             """
-            INSERT INTO chunks(doc_path, chunk_index, heading, start_line, end_line, content, content_hash, source_hash)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO chunks(doc_path, chunk_index, heading, start_line, end_line, content, content_hash, source_hash, profile_id, workspace_id, visibility_scope, owner_agent_id)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (doc_path, index, chunk["heading"], chunk["start_line"], chunk["end_line"], chunk["content"], sha256_text(str(chunk["content"])), source_hash),
+            (doc_path, index, chunk["heading"], chunk["start_line"], chunk["end_line"], chunk["content"], sha256_text(str(chunk["content"])), source_hash, profile_id, workspace_id, visibility_scope, owner_agent_id or None),
         )
         if chunk_fts:
             conn.execute("INSERT INTO chunk_fts(chunk_id, doc_path, heading, content) VALUES(?, ?, ?, ?)", (int(cursor.lastrowid), doc_path, chunk["heading"], chunk["content"]))
@@ -277,9 +278,13 @@ def main() -> None:
         claim_row = None
         claim_id = str(meta.get("memory_id", "") or "")
         if claim_id:
-            claim_row = conn.execute("SELECT domain, status, valid_from, valid_to, verification_state, security_state, prompt_eligible, replaced_by FROM claims WHERE id=?", (claim_id,)).fetchone()
+            claim_row = conn.execute("SELECT domain, status, valid_from, valid_to, verification_state, security_state, prompt_eligible, replaced_by, profile_id, workspace_id, visibility_scope, owner_agent_id FROM claims WHERE id=?", (claim_id,)).fetchone()
         if claim_row:
-            meta["domain"], meta["status"], meta["valid_from"], meta["valid_to"], meta["verification_state"], meta["security_state"], meta["prompt_eligible"], meta["replaced_by"] = claim_row
+            meta["domain"], meta["status"], meta["valid_from"], meta["valid_to"], meta["verification_state"], meta["security_state"], meta["prompt_eligible"], meta["replaced_by"], meta["profile_id"], meta["workspace_id"], meta["visibility_scope"], meta["owner_agent_id"] = claim_row
+        profile_id = str(meta.get("profile_id", "default") or "default")
+        workspace_id = str(meta.get("workspace_id", "global") or "global")
+        visibility_scope = str(meta.get("visibility_scope", "workspace") or "workspace")
+        owner_agent_id = str(meta.get("owner_agent_id", "") or "")
         confidence = as_float(meta.get("confidence"), 0.5 if memory_kind != "candidate" else 0.3)
         importance = as_float(meta.get("importance"), 0.5)
         conn.execute(
@@ -288,9 +293,9 @@ def main() -> None:
                 path, title, subject_id, subject_name, memory_kind, page_role, canonical, domain, topic, tags, summary,
                 confidence, importance, status, source, start_at, end_at, related_people, related_events,
                 related_topics, related_sources, supersedes, replaced_by, valid_from, valid_to, verification_state,
-                security_state, prompt_eligible, mtime
+                security_state, prompt_eligible, mtime, profile_id, workspace_id, visibility_scope, owner_agent_id
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 title=excluded.title,
                 subject_id=excluded.subject_id,
@@ -319,7 +324,11 @@ def main() -> None:
                 verification_state=excluded.verification_state,
                 security_state=excluded.security_state,
                 prompt_eligible=excluded.prompt_eligible,
-                mtime=excluded.mtime
+                mtime=excluded.mtime,
+                profile_id=excluded.profile_id,
+                workspace_id=excluded.workspace_id,
+                visibility_scope=excluded.visibility_scope,
+                owner_agent_id=excluded.owner_agent_id
             """,
             (
                 doc_path,
@@ -351,6 +360,10 @@ def main() -> None:
                 str(meta.get("security_state", "clean")),
                 1 if bool(meta.get("prompt_eligible", True)) else 0,
                 path.stat().st_mtime,
+                profile_id,
+                workspace_id,
+                visibility_scope,
+                owner_agent_id or None,
             ),
         )
         conn.execute(
@@ -365,7 +378,7 @@ def main() -> None:
             """,
             (doc_path, confidence),
         )
-        chunk_count, changed = sync_chunks(conn, doc_path, text)
+        chunk_count, changed = sync_chunks(conn, doc_path, text, profile_id=profile_id, workspace_id=workspace_id, visibility_scope=visibility_scope, owner_agent_id=owner_agent_id)
         chunks_indexed += chunk_count
         chunks_reused += 0 if changed else 1
         if fts_enabled:

@@ -22,6 +22,31 @@
 
 英文版在后面。前半部分先用中文把它讲清楚。
 
+## Meta Memory 2.2：共享智能体安全
+
+共享部署必须显式传入 `--profile-id`、`--workspace-id`、`--agent-id` 和由宿主生成的稳定 `--session-id`；启用 `--shared-mode` 后不允许空会话 ID。可见性只有三种：`global`、`workspace`、`agent`。
+
+- Raw event、card、unit、claim、document、chunk、review job、proposal、procedure、Hot Snapshot 与检索都携带并校验作用域。
+- agent 私有信息只会进入 owner 的检索结果和专属 Hot Snapshot；workspace 信息不会跨项目泄漏。
+- `remember` 成功返回前会处理其派生投影，保证写后立即可读；assistant artifact 只会以不可注入上下文的 candidate 保存。
+- 每个 store 只运行一个 `background_review.py --loop --apply-low-risk` 和一个 `projection_outbox.py --loop`。两个队列均有 lease、续租、批处理和指数退避。
+
+```bash
+python scripts/memory_runtime.py prepare-context \
+  --profile-id li-peng --workspace-id project-meta-memory \
+  --agent-id codex --session-id codex:<uuid> --shared-mode \
+  --subject-id project:meta-memory --query-file query.txt
+```
+
+For a central host, copy `config/agents.example.json` to a private file,
+provide the listed token environment variables, then bind the API to localhost
+or a private overlay network:
+
+```bash
+python scripts/memory_api.py --store /srv/meta-memory \
+  --agents-file /srv/meta-memory/config/agents.json
+```
+
 ## Meta Memory 2.1：现在多了什么
 
 2.1 将按需检索的长期记忆与每轮固定注入的核心记忆分开，并补齐了长运行 Agent 的运行时能力：
@@ -258,7 +283,10 @@ Run the standard maintenance sequence:
 python scripts/run_maintenance.py
 ```
 
-This rebuilds indexes, scores, generated views, and lint checks.
+This performs recovery only: migrations, legacy scope backfill, lease recovery,
+snapshot retention, projection draining, generated views, and lint. It never
+consolidates evidence directly; that responsibility belongs to the single
+durable review worker.
 
 Run lint only:
 

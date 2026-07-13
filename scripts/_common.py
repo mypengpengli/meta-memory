@@ -31,6 +31,7 @@ DEFAULT_DIRS = [
 ]
 
 _MIGRATED_DBS: set[str] = set()
+_WAL_INITIALIZED_DBS: set[str] = set()
 _MIGRATION_LOCK = threading.Lock()
 
 REPORTABLE_LAYOUT = [
@@ -207,15 +208,20 @@ def open_db(root: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=10)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError:
-        pass
+    conn.execute("PRAGMA synchronous=NORMAL")
+    key = str(path.resolve())
+    if key not in _WAL_INITIALIZED_DBS:
+        with _MIGRATION_LOCK:
+            if key not in _WAL_INITIALIZED_DBS:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError:
+                    pass
+                _WAL_INITIALIZED_DBS.add(key)
     # Schema changes are deliberately centralized in versioned migrations.
     # Import lazily to keep every standalone script executable from this folder.
     from db_migrations import run_migrations
 
-    key = str(path.resolve())
     if key not in _MIGRATED_DBS:
         with _MIGRATION_LOCK:
             if key not in _MIGRATED_DBS:

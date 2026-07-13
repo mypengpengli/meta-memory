@@ -76,6 +76,17 @@ def ensure_optional_fts(conn: sqlite3.Connection) -> bool:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS raw_events_fts USING fts5(
+                raw_event_id UNINDEXED, content, topic_hint, domain_hint
+            )
+            """
+        )
+        raw_count = int(conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0])
+        fts_count = int(conn.execute("SELECT COUNT(*) FROM raw_events_fts").fetchone()[0])
+        if raw_count and not fts_count:
+            conn.execute("INSERT INTO raw_events_fts(raw_event_id, content, topic_hint, domain_hint) SELECT id, content, topic_hint, domain_hint FROM raw_events")
         return True
     except sqlite3.OperationalError:
         return False

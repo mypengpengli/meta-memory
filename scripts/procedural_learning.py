@@ -8,18 +8,20 @@ from pathlib import Path
 
 from _common import open_db
 from proposal_manager import get_proposal, reject_proposal, stage_skill_proposal
+from runtime_identity import identity_from, visibility_sql
 
 
 SKILL_ACTIONS = {"CREATE_SKILL", "PATCH_SKILL", "ADD_REFERENCE", "ADD_TEMPLATE", "ADD_SCRIPT", "ARCHIVE_SKILL", "IGNORE"}
 
 
-def retrieve_procedures(root, *, subject_id: str, query: str, limit: int = 4) -> list[dict[str, object]]:
-    """Return approved or candidate procedures as data, never as executable instructions."""
+def retrieve_procedures(root, *, subject_id: str, query: str, limit: int = 4, profile_id: str = "default", workspace_id: str = "default", agent_id: str = "") -> list[dict[str, object]]:
+    """Return only approved, safe, visible procedures for prompt context."""
     terms = [term.casefold() for term in re.findall(r"[a-z0-9][\w.-]{1,}", query.casefold())][:12]
     conn = open_db(root)
+    scope_sql, scope_params = visibility_sql(identity_from(profile_id=profile_id, workspace_id=workspace_id, agent_id=agent_id), alias="p")
     rows = conn.execute(
-        "SELECT learning_uid, task_class, instruction_text, trigger_text, pitfall_text, confidence, status FROM procedural_learnings WHERE subject_id=? AND status IN ('candidate','approved') ORDER BY confidence DESC, created_at DESC LIMIT ?",
-        (subject_id, max(limit * 4, limit)),
+        "SELECT learning_uid, task_class, instruction_text, trigger_text, pitfall_text, confidence, status FROM procedural_learnings p WHERE subject_id=? AND " + scope_sql + " AND status='approved' AND prompt_eligible=1 AND security_state IN ('clean','reviewed_safe') ORDER BY confidence DESC, created_at DESC LIMIT ?",
+        (subject_id, *scope_params, max(limit * 4, limit)),
     ).fetchall()
     conn.close()
     scored = []
@@ -36,9 +38,9 @@ def slug(value: str) -> str:
     return text[:64] or "general-procedure"
 
 
-def create_learning(root, *, subject_id: str, task_class: str, instruction_text: str, source_event_ids: list[int], domain: str = "general", trigger_text: str = "", pitfall_text: str = "", confidence: float = 0.5, target_skill: str = "") -> dict[str, object]:
+def create_learning(root, *, subject_id: str, task_class: str, instruction_text: str, source_event_ids: list[int], domain: str = "general", trigger_text: str = "", pitfall_text: str = "", confidence: float = 0.5, target_skill: str = "", profile_id: str = "default", workspace_id: str = "default", visibility_scope: str = "workspace", owner_agent_id: str = "") -> dict[str, object]:
     conn = open_db(root); uid = str(uuid.uuid4())
-    conn.execute("INSERT INTO procedural_learnings(learning_uid, subject_id, domain, task_class, trigger_text, instruction_text, pitfall_text, source_event_ids, confidence, target_skill) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (uid, subject_id, domain, task_class, trigger_text, instruction_text, pitfall_text, json.dumps(source_event_ids), confidence, target_skill or slug(task_class)))
+    conn.execute("INSERT INTO procedural_learnings(learning_uid, subject_id, domain, task_class, trigger_text, instruction_text, pitfall_text, source_event_ids, confidence, target_skill, profile_id, workspace_id, visibility_scope, owner_agent_id, security_state, prompt_eligible) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'clean', 0)", (uid, subject_id, domain, task_class, trigger_text, instruction_text, pitfall_text, json.dumps(source_event_ids), confidence, target_skill or slug(task_class), profile_id, workspace_id, visibility_scope, owner_agent_id or None))
     conn.commit(); conn.close()
     return {"learning_id": uid, "status": "candidate"}
 
