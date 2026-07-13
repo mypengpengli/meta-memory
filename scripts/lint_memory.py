@@ -50,7 +50,8 @@ def main() -> None:
             issues.append(issue("warning", "missing_view", f"Missing generated view `{filename}`.", path=str(path)))
 
     migration_rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-    required_versions = ["001", "002", "003", "004", "005", "006", "007", "008"]
+    from db_migrations import migration_files
+    required_versions = [path.name.split("_", 1)[0] for path in migration_files()]
     if [str(row[0]) for row in migration_rows] != required_versions:
         issues.append(issue("error", "schema_migrations_incomplete", "The store has not completed all Meta Memory 2.1 migrations."))
 

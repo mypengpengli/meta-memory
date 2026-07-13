@@ -44,6 +44,19 @@ def _tokens(value: str) -> set[str]:
     return {token for token in value.casefold().replace("-", " ").split() if len(token) > 2}
 
 
+def _compatible_scope(unit: dict[str, object], candidate: dict[str, object]) -> bool:
+    left = unit.get("qualifiers") if isinstance(unit.get("qualifiers"), dict) else {}
+    right = candidate.get("qualifiers") if isinstance(candidate.get("qualifiers"), dict) else {}
+    return not left or not right or left == right
+
+
+def _has_state_transition(unit: dict[str, object], candidate: dict[str, object]) -> bool:
+    text = str(unit.get("content") or "").casefold()
+    signal = bool(__import__("re").search(r"\b(now|currently|migrated|changed|replaced)\b|现在|目前|已经|迁移|改成", text))
+    newer = str(unit.get("observed_at") or unit.get("valid_from") or "") > str(candidate.get("observed_at") or candidate.get("valid_from") or "")
+    return signal and newer and _compatible_scope(unit, candidate)
+
+
 def semantic_relation(unit: dict[str, object], candidates: list[dict[str, object]]) -> tuple[str, dict[str, object] | None]:
     """Use an optional relation-only LLM, then fall back deterministically.
 
@@ -76,7 +89,7 @@ def semantic_relation(unit: dict[str, object], candidates: list[dict[str, object
         if same_predicate and same_subject and same_object:
             return "SEMANTIC_SAME", candidate
         if same_predicate and same_subject and not same_object:
-            if str(unit.get("unit_kind")) == "state" or str(candidate.get("memory_kind")) == "state":
+            if (str(unit.get("unit_kind")) == "state" or str(candidate.get("memory_kind")) == "state") and _has_state_transition(unit, candidate):
                 return "REPLACES_OLD_STATE", candidate
             return "CONTRADICTS_UNRESOLVED", candidate
         old_tokens, new_tokens = _tokens(str(candidate.get("content") or "")), _tokens(str(unit.get("content") or ""))
@@ -97,12 +110,12 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
         conn.close()
         return {**base, "action": "CORROBORATE", "relation": "EXACT_SAME", "target_claim_id": str(exact[0]), "memory_kind": str(exact[2]), "title": str(exact[1]), "content": ""}
     candidate_rows = conn.execute(
-        """SELECT id, memory_kind, title, content, content_hash, predicate, subject_text, object_text, status
+        """SELECT id, memory_kind, title, content, content_hash, predicate, subject_text, object_text, status, qualifiers_json, valid_from, observed_at
            FROM claims WHERE subject_id=? AND status='active' AND security_state!='blocked' ORDER BY importance DESC LIMIT 20""",
         (unit["subject_id"],),
     ).fetchall()
     conn.close()
-    candidates = [{"id": str(row[0]), "memory_kind": str(row[1]), "title": str(row[2]), "content": str(row[3]), "content_hash": str(row[4]), "predicate": str(row[5] or ""), "subject_text": str(row[6] or ""), "object_text": str(row[7] or ""), "status": str(row[8])} for row in candidate_rows]
+    candidates = [{"id": str(row[0]), "memory_kind": str(row[1]), "title": str(row[2]), "content": str(row[3]), "content_hash": str(row[4]), "predicate": str(row[5] or ""), "subject_text": str(row[6] or ""), "object_text": str(row[7] or ""), "status": str(row[8]), "qualifiers": json.loads(str(row[9] or "{}")), "valid_from": str(row[10] or ""), "observed_at": str(row[11] or "")} for row in candidate_rows]
     # Node search supplies text/topic candidates that may not match structured
     # predicates; append only unseen claim ids to preserve scope boundaries.
     found = search_nodes(root, str(unit["subject_id"]), str(unit["content"]), limit=20).get("nodes", [])
@@ -111,6 +124,10 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
         if item.get("node_type") == "claim" and str(item.get("node_id")) not in known:
             candidates.append({"id": str(item["node_id"]), "memory_kind": str(item.get("memory_kind", "candidate")), "title": str(item.get("title", "")), "content": str(item.get("summary", "")), "content_hash": "", "predicate": "", "subject_text": "", "object_text": "", "status": str(item.get("status", ""))})
     relation, target = semantic_relation(unit, candidates)
+    # An optional classifier may suggest a replacement, but only deterministic
+    # temporal/scope evidence may permit automatic supersession semantics.
+    if relation == "REPLACES_OLD_STATE" and target and not _has_state_transition(unit, target):
+        relation = "CONTRADICTS_UNRESOLVED"
     action = RELATION_TO_ACTION[relation]
     if action == "CORROBORATE" and target:
         return {**base, "action": action, "relation": relation, "target_claim_id": target["id"], "memory_kind": target["memory_kind"], "title": target["title"], "content": ""}
@@ -129,13 +146,17 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
     return result
 
 
-def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", limit: int = 20) -> dict[str, object]:
+def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", limit: int = 20, unit_ids: list[int] | None = None) -> dict[str, object]:
     conn = open_db(root)
+    scope, scope_params = "", []
+    if unit_ids:
+        scope = " AND id IN ({})".format(", ".join("?" for _ in unit_ids))
+        scope_params = list(unit_ids)
     rows = conn.execute(
         """SELECT id, unit_kind, domain, topic, content, content_hash, confidence, uncertainty, importance, durability,
                   sensitivity, source_event_ids, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json
-           FROM memory_units WHERE subject_id=? AND status='pending' AND security_state!='blocked' ORDER BY id LIMIT ?""",
-        (subject_id, max(1, limit)),
+           FROM memory_units WHERE subject_id=? AND status='pending' AND security_state!='blocked'""" + scope + " ORDER BY id LIMIT ?",
+        (subject_id, *scope_params, max(1, limit)),
     ).fetchall()
     conn.close()
     keys = ["id", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json"]

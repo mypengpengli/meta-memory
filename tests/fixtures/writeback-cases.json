@@ -1,1 +1,18 @@
-[]
+[
+  {
+    "name": "sourced candidate create is valid",
+    "valid": true,
+    "plan": {
+      "subject_id": "evaluation-user",
+      "actions": [{"plan_id": "eval-valid-create", "action": "CREATE", "subject_id": "evaluation-user", "source_event_ids": [1], "memory_kind": "candidate", "topic": "fixture", "content": "A sourced fixture memory.", "confidence": 0.4, "importance": 0.3, "sensitivity": "normal"}]
+    }
+  },
+  {
+    "name": "unsourced correction is invalid",
+    "valid": false,
+    "plan": {
+      "subject_id": "evaluation-user",
+      "actions": [{"plan_id": "eval-invalid-correct", "action": "CORRECT", "subject_id": "evaluation-user", "target_claim_id": "missing", "source_event_ids": [], "memory_kind": "state", "topic": "fixture", "content": "Replacement.", "confidence": 0.99, "importance": 0.8, "sensitivity": "normal"}]
+    }
+  }
+]

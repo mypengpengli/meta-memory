@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import argparse
+from pathlib import Path
 
 from _common import (
     as_float,
@@ -112,7 +114,7 @@ def search_terms(text: str) -> list[str]:
     return sorted(terms)
 
 
-def ensure_fts(conn: sqlite3.Connection) -> bool:
+def ensure_fts(conn: sqlite3.Connection, *, reset: bool) -> bool:
     try:
         conn.execute(
             """
@@ -130,7 +132,8 @@ def ensure_fts(conn: sqlite3.Connection) -> bool:
             )
             """
         )
-        conn.execute("DELETE FROM document_fts")
+        if reset:
+            conn.execute("DELETE FROM document_fts")
     except sqlite3.OperationalError:
         return False
     return True
@@ -218,14 +221,18 @@ def sync_chunks(conn: sqlite3.Connection, doc_path: str, text: str) -> tuple[int
 
 
 def main() -> None:
-    args = parse_args("Reindex person memory notes into SQLite.")
+    parser = argparse.ArgumentParser(description="Reindex person memory notes into SQLite.")
+    parser.add_argument("--store", help="Path to the memory-data root")
+    parser.add_argument("--path", action="append", default=[], help="Index only this projected Markdown path; may be repeated")
+    args = parser.parse_args()
     root = store_root(args.store)
     conn = open_db(root)
-    fts_enabled = ensure_fts(conn)
-    files = markdown_files(indexed_roots(root))
+    selected_paths = [Path(value).resolve() for value in args.path]
+    fts_enabled = ensure_fts(conn, reset=not selected_paths)
+    files = [path for path in selected_paths if path.exists()] if selected_paths else markdown_files(indexed_roots(root))
     current_paths = {str(path) for path in files}
 
-    if current_paths:
+    if not selected_paths and current_paths:
         placeholders = ", ".join("?" for _ in current_paths)
         conn.execute(
             f"DELETE FROM documents WHERE path NOT IN ({placeholders})",
@@ -243,7 +250,7 @@ def main() -> None:
             conn.execute(f"DELETE FROM chunk_fts WHERE doc_path NOT IN ({placeholders})", tuple(sorted(current_paths)))
         except sqlite3.OperationalError:
             pass
-    else:
+    elif not selected_paths:
         conn.execute("DELETE FROM documents")
         conn.execute("DELETE FROM scores")
         conn.execute("DELETE FROM chunks")
@@ -362,6 +369,7 @@ def main() -> None:
         chunks_indexed += chunk_count
         chunks_reused += 0 if changed else 1
         if fts_enabled:
+            conn.execute("DELETE FROM document_fts WHERE path=?", (doc_path,))
             related_sources = parse_list_text(meta.get("related_sources", []))
             content_terms = " ".join(
                 search_terms(
@@ -404,7 +412,7 @@ def main() -> None:
         indexed += 1
     conn.commit()
     conn.close()
-    emit({"status": "ok", "indexed": indexed, "chunks_indexed": chunks_indexed, "chunks_reused": chunks_reused, "fts_enabled": fts_enabled, "store": str(root)})
+    emit({"status": "ok", "indexed": indexed, "chunks_indexed": chunks_indexed, "chunks_reused": chunks_reused, "fts_enabled": fts_enabled, "store": str(root), "incremental": bool(selected_paths)})
 
 
 if __name__ == "__main__":

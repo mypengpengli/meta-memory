@@ -13,6 +13,24 @@ from proposal_manager import get_proposal, reject_proposal, stage_skill_proposal
 SKILL_ACTIONS = {"CREATE_SKILL", "PATCH_SKILL", "ADD_REFERENCE", "ADD_TEMPLATE", "ADD_SCRIPT", "ARCHIVE_SKILL", "IGNORE"}
 
 
+def retrieve_procedures(root, *, subject_id: str, query: str, limit: int = 4) -> list[dict[str, object]]:
+    """Return approved or candidate procedures as data, never as executable instructions."""
+    terms = [term.casefold() for term in re.findall(r"[a-z0-9][\w.-]{1,}", query.casefold())][:12]
+    conn = open_db(root)
+    rows = conn.execute(
+        "SELECT learning_uid, task_class, instruction_text, trigger_text, pitfall_text, confidence, status FROM procedural_learnings WHERE subject_id=? AND status IN ('candidate','approved') ORDER BY confidence DESC, created_at DESC LIMIT ?",
+        (subject_id, max(limit * 4, limit)),
+    ).fetchall()
+    conn.close()
+    scored = []
+    for row in rows:
+        text = " ".join(str(value or "") for value in row[1:5]).casefold()
+        score = sum(term in text for term in terms)
+        if score:
+            scored.append({"learning_uid": str(row[0]), "task_class": str(row[1]), "instruction_text": str(row[2]), "trigger_text": str(row[3] or ""), "pitfall_text": str(row[4] or ""), "confidence": float(row[5] or 0), "status": str(row[6]), "score": score})
+    return sorted(scored, key=lambda item: (item["score"], item["confidence"]), reverse=True)[:limit]
+
+
 def slug(value: str) -> str:
     text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", (value or "").casefold()).strip("-")
     return text[:64] or "general-procedure"
@@ -49,17 +67,5 @@ def approve_skill(root, proposal_id: str, *, reviewer: str = "user") -> dict[str
     plan = proposal["plan"]
     if str(plan.get("action")) not in SKILL_ACTIONS or str(plan.get("action")) == "IGNORE":
         reject_proposal(root, proposal_id, note="ignored", kind="skill"); return {"status": "ignored"}
-    target = (root / "skills" / f"{slug(str(plan.get('skill') or 'procedure'))}.md").resolve()
-    try: target.relative_to((root / "skills").resolve())
-    except ValueError as exc: raise ValueError("Skill target escaped store") from exc
-    target.parent.mkdir(parents=True, exist_ok=True)
-    old = target.read_text(encoding="utf-8") if target.exists() else ""
-    if "protected: true" in old.casefold(): return {"status": "blocked", "reason": "protected_skill"}
-    heading = f"# {plan.get('skill') or 'Procedure'}\n\n"
-    change = str(plan.get("change") or "").strip()
-    if str(plan.get("action")) == "CREATE_SKILL" or not old:
-        target.write_text(heading + "## User-specific procedures\n\n" + change + "\n", encoding="utf-8", newline="\n")
-    else:
-        target.write_text(old.rstrip() + f"\n\n## {plan.get('section') or 'User-specific procedures'}\n\n{change}\n", encoding="utf-8", newline="\n")
     conn = open_db(root); conn.execute("UPDATE skill_proposals SET status='approved', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE proposal_uid=? AND status='pending'", (reviewer, proposal_id)); conn.commit(); conn.close()
-    return {"status": "approved", "path": str(target), "source_event_ids": plan.get("source_event_ids", [])}
+    return {"status": "approved", "mode": "proposal_only", "source_event_ids": plan.get("source_event_ids", []), "external_apply_required": True}

@@ -1,1 +1,4 @@
-[]
+[
+  {"name": "current state visible", "subject_id": "evaluation-user", "at": "2026-01-01T00:00:00+00:00", "must_include": ["Current Database", "Response Style"], "must_not_include": ["Historical Database"]},
+  {"name": "historical state visible at the time", "subject_id": "evaluation-user", "at": "2024-06-01T00:00:00+00:00", "must_include": ["Historical Database"], "must_not_include": ["Current Database"]}
+]

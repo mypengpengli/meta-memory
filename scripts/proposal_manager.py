@@ -66,6 +66,29 @@ def reject_proposal(root, proposal_id: str, *, note: str = "", kind: str = "memo
     return bool(changed)
 
 
+def approve_memory_proposal(root, proposal_id: str) -> dict[str, object]:
+    """Claim once, apply once, and mark approved only after real success."""
+    conn = open_db(root)
+    claimed = conn.execute("UPDATE write_proposals SET status='applying' WHERE proposal_uid=? AND status='pending'", (proposal_id,)).rowcount
+    if not claimed:
+        row = conn.execute("SELECT status FROM write_proposals WHERE proposal_uid=?", (proposal_id,)).fetchone()
+        conn.close()
+        return {"status": "not_pending", "proposal_status": str(row[0]) if row else "missing"}
+    row = conn.execute("SELECT subject_id, plan_json FROM write_proposals WHERE proposal_uid=?", (proposal_id,)).fetchone()
+    conn.commit(); conn.close()
+    plan = json.loads(str(row[1]))
+    if str(plan.get("action", "")).startswith("REVIEW_"):
+        conn = open_db(root); conn.execute("UPDATE write_proposals SET status='needs_clarification', review_note='Proposal needs corrected replacement content.' WHERE proposal_uid=?", (proposal_id,)); conn.commit(); conn.close()
+        return {"status": "needs_clarification"}
+    from apply_memory_plan import apply_plan
+    result = apply_plan(root, {"schema_version": 3, "subject_id": str(row[0]), "policy": "balanced", "actions": [plan]}, review_approved=True)
+    success = result.get("status") == "ok" and all(item.get("status") in {"applied", "skipped"} for item in result.get("results", []))
+    conn = open_db(root)
+    conn.execute("UPDATE write_proposals SET status=?, reviewed_at=?, review_note=? WHERE proposal_uid=?", ("approved" if success else "failed", datetime.now(timezone.utc).isoformat(), "" if success else json.dumps(result, ensure_ascii=False), proposal_id))
+    conn.commit(); conn.close()
+    return {"status": "approved" if success else "failed", "result": result}
+
+
 def stage_skill_proposal(root, plan: dict[str, object], *, subject_id: str, origin: str = "background_review") -> str:
     conn = open_db(root)
     uid = str(uuid.uuid4())

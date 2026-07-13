@@ -15,7 +15,10 @@ def resolve_entity(conn, *, workspace_id: str, name: str, entity_type: str, sour
     normalized = normalize_alias(name)
     if not normalized:
         return ""
-    row = conn.execute("SELECT entity_uid FROM entity_aliases WHERE normalized_alias=? ORDER BY confidence DESC LIMIT 1", (normalized,)).fetchone()
+    row = conn.execute("""SELECT ea.entity_uid FROM entity_aliases ea
+        JOIN entities e ON e.entity_uid=ea.entity_uid
+        WHERE ea.workspace_id=? AND e.workspace_id=? AND ea.normalized_alias=?
+        ORDER BY ea.confidence DESC LIMIT 1""", (workspace_id, workspace_id, normalized)).fetchone()
     if row:
         uid = str(row[0])
     else:
@@ -23,7 +26,7 @@ def resolve_entity(conn, *, workspace_id: str, name: str, entity_type: str, sour
         uid = str(exact[0]) if exact else str(uuid.uuid4())
         if not exact:
             conn.execute("INSERT INTO entities(entity_uid, workspace_id, canonical_name, entity_type) VALUES(?, ?, ?, ?)", (uid, workspace_id, name, entity_type))
-    conn.execute("INSERT OR IGNORE INTO entity_aliases(entity_uid, alias, normalized_alias, source_event_id, confidence) VALUES(?, ?, ?, ?, ?)", (uid, name, normalized, source_event_id, confidence))
+    conn.execute("INSERT OR IGNORE INTO entity_aliases(entity_uid, alias, normalized_alias, source_event_id, confidence, workspace_id) VALUES(?, ?, ?, ?, ?, ?)", (uid, name, normalized, source_event_id, confidence, workspace_id))
     return uid
 
 
@@ -49,12 +52,12 @@ def resolve_claim_entities(root, claim_id: str, entities: list[dict[str, object]
     return linked
 
 
-def enrich_retrieval_scores(conn, items: list[dict[str, object]], query_terms: list[str]) -> None:
+def enrich_retrieval_scores(conn, items: list[dict[str, object]], query_terms: list[str], *, workspace_id: str = "default") -> None:
     aliases = [normalize_alias(term) for term in query_terms if normalize_alias(term)]
     if not aliases:
         return
     placeholders = ", ".join("?" for _ in aliases)
-    rows = conn.execute(f"SELECT DISTINCT ce.claim_uid FROM entity_aliases ea JOIN claim_entities ce ON ce.entity_uid=ea.entity_uid WHERE ea.normalized_alias IN ({placeholders})", aliases).fetchall()
+    rows = conn.execute(f"SELECT DISTINCT ce.claim_uid FROM entity_aliases ea JOIN claim_entities ce ON ce.entity_uid=ea.entity_uid WHERE ea.workspace_id=? AND ea.normalized_alias IN ({placeholders})", (workspace_id, *aliases)).fetchall()
     matched = {str(row[0]) for row in rows}
     active = {str(item.get("memory_id") or "") for item in items if float(item.get("field_score", 0.0) or 0.0) > 0}
     edges = conn.execute("SELECT from_claim_id, to_claim_id FROM memory_edges").fetchall()

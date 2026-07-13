@@ -1,6 +1,7 @@
 """Small dependency-free reader for the checked-in default configuration."""
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -55,6 +56,7 @@ def _parse_scalar(value: str) -> object:
             return value.strip("'\"")
 
 
+@lru_cache(maxsize=1)
 def load_defaults() -> dict[str, object]:
     values = dict(DEFAULTS)
     path = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
@@ -79,4 +81,14 @@ def load_defaults() -> dict[str, object]:
 
 
 def get(key: str) -> object:
-    return load_defaults().get(key, DEFAULTS[key])
+    values = load_defaults()
+    if key in values:
+        return values[key]
+    if key in DEFAULTS:
+        return DEFAULTS[key]
+    raise KeyError(f"Unknown Meta Memory configuration key: {key}")
+
+
+def reload_config() -> None:
+    """Explicit opt-in reload for hosts that edit configuration at runtime."""
+    load_defaults.cache_clear()

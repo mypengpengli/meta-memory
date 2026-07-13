@@ -138,9 +138,8 @@ def snippet(text: str, limit: int = 180) -> str:
     return compact[: limit - 1] + "…"
 
 
-def main() -> None:
-    args = parse_args()
-    query = read_query(args)
+def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict[str, object]:
+    query = query if query is not None else read_query(args)
     terms = query_terms(query) if query else []
     since = parse_db_time(args.since)
     until = parse_db_time(args.until)
@@ -271,8 +270,7 @@ def main() -> None:
             payload["content"] = row["content"]
         payload_rows.append(payload)
 
-    emit(
-        {
+    return {
             "status": "ok",
             "query": query,
             "filters": {
@@ -287,8 +285,11 @@ def main() -> None:
             },
             "count": len(payload_rows),
             "results": payload_rows,
-        }
-    )
+    }
+
+
+def main() -> None:
+    emit(search_events(parse_args()))
 
 
 if __name__ == "__main__":

@@ -111,6 +111,8 @@ def main() -> None:
     args = parse_args()
     root = store_root(args.store)
     cases = load_cases(args.cases_file)
+    if args.strict and not cases:
+        raise SystemExit("Strict evaluation requires at least one retrieval case.")
     results = [evaluate_case(root, case, args) for case in cases]
     passed = sum(1 for result in results if result["passed"])
     total = len(results)

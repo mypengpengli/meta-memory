@@ -17,12 +17,12 @@ class SecurityFinding:
 
 
 PATTERNS: tuple[tuple[str, str, str, str], ...] = (
-    ("prompt_injection", "blocked", r"(?:ignore|disregard|forget).{0,32}(?:previous|prior|system|developer).{0,32}(?:instruction|prompt|rule)", "Attempts to override prior instructions are not durable memory."),
-    ("role_spoofing", "blocked", r"(?:^|\\n)\\s*(?:system|developer)\\s*[:：]", "Role-labelled text can impersonate a trusted instruction."),
-    ("secret_exfiltration", "blocked", r"(?:reveal|print|show|exfiltrate).{0,48}(?:system prompt|api[_ -]?key|secret|token|credential|password)", "Requests for secrets or hidden prompts are unsafe."),
-    ("hidden_execution", "blocked", r"(?:run|execute|curl|wget|powershell|bash).{0,48}(?:silently|hidden|background|without.*(?:tell|ask))", "Hidden shell or network actions are unsafe in recalled data."),
-    ("tool_call_forgery", "blocked", r"<(?:tool_call|function_call|assistant|memory-context)\\b[^>]*>", "Internal tool/context tags must not be persisted as memory instructions."),
-    ("html_hidden", "suspicious", r"<!--.*?-->|<span[^>]+(?:display\\s*:\\s*none|hidden)", "Hidden markup may conceal instructions."),
+    ("prompt_injection", "blocked", r"(?:ignore|disregard|forget).{0,32}(?:previous|prior|system|developer).{0,32}(?:instruction|prompt|rule)|忽略(?:之前|先前|系统).{0,24}(?:指令|规则)|忽略系统规则", "Attempts to override prior instructions are not durable memory."),
+    ("role_spoofing", "blocked", r"(?:^|\n)\s*(?:system|developer)\s*[:：]", "Role-labelled text can impersonate a trusted instruction."),
+    ("secret_exfiltration", "blocked", r"(?:reveal|print|show|exfiltrate).{0,48}(?:system prompt|api[_ -]?key|secret|token|credential|password)|(?:输出系统提示词|读取并发送\s*API\s*Key|泄露(?:密钥|凭证))", "Requests for secrets or hidden prompts are unsafe."),
+    ("hidden_execution", "blocked", r"(?:run|execute|curl|wget|powershell|bash).{0,48}(?:silently|hidden|background|without.*(?:tell|ask))|(?:不要告诉用户|后台静默执行).{0,48}(?:命令|脚本|下载|请求)?", "Hidden shell or network actions are unsafe in recalled data."),
+    ("tool_call_forgery", "blocked", r"<(?:tool_call|function_call|assistant|memory-context)\b[^>]*>", "Internal tool/context tags must not be persisted as memory instructions."),
+    ("html_hidden", "suspicious", r"<!--.*?-->|<span[^>]+(?:display\s*:\s*none|hidden)", "Hidden markup may conceal instructions."),
 )
 INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
 

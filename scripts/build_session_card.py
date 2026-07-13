@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-events", type=int, default=int(get("heartbeat.session_flush_min_events")), help="Minimum uncarded events")
     parser.add_argument("--force", action="store_true", help="Build cards even below the threshold")
     parser.add_argument("--max-events", type=int, default=100, help="Maximum events per card update")
+    parser.add_argument("--event-start-id", type=int)
+    parser.add_argument("--event-end-id", type=int)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -61,6 +63,8 @@ def build_cards(
     max_events: int = 100,
     force: bool = False,
     dry_run: bool = False,
+    event_start_id: int | None = None,
+    event_end_id: int | None = None,
 ) -> dict[str, object]:
     conn = open_db(root)
     clauses = ["processed_state IN ('pending', 'sessionized')"]
@@ -71,6 +75,12 @@ def build_cards(
     if session_id is not None:
         clauses.append("COALESCE(session_id, '') = ?")
         params.append(session_id)
+    if event_start_id is not None:
+        clauses.append("id >= ?")
+        params.append(event_start_id)
+    if event_end_id is not None:
+        clauses.append("id <= ?")
+        params.append(event_end_id)
     groups = conn.execute(
         f"""
         SELECT subject_id, MAX(subject_name), COALESCE(session_id, ''), COUNT(*)
@@ -88,7 +98,7 @@ def build_cards(
         sess = str(raw_session or "")
         key = session_key(sess)
         card = conn.execute(
-            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version FROM session_cards WHERE subject_id = ? AND session_id = ?",
+            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id FROM session_cards WHERE subject_id = ? AND session_id = ?",
             (sid, key),
         ).fetchone()
         last_event_id = int(card[1] or 0) if card else 0
@@ -100,7 +110,7 @@ def build_cards(
               AND id > ? AND processed_state IN ('pending', 'sessionized')
             ORDER BY id ASC LIMIT ?
             """,
-            (sid, sess, last_event_id, max_events),
+            (sid, sess, max(last_event_id, (event_start_id or 0) - 1), max_events),
         ).fetchall()
         events = [
             {"id": int(row[0]), "source_type": str(row[1] or "conversation"), "content": str(row[2] or ""), "created_at": str(row[3] or ""), "event_time": str(row[4] or "")}
@@ -114,7 +124,7 @@ def build_cards(
         old_questions = json.loads(card[4] or "[]") if card else []
         old_summary = str(card[3] or "") if card else ""
         ids = old_ids + [event["id"] for event in events if event["id"] not in old_ids]
-        summary = "\n".join(part for part in [old_summary, addition] if part).strip()
+        summary = "\n".join(part for part in [old_summary, addition] if part).strip()[-12000:]
         open_questions = list(dict.fromkeys(old_questions + questions))[:12]
         if not dry_run:
             if card:
@@ -141,7 +151,7 @@ def build_cards(
                 f"UPDATE raw_events SET processed_state='sessionized', session_card_id=?, sessionized_at=? WHERE id IN ({placeholders})",
                 (card_id, now, *[event["id"] for event in events]),
             )
-        results.append({"subject_id": sid, "session_id": sess, "card_id": int(card[0]) if card else None, "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions})
+        results.append({"subject_id": sid, "session_id": sess, "card_id": card_id if not dry_run else (int(card[0]) if card else None), "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions})
     if not dry_run:
         conn.commit()
     conn.close()
@@ -150,7 +160,7 @@ def build_cards(
 
 def main() -> None:
     args = parse_args()
-    emit(build_cards(store_root(args.store), subject_id=args.subject_id, session_id=args.session_id, min_events=max(1, args.min_events), max_events=max(1, args.max_events), force=args.force, dry_run=args.dry_run))
+    emit(build_cards(store_root(args.store), subject_id=args.subject_id, session_id=args.session_id, min_events=max(1, args.min_events), max_events=max(1, args.max_events), force=args.force, dry_run=args.dry_run, event_start_id=args.event_start_id, event_end_id=args.event_end_id))
 
 
 if __name__ == "__main__":

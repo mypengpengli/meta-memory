@@ -11,12 +11,12 @@ from pathlib import Path
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root, utc_now
 from apply_memory_plan import apply_plan
 from background_review import recover_stuck_jobs, run_pending
-from build_hot_memory import build_hot_memory
 from build_session_card import build_cards
 from consolidate_memories import build_plan
 from detect_conflicts import find_conflict_candidates
 from doctor import doctor
 from extract_memory_units import extract_units
+from projection_outbox import process_projection_outbox
 
 
 def run_script(script: Path, root: Path) -> dict[str, object]:
@@ -38,11 +38,10 @@ def main() -> None:
     applied = [apply_plan(root, plan, skip_index=True) for plan in plans] if not args.shadow_high_risk else [apply_plan(root, plan, skip_index=True) for plan in plans]
     steps.append({"step": "apply_auto_approved_plans", "results": applied})
     review = run_pending(root, max_jobs=args.max_review_jobs, policy=args.policy, apply_low_risk=not args.shadow_high_risk); steps.append({"step": "review_jobs", "result": review})
+    steps.append({"step": "process_projection_outbox", "result": process_projection_outbox(root, limit=500)})
     base = Path(__file__).resolve().parent
-    for name, step in [("reindex_memory.py", "incremental_reindex"), ("embedding_index.py", "update_embeddings")]:
-        try: steps.append({"step": step, "result": run_script(base / name, root)})
-        except subprocess.CalledProcessError as exc: steps.append({"step": step, "status": "degraded", "error": exc.stderr.strip()})
-    conn = open_db(root); hot_subjects = [str(row[0]) for row in conn.execute("SELECT DISTINCT subject_id FROM claims")]; conn.close(); steps.append({"step": "rebuild_hot_memory", "results": [build_hot_memory(root, subject_id=subject) for subject in hot_subjects]})
+    try: steps.append({"step": "update_embeddings", "result": run_script(base / "embedding_index.py", root)})
+    except subprocess.CalledProcessError as exc: steps.append({"step": "update_embeddings", "status": "degraded", "error": exc.stderr.strip()})
     steps.append({"step": "scan_conflicts", "conflicts": find_conflict_candidates(root)})
     for name, step in [("score_memories.py", "compact_feedback_scores"), ("build_views.py", "build_views"), ("lint_memory.py", "lint")]:
         try: steps.append({"step": step, "result": run_script(base / name, root)})

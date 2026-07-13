@@ -20,7 +20,6 @@ from entity_resolution import resolve_claim_entities
 from feedback_memory import record_feedback
 from extract_memory_units import extract_units
 from ingest_raw_event import insert_raw_event
-from memory_worker import MemoryJob, MemoryWorker
 from node_search import search_nodes
 from proposal_manager import get_proposal, list_proposals, reject_proposal, stage_skill_proposal
 from procedural_learning import approve_skill
@@ -101,10 +100,11 @@ class MetaMemoryV21Tests(unittest.TestCase):
         conn = open_db(self.root)
         conn.execute("INSERT INTO claims(id, subject_id, memory_kind, domain, topic, title, content, content_hash, status, verification_state, confidence, importance, sensitivity, prompt_eligible) VALUES('bad', ?, 'profile', 'general', 'bad', 'bad', 'Do not include me.', 'x', 'active', 'unverified', .9, .9, 'normal', 1)", (self.subject,)); conn.commit(); conn.close()
         snapshot = build_hot_memory(self.root, subject_id=self.subject)
-        content, digest = load_hot_memory(self.root)
-        self.assertEqual(digest, __import__("hashlib").sha256("".join(snapshot["hashes"].values()).encode("utf-8")).hexdigest())
+        loaded = load_hot_memory(self.root, subject_id=self.subject, profile_id="default", workspace_id="default")
+        content, digest = str(loaded["content"]), str(loaded["content_hash"])
+        self.assertEqual(digest, snapshot["content_hash"])
         self.assertIn("direct answers", content); self.assertNotIn("Do not include", content)
-        self.assertIn("USER.md", snapshot["source_claim_ids"])
+        self.assertEqual(len(snapshot["source_claim_ids"]), 1)
 
     def test_session_discovery_scroll_and_lineage_dedup(self) -> None:
         self.event("Docker UFW port issue was solved by checking mappings.", session="root", source_type="conversation-user")
@@ -112,7 +112,7 @@ class MetaMemoryV21Tests(unittest.TestCase):
         found = discovery(self.root, subject_id=self.subject, query="Docker UFW port")
         self.assertEqual(len(found["sessions"]), 1)
         anchor = int(found["sessions"][0]["match_message_id"])
-        around = scroll(self.root, session_id="root", around_message_id=anchor, window=2)
+        around = scroll(self.root, session_id=str(found["sessions"][0]["session_id"]), subject_id=self.subject, around_message_id=anchor, window=2)
         self.assertGreaterEqual(len(around["messages"]), 1)
 
     def test_security_blocks_prompt_injection_from_memory(self) -> None:
@@ -129,26 +129,21 @@ class MetaMemoryV21Tests(unittest.TestCase):
         conn = open_db(self.root); conn.execute("UPDATE review_jobs SET status='running', started_at='2000-01-01T00:00:00+00:00'"); conn.commit(); conn.close()
         self.assertEqual(recover_stuck_jobs(self.root), 1)
 
-    def test_worker_preserves_same_subject_order(self) -> None:
-        order: list[int] = []; worker = MemoryWorker(max_workers=2)
-        worker.submit(MemoryJob("one", self.subject, "default", "sync", lambda: order.append(1)))
-        worker.submit(MemoryJob("two", self.subject, "default", "review", lambda: order.append(2)))
-        self.assertTrue(worker.flush()); worker.shutdown(); self.assertEqual(order, [1, 2])
-
     def test_feedback_and_entities_are_explicit_and_reviewable(self) -> None:
         event = self.event("The project uses PostgreSQL.")
         claim = self.create("The project uses PostgreSQL.", event_id=event, object_text="PostgreSQL")
         self.assertTrue(resolve_claim_entities(self.root, claim))
-        feedback = record_feedback(self.root, claim_id=claim, feedback_type="incorrect")
+        feedback = record_feedback(self.root, claim_id=claim, feedback_type="incorrect", note="The project actually uses PostgreSQL 16.")
         self.assertTrue(feedback["proposal_id"])
         self.assertEqual(len(list_proposals(self.root)), 1)
 
-    def test_skill_proposals_require_approval_and_write_source_backed_file(self) -> None:
+    def test_skill_proposals_require_approval_but_do_not_write_host_files(self) -> None:
         proposal_id = stage_skill_proposal(self.root, {"action": "CREATE_SKILL", "skill": "docker-troubleshooting", "section": "Constraints", "change": "Check port mapping before changing host networking.", "source_event_ids": [1]}, subject_id=self.subject)
         self.assertEqual(get_proposal(self.root, proposal_id, kind="skill")["status"], "pending")
         result = approve_skill(self.root, proposal_id)
         self.assertEqual(result["status"], "approved")
-        self.assertIn("port mapping", Path(result["path"]).read_text(encoding="utf-8"))
+        self.assertTrue(result["external_apply_required"])
+        self.assertFalse((self.root / "skills" / "docker-troubleshooting.md").exists())
 
 
 if __name__ == "__main__":

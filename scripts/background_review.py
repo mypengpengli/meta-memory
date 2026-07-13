@@ -1,76 +1,86 @@
 #!/usr/bin/env python3
-"""Restricted background reviewer: it creates plans, never direct writes."""
+"""SQLite-leased durable review worker; no in-process secondary queue."""
 from __future__ import annotations
 
 import argparse
 import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root, utc_now
 from apply_memory_plan import apply_plan
 from build_session_card import build_cards
+from config import get
 from consolidate_memories import build_plan
 from extract_memory_units import extract_units
 
 
 def enqueue_review(root, *, subject_id: str, session_id: str, event_start_id: int, event_end_id: int, trigger_type: str, workspace_id: str = "default") -> dict[str, object]:
-    key = f"{subject_id}:{workspace_id}:{session_id}:{event_end_id}:{trigger_type}:v1"
-    conn = open_db(root)
-    existing = conn.execute("SELECT job_uid, status FROM review_jobs WHERE job_key=?", (key,)).fetchone()
-    if existing:
-        conn.close(); return {"job_id": str(existing[0]), "status": str(existing[1]), "deduplicated": True}
-    uid = str(uuid.uuid4())
-    conn.execute("INSERT INTO review_jobs(job_uid, job_key, subject_id, session_id, event_start_id, event_end_id, trigger_type) VALUES(?, ?, ?, ?, ?, ?, ?)", (uid, key, subject_id, session_id, event_start_id, event_end_id, trigger_type))
-    conn.commit(); conn.close()
-    return {"job_id": uid, "status": "pending", "deduplicated": False}
+    key=f"{subject_id}:{workspace_id}:{session_id}:{event_start_id}:{event_end_id}:{trigger_type}:v2"; conn=open_db(root)
+    existing=conn.execute("SELECT job_uid,status FROM review_jobs WHERE job_key=?",(key,)).fetchone()
+    if existing: conn.close(); return {"job_id":str(existing[0]),"status":str(existing[1]),"deduplicated":True}
+    uid=str(uuid.uuid4()); conn.execute("INSERT INTO review_jobs(job_uid,job_key,subject_id,session_id,event_start_id,event_end_id,trigger_type) VALUES(?, ?, ?, ?, ?, ?, ?)",(uid,key,subject_id,session_id,event_start_id,event_end_id,trigger_type)); conn.commit(); conn.close(); return {"job_id":uid,"status":"pending","deduplicated":False}
 
 
 def recover_stuck_jobs(root, *, timeout_minutes: int = 10) -> int:
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)).isoformat()
-    conn = open_db(root)
-    changed = conn.execute("UPDATE review_jobs SET status='pending', started_at=NULL, next_retry_at=? WHERE status='running' AND started_at<?", (utc_now(), cutoff)).rowcount
-    conn.commit(); conn.close()
-    return int(changed)
+    conn=open_db(root); cutoff=(datetime.now(timezone.utc)-timedelta(minutes=timeout_minutes)).isoformat()
+    changed=conn.execute("UPDATE review_jobs SET status='pending',lease_owner=NULL,leased_until=NULL,started_at=NULL,next_retry_at=? WHERE status='running' AND (leased_until<? OR started_at<?)",(utc_now(),cutoff,cutoff)).rowcount; conn.commit();conn.close();return int(changed)
 
 
-def _digest(conn, subject_id: str, session_id: str, limit: int = 20) -> str:
-    rows = conn.execute("SELECT role, content FROM session_messages WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id or f"implicit:{subject_id}", limit)).fetchall()
-    return "\n".join(f"{row[0]}: {str(row[1])[:500]}" for row in reversed(rows))[:12000]
+def _claim_job(root, worker_id: str):
+    conn=open_db(root); now=utc_now(); lease=(datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    row=conn.execute("SELECT job_uid,subject_id,session_id,event_start_id,event_end_id,attempt_count FROM review_jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at<=?) AND (leased_until IS NULL OR leased_until<?) ORDER BY created_at LIMIT 1",(now,now)).fetchone()
+    if not row: conn.commit();conn.close();return None
+    claimed=conn.execute("UPDATE review_jobs SET status='running',attempt_count=attempt_count+1,started_at=?,lease_owner=?,leased_until=? WHERE job_uid=? AND status='pending'",(now,worker_id,lease,row[0])).rowcount
+    conn.commit();conn.close(); return tuple(row) if claimed else None
 
 
-def run_pending(root, *, max_jobs: int = 10, policy: str = "conservative", apply_low_risk: bool = False) -> dict[str, object]:
-    conn = open_db(root)
-    jobs = conn.execute("SELECT job_uid, subject_id, session_id FROM review_jobs WHERE status='pending' AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY created_at LIMIT ?", (utc_now(), max_jobs)).fetchall()
-    conn.close()
-    results: list[dict[str, object]] = []
-    for uid, subject_id, session_id in jobs:
-        conn = open_db(root)
-        if not conn.execute("UPDATE review_jobs SET status='running', attempt_count=attempt_count+1, started_at=? WHERE job_uid=? AND status='pending'", (utc_now(), uid)).rowcount:
-            conn.close(); continue
-        digest = _digest(conn, str(subject_id), str(session_id)); conn.execute("UPDATE review_jobs SET input_digest=? WHERE job_uid=?", (digest, uid)); conn.commit(); conn.close()
+def _digest(root, subject_id: str, session_id: str) -> str:
+    conn=open_db(root); rows=conn.execute("SELECT role,content FROM session_messages m JOIN sessions s ON s.session_id=m.session_id WHERE s.subject_id=? AND s.external_session_id=? ORDER BY m.id DESC LIMIT ?",(subject_id,session_id, int(get("review.recent_messages")))).fetchall();conn.close(); return "\n".join(f"{row[0]}: {str(row[1])[:500]}" for row in reversed(rows))[:int(get("review.max_digest_chars"))]
+
+
+def _finish(root, uid: str, *, status: str, plan: dict[str,object] | None=None, error: str="", retry: bool=False) -> None:
+    conn=open_db(root)
+    if retry:
+        attempts=int(conn.execute("SELECT attempt_count FROM review_jobs WHERE job_uid=?",(uid,)).fetchone()[0]); limit=int(get("worker.retry_limit")); delay=min(3600,30*(2**max(0,attempts-1)))
+        if attempts>=limit: status, next_retry="dead_letter",None
+        else: status,next_retry="pending",(datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat()
+        conn.execute("UPDATE review_jobs SET status=?,next_retry_at=?,last_error=?,completed_at=NULL,lease_owner=NULL,leased_until=NULL WHERE job_uid=?",(status,next_retry,error,uid))
+    else:
+        conn.execute("UPDATE review_jobs SET status=?,memory_plan_json=?,completed_at=?,last_error=?,lease_owner=NULL,leased_until=NULL WHERE job_uid=?",(status,json.dumps(plan or {},ensure_ascii=False),utc_now(),error or None,uid))
+    conn.commit();conn.close()
+
+
+def run_pending(root, *, max_jobs: int=10, policy: str="conservative", apply_low_risk: bool=False, worker_id: str="") -> dict[str,object]:
+    worker_id=worker_id or f"worker:{uuid.uuid4()}"; results=[]
+    for _ in range(max(0,max_jobs)):
+        job=_claim_job(root,worker_id)
+        if not job: break
+        uid,subject_id,session_id,start,end,_=job
         try:
-            build_cards(root, subject_id=str(subject_id), session_id=str(session_id) if session_id else None, force=True)
-            units = extract_units(root, subject_id=str(subject_id), limit=100)
-            plan = build_plan(root, str(subject_id), policy=policy, limit=100)
-            for action in plan["actions"]:
-                action["origin"] = "background_review"
-            outcome = apply_plan(root, plan, skip_index=True) if apply_low_risk else {"status": "shadow", "actions": plan["actions"]}
-            status = "applied" if apply_low_risk and all(item.get("status") in {"applied", "review", "skipped"} for item in outcome.get("results", [])) else "staged" if plan["actions"] else "planned"
-            conn = open_db(root); conn.execute("UPDATE review_jobs SET status=?, memory_plan_json=?, completed_at=?, last_error=NULL WHERE job_uid=?", (status, json.dumps(plan, ensure_ascii=False), utc_now(), uid)); conn.commit(); conn.close()
-            results.append({"job_id": uid, "status": status, "units": units["created"], "action_count": len(plan["actions"]), "outcome": outcome})
+            cards=build_cards(root,subject_id=str(subject_id),session_id=str(session_id) or None,event_start_id=int(start or 0) or None,event_end_id=int(end or 0) or None,force=True)
+            card_ids=[int(card["card_id"]) for card in cards["cards"] if card.get("card_id")]
+            units=extract_units(root,subject_id=str(subject_id),card_ids=card_ids,event_start_id=int(start or 0) or None,event_end_id=int(end or 0) or None,limit=max(1,len(card_ids) or 1))
+            unit_ids=[int(item["unit_id"]) for item in units["created"] if item.get("unit_id")]
+            plan=build_plan(root,str(subject_id),policy=policy,unit_ids=unit_ids,limit=max(1,len(unit_ids) or 1))
+            for action in plan["actions"]: action["origin"]="background_review";action["session_id"]=str(session_id)
+            outcome=apply_plan(root,plan,skip_index=True) if apply_low_risk and plan["actions"] else {"status":"shadow","actions":plan["actions"]}
+            status="applied" if apply_low_risk and outcome.get("status")=="ok" else "staged" if plan["actions"] else "planned"; _finish(root,str(uid),status=status,plan=plan);results.append({"job_id":uid,"status":status,"card_ids":card_ids,"unit_ids":unit_ids,"outcome":outcome})
         except Exception as exc:
-            conn = open_db(root); conn.execute("UPDATE review_jobs SET status=CASE WHEN attempt_count>=5 THEN 'dead_letter' ELSE 'failed' END, last_error=?, completed_at=? WHERE job_uid=?", (str(exc), utc_now(), uid)); conn.commit(); conn.close(); results.append({"job_id": uid, "status": "failed", "error": str(exc)})
-    return {"status": "ok", "results": results}
+            _finish(root,str(uid),status="pending",error=str(exc),retry=True);results.append({"job_id":uid,"status":"retrying","error":str(exc)})
+    return {"status":"ok","worker_id":worker_id,"results":results}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Queue or process restricted background memory reviews.")
-    parser.add_argument("--store", help=DEFAULT_STORE_HELP); parser.add_argument("--subject-id"); parser.add_argument("--session-id", default=""); parser.add_argument("--event-start-id", type=int, default=0); parser.add_argument("--event-end-id", type=int, default=0); parser.add_argument("--trigger", default="scheduled_maintenance"); parser.add_argument("--run", action="store_true"); parser.add_argument("--max-jobs", type=int, default=10); parser.add_argument("--apply-low-risk", action="store_true")
-    args = parser.parse_args(); root = store_root(args.store)
-    if args.run: emit(run_pending(root, max_jobs=args.max_jobs, apply_low_risk=args.apply_low_risk))
-    elif args.subject_id: emit(enqueue_review(root, subject_id=args.subject_id, session_id=args.session_id, event_start_id=args.event_start_id, event_end_id=args.event_end_id, trigger_type=args.trigger))
-    else: raise SystemExit("Use --run or supply --subject-id to queue a review job.")
+    parser=argparse.ArgumentParser(description="Run the single durable review worker.");parser.add_argument("--store",help=DEFAULT_STORE_HELP);parser.add_argument("--subject-id");parser.add_argument("--session-id",default="");parser.add_argument("--event-start-id",type=int,default=0);parser.add_argument("--event-end-id",type=int,default=0);parser.add_argument("--trigger",default="scheduled_maintenance");parser.add_argument("--run",action="store_true");parser.add_argument("--loop",action="store_true");parser.add_argument("--poll-seconds",type=float,default=2);parser.add_argument("--max-jobs",type=int,default=10);parser.add_argument("--apply-low-risk",action="store_true")
+    args=parser.parse_args();root=store_root(args.store)
+    if args.loop:
+        while True: run_pending(root,max_jobs=args.max_jobs,apply_low_risk=args.apply_low_risk); time.sleep(max(.1,args.poll_seconds))
+    elif args.run: emit(run_pending(root,max_jobs=args.max_jobs,apply_low_risk=args.apply_low_risk))
+    elif args.subject_id: emit(enqueue_review(root,subject_id=args.subject_id,session_id=args.session_id,event_start_id=args.event_start_id,event_end_id=args.event_end_id,trigger_type=args.trigger))
+    else: raise SystemExit("Use --run/--loop or supply --subject-id to queue a review job.")
 
 
-if __name__ == "__main__": main()
+if __name__=="__main__":main()

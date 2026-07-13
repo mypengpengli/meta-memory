@@ -172,6 +172,14 @@ def apply_action(root: Path, action: dict[str, object], policy: str, review_appr
             old_path, old_backup = save_claim_file(root, conn, old_claim, all_sources(conn, str(old_claim["id"])), name.casefold()); backups.append((old_path, old_backup)); result.update({"claim_id": new_id, "path": str(path), "replaces": old_claim["id"]})
         if action.get("unit_id"):
             conn.execute("UPDATE memory_units SET status='consolidated', updated_at=? WHERE id=?", (utc_now(), action["unit_id"]))
+        if result.get("claim_id"):
+            from projection_outbox import enqueue_projection
+            claim_id = str(result["claim_id"])
+            path_row = conn.execute("SELECT memory_path, content_hash FROM claims WHERE id=?", (claim_id,)).fetchone()
+            enqueue_projection(conn, entity_type="claim", entity_id=claim_id, operation="reindex", payload={"path": str(path_row[0] or "") if path_row else "", "content_hash": str(path_row[1] or "") if path_row else ""})
+            profile_id = str(action.get("profile_id") or "default")
+            workspace_id = str(action.get("workspace_id") or "default")
+            enqueue_projection(conn, entity_type="hot", entity_id=f"{action['subject_id']}\x1f{profile_id}\x1f{workspace_id}", operation="refresh", payload={"claim_id": claim_id, "content_hash": str(path_row[1] or "") if path_row else ""})
         conn.execute("INSERT INTO consolidation_runs(plan_id, subject_id, policy, action, status, payload, applied_at) VALUES(?, ?, ?, ?, 'applied', ?, ?) ON CONFLICT(plan_id) DO UPDATE SET status='applied', applied_at=excluded.applied_at, error=NULL", (action["plan_id"], action["subject_id"], policy, name, json.dumps(action, ensure_ascii=False), utc_now()))
         conn.commit(); conn.close()
         return {**result, "status": "applied"}
@@ -192,11 +200,7 @@ def apply_plan(root: Path, plan: dict[str, object], *, review_approved: bool = F
             resolve_claim_entities(root, str(result["claim_id"]), list(action.get("entities") or []))
     indexing: list[dict[str, object]] = []
     if not skip_index and any(item["status"] == "applied" for item in results):
-        from write_memory import run_indexing
-        indexing = run_indexing(root)
-        from build_hot_memory import build_hot_memory
-        for subject_id in {str(action["subject_id"]) for action in plan["actions"]}:
-            build_hot_memory(root, subject_id=subject_id)
+        indexing = [{"status": "queued", "projection": "outbox"}]
     return {"status": "ok", "validation": validation, "results": results, "indexing": indexing}
 
 

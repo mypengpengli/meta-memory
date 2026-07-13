@@ -1,171 +1,155 @@
 #!/usr/bin/env python3
-"""Extract atomic, validated claims from changed session cards."""
+"""Delta-only, source-timestamped atomic memory unit extraction."""
 from __future__ import annotations
 
 import argparse
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
-from build_session_card import QUESTION, sentence
+from build_session_card import QUESTION
 from classify_memory import classify, first_sentence
-from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root
-from validate_memory_units import validate_unit
+from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root, utc_now
 from llm_client import complete
+from validate_memory_units import validate_unit
 
 
 SENSITIVE = re.compile(r"\b(health|medical|diagnosis|finance|salary|bank|relationship|divorce|password|phone|address)\b|健康|医疗|诊断|财务|工资|银行|关系|离婚|密码|电话|住址")
 UNCERTAIN = re.compile(r"\b(maybe|perhaps|might|guess|probably|unsure)\b|可能|也许|大概|猜测|不确定|好像")
-ACKNOWLEDGEMENT = re.compile(r"^(?:ok|okay|thanks|thank you|got it|continue|好的|谢谢|收到|继续)[!！。.]?$", re.I)
+ACK = re.compile(r"^(?:ok|okay|thanks|thank you|got it|continue|好的|谢谢|收到|继续)[!！。.]?$", re.I)
 BOUNDARY = re.compile(r"(?<=[。！？!?.])\s*|\n+")
+EXTRACTION_VERSION = "rules-v2"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract validated atomic memory units from changed session cards.")
-    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
-    parser.add_argument("--subject-id")
-    parser.add_argument("--card-id", type=int)
-    parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--include-assistant", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser = argparse.ArgumentParser(description="Extract atomic units only from new session-card events.")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP); parser.add_argument("--subject-id"); parser.add_argument("--session-id"); parser.add_argument("--card-id", type=int); parser.add_argument("--limit", type=int, default=20); parser.add_argument("--event-start-id", type=int); parser.add_argument("--event-end-id", type=int); parser.add_argument("--include-assistant", action="store_true"); parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
-def is_question(content: str) -> bool:
-    return bool(QUESTION.search(content.strip()))
-
-
-def sensitivity(content: str) -> str:
-    return "sensitive" if SENSITIVE.search(content) else "normal"
+def is_question(text: str) -> bool: return bool(QUESTION.search(text.strip()))
+def contains_assertion(text: str) -> bool:
+    # Keep factual clauses embedded in a question such as "The project now
+    # uses PostgreSQL; do you remember?".  The localized patterns below cover
+    # Chinese phrasing; this explicit English branch avoids an overly narrow
+    # "the project uses" match.
+    if re.search(r"\bthe project\s+(?:(?:now|currently)\s+)?(?:uses|has|is)\b", text, re.I):
+        return True
+    return bool(re.search(r"我(?:现在|目前|已经|一直)|项目(?:现在|目前|已经)|\bI (?:currently|now|have|use|prefer)\b|\bthe project (?:uses|has|is)\b", text, re.I))
+def sensitivity(text: str) -> str: return "sensitive" if SENSITIVE.search(text) else "normal"
+def clamp01(value: object, fallback: float) -> float:
+    try: return max(0., min(1., float(value)))
+    except (TypeError, ValueError): return fallback
+def normalize_dict(value: object) -> dict[str, object]: return {str(key): item for key, item in value.items()} if isinstance(value, dict) else {}
+def normalize_entities(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list): return []
+    return [{"name":str(item.get("name", "")).strip(),"type":str(item.get("type", "unknown")).strip() or "unknown","role":str(item.get("role", "related")).strip() or "related"} for item in value if isinstance(item, dict) and str(item.get("name", "")).strip()][:20]
+def normalize_time(value: object) -> str: return str(value or "").strip()
 
 
 def atomic_clauses(content: str) -> list[str]:
-    """Keep timeline facts, preferences, and procedures as separate units."""
-    flat = " ".join(content.split())
-    clauses: list[str] = []
-    for sentence_text in BOUNDARY.split(flat):
-        sentence_text = sentence_text.strip(" -;；")
-        if not sentence_text:
-            continue
-        clauses.extend(part.strip() for part in re.split(r"\s+(?:and|but)\s+(?=(?:I|we|the |this |now |previously ))", sentence_text, flags=re.I) if part.strip())
-    return list(dict.fromkeys(clauses))[:12]
+    result: list[str] = []
+    for sentence in BOUNDARY.split(" ".join(content.split())):
+        sentence = sentence.strip(" -;；")
+        if sentence: result.extend(piece.strip() for piece in re.split(r"\s+(?:and|but)\s+(?=(?:I|we|the |this |now |previously ))", sentence, flags=re.I) if piece.strip())
+    return list(dict.fromkeys(result))[:12]
 
 
 def structured_fields(text: str, topic_hint: str, domain_hint: str) -> dict[str, object]:
-    predicate, kind, subject, durability = "states", "domain", "user", 0.55
-    if re.search(r"\b(?:prefer|preference|like responses)\b|偏好|喜欢.*(?:回答|方式)|希望.*(?:回答|说明)", text, re.I):
-        predicate, kind, subject, durability = "prefers", "profile", "user", 0.9
-    elif re.search(r"\b(?:now|currently|migrated|changed to|uses?)\b|现在|目前|已经改成|迁移到", text, re.I):
-        predicate, kind, subject, durability = "current_state", "state", "project", 0.75
-    elif re.search(r"\b(?:previously|used to|before)\b|以前|之前|曾经", text, re.I):
-        predicate, kind, subject, durability = "historical_state", "event", "project", 0.7
-    elif re.search(r"\b(?:please|when troubleshooting|when debugging|when .*?(?:debug|troubleshoot)|first .*? then)\b|以后.*(?:请|先)|排查.*(?:先|再)", text, re.I):
-        predicate, kind, subject, durability = "procedure", "domain", "workflow", 0.8
-    elif re.search(r"\b(?:goal|plan|will|need to)\b|目标|计划|需要", text, re.I):
-        predicate, kind, subject, durability = "goal", "goal", "project", 0.65
-    object_match = re.search(r"(?:uses?|use|to|为|是|改成|迁移到)\s+([A-Za-z0-9_.+/#-]{2,}|[\u4e00-\u9fff]{2,})", text, re.I)
-    object_text = object_match.group(1) if object_match else text[:240]
+    predicate, kind, subject, durability = "states", "domain", "user", .55
+    if re.search(r"\b(?:prefer|preference|like responses)\b|偏好|喜欢.*(?:回答|方式)|希望.*(?:回答|说明)", text, re.I): predicate,kind,subject,durability="prefers","profile","user",.9
+    elif re.search(r"\b(?:now|currently|migrated|changed to|uses?)\b|现在|目前|已经改成|迁移到", text, re.I): predicate,kind,subject,durability="current_state","state","project",.75
+    elif re.search(r"\b(?:previously|used to|before)\b|以前|之前|曾经", text, re.I): predicate,kind,subject,durability="historical_state","event","project",.7
+    elif re.search(r"\b(?:please|when troubleshooting|when debugging|when .*?(?:debug|troubleshoot)|first .*? then)\b|以后.*(?:请|先)|排查.*(?:先|再)", text, re.I): predicate,kind,subject,durability="procedure","domain","workflow",.8
+    elif re.search(r"\b(?:goal|plan|will|need to)\b|目标|计划|需要", text, re.I): predicate,kind,subject,durability="goal","goal","project",.65
+    matched = re.search(r"(?:uses?|use|to|为|是|改成|迁移到)\s+([A-Za-z0-9_.+/#-]{2,}|[\u4e00-\u9fff]{2,})", text, re.I)
+    object_text = matched.group(1) if matched else text[:240]
     topic = topic_hint or re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", object_text.casefold()).strip("-") or "memory"
-    return {"predicate": predicate, "unit_kind": kind, "subject_text": subject, "object_text": object_text[:240], "topic": topic[:80], "domain": domain_hint or "general", "durability": durability}
+    return {"predicate":predicate,"unit_kind":kind,"subject_text":subject,"object_text":object_text[:240],"topic":topic[:80],"domain":domain_hint or "general","durability":durability,"qualifiers":{},"entities":{},"valid_from":"","valid_to":""}
 
 
 def optional_llm_units(content: str, raw_event_id: int) -> list[dict[str, object]]:
-    """Use a configured structured LLM only for multi-fact/conditional text."""
-    if not re.search(r"[。！？!?].+[。！？!?]|\b(?:but|however|previously|now|if)\b|以前|现在|如果|但是", content, re.I):
-        return []
-    prompt = (Path(__file__).resolve().parent.parent / "prompts" / "extract_memory_units.md").read_text(encoding="utf-8")
-    try:
-        response = complete(prompt, {"raw_event_id": raw_event_id, "content": content}) or {}
-    except Exception:
-        return []
+    if not re.search(r"[。！？!?].+[。！？!?]|\b(?:but|however|previously|now|if)\b|以前|现在|如果|但是", content, re.I): return []
+    try: response = complete((Path(__file__).resolve().parent.parent / "prompts" / "extract_memory_units.md").read_text(encoding="utf-8"), {"raw_event_id":raw_event_id,"content":content}) or {}
+    except Exception: return []
     values = response.get("units") if isinstance(response, dict) else None
-    if not isinstance(values, list):
-        return []
-    result: list[dict[str, object]] = []
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        ids = value.get("source_event_ids")
-        if ids != [raw_event_id]:
-            continue
-        if not str(value.get("claim_text") or "").strip() or not str(value.get("predicate") or "").strip():
-            continue
-        result.append(value)
-    return result[:12]
+    return [item for item in values or [] if isinstance(item,dict) and item.get("source_event_ids")==[raw_event_id] and str(item.get("claim_text") or "").strip() and str(item.get("predicate") or "").strip()][:12]
 
 
-def extract_units(root, *, subject_id: str | None = None, card_id: int | None = None, limit: int = 20, include_assistant: bool = False, dry_run: bool = False) -> dict[str, object]:
-    conn = open_db(root)
-    clauses, params = ["needs_extraction=1"], []
-    if subject_id:
-        clauses.append("subject_id=?")
-        params.append(subject_id)
-    if card_id is not None:
-        clauses.append("id=?")
-        params.append(card_id)
-    cards = conn.execute(f"SELECT id, subject_id, subject_name, session_id, source_event_ids FROM session_cards WHERE {' AND '.join(clauses)} ORDER BY updated_at LIMIT ?", (*params, max(1, limit))).fetchall()
-    created: list[dict[str, object]] = []
-    skipped: list[dict[str, object]] = []
-    for card_id_value, sid, name, session_id, source_ids_json in cards:
-        ids = [int(value) for value in json.loads(source_ids_json or "[]")]
-        if not ids:
+def optional_llm_units_batch(events: list[dict[str, object]]) -> dict[int, list[dict[str, object]]]:
+    """Use one optional model request for up to ten complex source events."""
+    complex_events = [
+        {"raw_event_id": int(item["raw_event_id"]), "content": str(item["content"])}
+        for item in events
+        if re.search(r"[.?!].+[.?!]|\b(?:but|however|previously|now|if)\b", str(item["content"]), re.I)
+    ][:10]
+    if not complex_events:
+        return {}
+    try:
+        prompt = (Path(__file__).resolve().parent.parent / "prompts" / "extract_memory_units.md").read_text(encoding="utf-8")
+        response = complete(prompt, {"events": complex_events, "batch": True}) or {}
+    except Exception:
+        return {}
+    allowed = {entry["raw_event_id"] for entry in complex_events}
+    grouped: dict[int, list[dict[str, object]]] = {}
+    for item in response.get("units", []) if isinstance(response, dict) else []:
+        if not isinstance(item, dict) or not str(item.get("claim_text") or "").strip() or not str(item.get("predicate") or "").strip():
             continue
-        placeholders = ", ".join("?" for _ in ids)
-        events = conn.execute(f"SELECT id, source_type, content, topic_hint, domain_hint FROM raw_events WHERE id IN ({placeholders}) ORDER BY id", ids).fetchall()
-        for event_id, source_type, raw_content, topic_hint, domain_hint in events:
-            source_type = str(source_type or "")
-            content = " ".join(str(raw_content or "").split())[:2000]
-            if not content or is_question(content) or ACKNOWLEDGEMENT.match(content):
-                skipped.append({"raw_event_id": event_id, "reason": "question_or_empty"})
-                continue
-            if source_type == "conversation-assistant" and not include_assistant:
-                skipped.append({"raw_event_id": event_id, "reason": "assistant_content_disabled"})
-                continue
-            llm_units = optional_llm_units(content, int(event_id))
-            candidates = llm_units or [{"claim_text": clause} for clause in atomic_clauses(content)]
-            for extracted in candidates:
+        source_ids = item.get("source_event_ids")
+        if not isinstance(source_ids, list) or len(source_ids) != 1:
+            continue
+        try:
+            event_id = int(source_ids[0])
+        except (TypeError, ValueError):
+            continue
+        if event_id in allowed:
+            grouped.setdefault(event_id, []).append(item)
+    return {event_id: units[:12] for event_id, units in grouped.items()}
+
+
+def normalize_extracted_unit(extracted: dict[str, object], *, fallback: dict[str, object], raw_event: dict[str, object]) -> dict[str, object]:
+    return {"predicate":str(extracted.get("predicate") or fallback["predicate"]),"unit_kind":str(extracted.get("memory_kind") or fallback["unit_kind"]),"subject_text":str(extracted.get("subject_text") or fallback["subject_text"]),"object_text":str(extracted.get("object_text") or fallback["object_text"]),"topic":str(extracted.get("topic") or fallback["topic"]),"domain":str(extracted.get("domain") or fallback["domain"]),"qualifiers":normalize_dict(extracted.get("qualifiers")),"entities":normalize_entities(extracted.get("entities")),"valid_from":normalize_time(extracted.get("valid_from")),"valid_to":normalize_time(extracted.get("valid_to")),"observed_at":normalize_time(extracted.get("observed_at") or raw_event["event_time"] or raw_event["created_at"]),"durability":clamp01(extracted.get("durability"), float(fallback["durability"]))}
+
+
+def extract_units(root, *, subject_id: str | None = None, session_id: str | None = None, card_id: int | None = None, card_ids: list[int] | None = None, event_start_id: int | None = None, event_end_id: int | None = None, limit: int = 20, include_assistant: bool = False, dry_run: bool = False) -> dict[str, object]:
+    conn = open_db(root); clauses, params = ["needs_extraction=1"], []
+    if subject_id: clauses.append("subject_id=?"); params.append(subject_id)
+    if session_id is not None: clauses.append("session_id=?"); params.append(session_id or "__default__")
+    identifiers = card_ids or ([card_id] if card_id is not None else [])
+    if identifiers: clauses.append("id IN ({})".format(", ".join("?" for _ in identifiers))); params.extend(identifiers)
+    cards = conn.execute(f"SELECT id,subject_id,subject_name,session_id,last_extracted_event_id FROM session_cards WHERE {' AND '.join(clauses)} ORDER BY updated_at LIMIT ?", (*params,max(1,limit))).fetchall()
+    created, skipped = [], []
+    for cid, sid, name, sess, last_extracted in cards:
+        event_clauses, event_params = ["session_card_id=?", "id>?"], [cid, int(last_extracted or 0)]
+        if event_start_id is not None: event_clauses.append("id>=?"); event_params.append(event_start_id)
+        if event_end_id is not None: event_clauses.append("id<=?"); event_params.append(event_end_id)
+        events = conn.execute(f"SELECT id,source_type,content,topic_hint,domain_hint,event_time,created_at FROM raw_events WHERE {' AND '.join(event_clauses)} ORDER BY id", event_params).fetchall()
+        max_seen = int(last_extracted or 0)
+        llm_by_event = optional_llm_units_batch([{"raw_event_id": int(row[0]), "content": str(row[2] or "")} for row in events])
+        for event_id, source_type, content, topic_hint, domain_hint, event_time, created_at in events:
+            max_seen = max(max_seen,int(event_id)); source_type, content = str(source_type or ""), " ".join(str(content or "").split())[:2000]
+            if not content or ACK.match(content): skipped.append({"raw_event_id":event_id,"reason":"empty_or_ack"}); continue
+            if source_type=="conversation-assistant" and not include_assistant: skipped.append({"raw_event_id":event_id,"reason":"assistant_content_disabled"}); continue
+            raw = {"event_time":str(event_time or ""),"created_at":str(created_at or "")}; llm = llm_by_event.get(int(event_id), []); candidates = llm or [{"claim_text":part} for part in atomic_clauses(content)]
+            for clause_index, extracted in enumerate(candidates):
                 clause = str(extracted.get("claim_text") or "").strip()
-                if is_question(clause) or ACKNOWLEDGEMENT.match(clause):
-                    skipped.append({"raw_event_id": event_id, "reason": "non_memory_clause"})
-                    continue
-                fields = structured_fields(clause, str(topic_hint or ""), str(domain_hint or ""))
-                if llm_units:
-                    fields.update({"predicate": str(extracted.get("predicate") or fields["predicate"]), "unit_kind": str(extracted.get("memory_kind") or fields["unit_kind"]), "subject_text": str(extracted.get("subject_text") or fields["subject_text"]), "object_text": str(extracted.get("object_text") or fields["object_text"]), "topic": str(extracted.get("topic") or fields["topic"]), "domain": str(extracted.get("domain") or fields["domain"]), "durability": float(extracted.get("durability", fields["durability"]) or fields["durability"])})
-                title = str(topic_hint or first_sentence(clause)[:80] or f"raw-event-{event_id}")
-                classified = classify(title, clause, str(sid), str(name or "Unknown"))
-                confidence = min(float(classified["suggested_payload"]["confidence"]), 0.25) if source_type == "conversation-assistant" else float(classified["suggested_payload"]["confidence"])
-                confidence = float(extracted.get("confidence", confidence) or confidence) if llm_units else confidence
-                unit = {"subject_id": str(sid), "claim_text": clause, "source_event_ids": [int(event_id)], "memory_kind": str(fields["unit_kind"]), "predicate": str(fields["predicate"]), "confidence": confidence, "uncertainty": float(extracted.get("uncertainty", 0.7 if UNCERTAIN.search(clause) else max(0.05, 1.0 - float(classified["classification_confidence"]))) or 0.0), "importance": float(extracted.get("importance", classified["suggested_payload"]["importance"]) or 0.0), "durability": float(fields["durability"])}
-                validation = validate_unit(root, unit)
-                if not validation["valid"]:
-                    skipped.append({"raw_event_id": event_id, "reason": "validation", "errors": validation["errors"]})
-                    continue
-                digest = sha256_text(clause)
-                key = sha256_text(f"{sid}:{event_id}:{fields['predicate']}:{digest}")
-                observed_at = datetime.now(timezone.utc).isoformat()
-                if dry_run:
-                    created.append({"unit_id": None, "raw_event_id": event_id, "topic": fields["topic"], "predicate": fields["predicate"], "confidence": confidence})
-                    continue
-                cursor = conn.execute(
-                    """INSERT OR IGNORE INTO memory_units(unit_key, subject_id, subject_name, session_id, session_card_id, raw_event_id, source_event_ids, unit_kind, topic, content, content_hash, confidence, uncertainty, importance, sensitivity, source_type, status, domain, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, durability, entities_json, security_state, security_findings_json)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, '{}', ?, '', ?, ?, '[]', ?, ?)""",
-                    (key, sid, name, session_id, card_id_value, event_id, json.dumps([event_id]), fields["unit_kind"], fields["topic"], clause, digest, confidence, unit["uncertainty"], unit["importance"], sensitivity(clause), source_type, fields["domain"], fields["predicate"], fields["subject_text"], fields["object_text"], observed_at, observed_at, fields["durability"], validation["security_state"], json.dumps(validation["security_findings"], ensure_ascii=False)),
-                )
-                if cursor.rowcount:
-                    created.append({"unit_id": int(cursor.lastrowid), "raw_event_id": event_id, "topic": fields["topic"], "predicate": fields["predicate"], "confidence": confidence})
-        if not dry_run:
-            conn.execute("UPDATE session_cards SET needs_extraction=0, updated_at=CURRENT_TIMESTAMP WHERE id=?", (card_id_value,))
-    if not dry_run:
-        conn.commit()
-    conn.close()
-    return {"status": "ok", "dry_run": dry_run, "created": created, "skipped": skipped, "card_count": len(cards)}
+                if not clause or ACK.match(clause) or (is_question(clause) and not contains_assertion(clause)): skipped.append({"raw_event_id":event_id,"reason":"question_or_nonmemory"}); continue
+                fallback = structured_fields(clause,str(topic_hint or ""),str(domain_hint or "")); fields = normalize_extracted_unit(extracted if llm else {}, fallback=fallback, raw_event=raw)
+                classified = classify(str(topic_hint or first_sentence(clause)[:80] or f"raw-event-{event_id}"), clause, str(sid), str(name or "Unknown")); confidence = clamp01(extracted.get("confidence"), float(classified["suggested_payload"]["confidence"])) if llm else (min(float(classified["suggested_payload"]["confidence"]),.25) if source_type=="conversation-assistant" else float(classified["suggested_payload"]["confidence"]))
+                unit = {"subject_id":str(sid),"claim_text":clause,"source_event_ids":[int(event_id)],"memory_kind":fields["unit_kind"],"predicate":fields["predicate"],"confidence":confidence,"uncertainty":clamp01(extracted.get("uncertainty"), .7 if UNCERTAIN.search(clause) else max(.05,1-float(classified["classification_confidence"]))),"importance":clamp01(extracted.get("importance"),float(classified["suggested_payload"]["importance"])),"durability":fields["durability"],"valid_from":fields["valid_from"],"valid_to":fields["valid_to"]}
+                validation = validate_unit(root,unit)
+                if not validation["valid"]: skipped.append({"raw_event_id":event_id,"reason":"validation","errors":validation["errors"]}); continue
+                if dry_run: created.append({"unit_id":None,"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]}); continue
+                key=sha256_text(f"{sid}:{event_id}:{clause_index}:{EXTRACTION_VERSION}:{sha256_text(clause)}")
+                cursor=conn.execute("""INSERT OR IGNORE INTO memory_units(unit_key,subject_id,subject_name,session_id,session_card_id,raw_event_id,source_event_ids,unit_kind,topic,content,content_hash,confidence,uncertainty,importance,sensitivity,source_type,status,domain,predicate,subject_text,object_text,qualifiers_json,valid_from,valid_to,observed_at,durability,entities_json,security_state,security_findings_json,clause_index,extraction_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (key,sid,name,sess,cid,event_id,json.dumps([event_id]),fields["unit_kind"],fields["topic"],clause,sha256_text(clause),confidence,unit["uncertainty"],unit["importance"],sensitivity(clause),source_type,fields["domain"],fields["predicate"],fields["subject_text"],fields["object_text"],json.dumps(fields["qualifiers"],ensure_ascii=False),fields["valid_from"],fields["valid_to"],fields["observed_at"] or utc_now(),fields["durability"],json.dumps(fields["entities"],ensure_ascii=False),validation["security_state"],json.dumps(validation["security_findings"],ensure_ascii=False),clause_index,EXTRACTION_VERSION))
+                if cursor.rowcount: created.append({"unit_id":int(cursor.lastrowid),"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]})
+        if not dry_run and max_seen > int(last_extracted or 0): conn.execute("UPDATE session_cards SET last_extracted_event_id=?, needs_extraction=0, updated_at=CURRENT_TIMESTAMP WHERE id=?",(max_seen,cid))
+    if not dry_run: conn.commit()
+    conn.close(); return {"status":"ok","dry_run":dry_run,"created":created,"skipped":skipped,"card_count":len(cards)}
 
 
 def main() -> None:
-    args = parse_args()
-    emit(extract_units(store_root(args.store), subject_id=args.subject_id, card_id=args.card_id, limit=args.limit, include_assistant=args.include_assistant, dry_run=args.dry_run))
+    args=parse_args(); emit(extract_units(store_root(args.store),subject_id=args.subject_id,session_id=args.session_id,card_id=args.card_id,event_start_id=args.event_start_id,event_end_id=args.event_end_id,limit=args.limit,include_assistant=args.include_assistant,dry_run=args.dry_run))
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

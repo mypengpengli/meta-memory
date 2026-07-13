@@ -1,1 +1,7 @@
-[]
+{
+  "cases": [
+    {"name": "current database", "query": "What database does the project use?", "subject_id": "evaluation-user", "must_include": ["Current Database"], "must_not_include": ["Historical Database"]},
+    {"name": "response preference", "query": "How should answers be written?", "subject_id": "evaluation-user", "must_include": ["Response Style"]},
+    {"name": "technical exact token", "query": "PostgreSQL", "subject_id": "evaluation-user", "must_include": ["Current Database"], "must_not_include": ["Historical Database"]}
+  ]
+}

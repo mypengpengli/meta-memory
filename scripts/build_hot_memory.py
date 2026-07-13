@@ -1,150 +1,150 @@
 #!/usr/bin/env python3
-"""Compile bounded, read-only hot-memory projections from eligible claims."""
+"""Scope-isolated, immutable-in-session hot-memory projections."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-from datetime import datetime, timezone
+import os
+import tempfile
+import uuid
 from pathlib import Path
 
-from _common import DEFAULT_STORE_HELP, emit, open_db, utc_now, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root, utc_now
 from config import get
 from security_scan import sanitize_for_context
+from write_memory import slugify
 
 
-TYPE_PRIORITY = {"profile": 1.0, "state": 0.9, "goal": 0.85, "relationship": 0.75, "domain": 0.65, "event": 0.35}
+TYPE_PRIORITY = {"profile": 1.0, "state": 0.9, "goal": 0.85, "relationship": 0.75, "domain": 0.30, "event": 0.2}
+AGENT_PREDICATES = {"procedure", "operating_principle", "response_constraint", "workflow_preference"}
 
 
-def _float(value: object, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def hot_scope_dir(root: Path, *, workspace_id: str, profile_id: str, subject_id: str) -> Path:
+    return root / "hot" / slugify(workspace_id) / slugify(profile_id) / sha256_text(subject_id)[:16]
+
+
+def _number(value: object, default: float = 0.0) -> float:
+    try: return float(value)
+    except (TypeError, ValueError): return default
 
 
 def hot_memory_score(claim: dict[str, object]) -> float:
     text = str(claim["content"])
-    score = _float(claim.get("importance")) * 0.25
-    score += _float(claim.get("confidence")) * 0.20
-    score += max(-1.0, min(1.0, _float(claim.get("confirmed_utility")))) * 0.15
-    score += _float(claim.get("durability"), 0.5) * 0.15
-    score += TYPE_PRIORITY.get(str(claim.get("memory_kind")), 0.2) * 0.15
-    valid_from = str(claim.get("valid_from") or "")
-    score += 0.10 if not valid_from or valid_from <= utc_now() else 0.0
-    score -= min(0.18, len(text) / 12000)
-    score -= _float(claim.get("uncertainty")) * 0.12
-    if str(claim.get("sensitivity")) == "sensitive":
-        score -= 0.35
+    score = _number(claim.get("importance")) * .25 + _number(claim.get("confidence")) * .20
+    score += max(-1., min(1., _number(claim.get("confirmed_utility")))) * .15 + _number(claim.get("durability"), .5) * .15
+    score += TYPE_PRIORITY.get(str(claim.get("memory_kind")), .1) * .15 + (.10 if not str(claim.get("valid_from") or "") or str(claim.get("valid_from")) <= utc_now() else 0)
+    score -= min(.18, len(text) / 12000) + _number(claim.get("uncertainty")) * .12
+    if str(claim.get("sensitivity")) == "sensitive": score -= .35
     return round(score, 6)
 
 
-def _read_claims(root: Path, subject_id: str) -> list[dict[str, object]]:
+def _eligible_claims(root: Path, subject_id: str) -> list[dict[str, object]]:
     conn = open_db(root)
-    rows = conn.execute(
-        """
-        SELECT c.id, c.memory_kind, c.domain, c.topic, c.title, c.content, c.status, c.verification_state,
-               c.confidence, c.importance, c.sensitivity, c.valid_from, c.valid_to, c.durability,
-               c.confirmed_utility, c.security_state,
-               (SELECT COUNT(*) FROM claim_sources cs WHERE cs.claim_id=c.id) AS sources
-        FROM claims c
-        WHERE c.subject_id=? AND c.status='active' AND c.prompt_eligible=1
-          AND c.security_state IN ('clean', 'reviewed_safe')
-          AND c.verification_state NOT IN ('unverified', 'disputed', 'invalid')
+    rows = conn.execute("""SELECT c.id, c.memory_kind, c.domain, c.topic, c.title, c.content, c.predicate,
+        c.confidence, c.importance, c.sensitivity, c.valid_from, c.valid_to, c.durability, c.confirmed_utility,
+        (SELECT COUNT(*) FROM claim_sources cs WHERE cs.claim_id=c.id) FROM claims c
+        WHERE c.subject_id=? AND c.status='active' AND c.prompt_eligible=1 AND c.security_state IN ('clean','reviewed_safe')
+          AND c.verification_state NOT IN ('unverified','disputed','invalid')
           AND (c.valid_from IS NULL OR c.valid_from='' OR c.valid_from<=?)
-          AND (c.valid_to IS NULL OR c.valid_to='' OR c.valid_to>?)
-          AND (c.replaced_by IS NULL OR c.replaced_by='')
-        """,
-        (subject_id, utc_now(), utc_now()),
-    ).fetchall()
+          AND (c.valid_to IS NULL OR c.valid_to='' OR c.valid_to>?) AND (c.replaced_by IS NULL OR c.replaced_by='')""", (subject_id, utc_now(), utc_now())).fetchall()
     conn.close()
-    keys = ["id", "memory_kind", "domain", "topic", "title", "content", "status", "verification_state", "confidence", "importance", "sensitivity", "valid_from", "valid_to", "durability", "confirmed_utility", "security_state", "sources"]
-    return [dict(zip(keys, row)) for row in rows if int(row[-1] or 0) > 0]
+    keys = ["id","memory_kind","domain","topic","title","content","predicate","confidence","importance","sensitivity","valid_from","valid_to","durability","confirmed_utility","sources"]
+    return [dict(zip(keys, row)) for row in rows if int(row[-1] or 0)]
 
 
 def _render(title: str, items: list[dict[str, object]], budget: int) -> tuple[str, list[str]]:
-    lines = [f"# {title}", "", "Generated from eligible claims; do not edit this projection manually."]
-    ids: list[str] = []
+    lines, ids = [f"# {title}", "", "Generated projection; edit claims, never this file."], []
     for item in items:
-        text = sanitize_for_context(str(item["content"]).strip())
-        line = f"- {text}  <!-- claim:{item['id']} -->"
-        candidate = "\n".join(lines + [line]) + "\n"
-        if len(candidate) > budget:
-            continue
-        lines.append(line)
-        ids.append(str(item["id"]))
-    if not ids:
-        lines.append("- No eligible memory is currently available.")
+        line = f"- {sanitize_for_context(str(item['content']).strip())}  <!-- claim:{item['id']} -->"
+        if len("\n".join(lines + [line])) + 1 > budget: continue
+        lines.append(line); ids.append(str(item["id"]))
+    if not ids: lines.append("- No eligible memory is currently available.")
     return "\n".join(lines).rstrip() + "\n", ids
 
 
-def build_hot_memory(root: Path, *, subject_id: str, profile_id: str = "default", force: bool = False) -> dict[str, object]:
-    claims = _read_claims(root, subject_id)
-    for claim in claims:
-        claim["score"] = hot_memory_score(claim)
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content); handle.flush(); os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except Exception:
+        Path(temp).unlink(missing_ok=True); raise
+
+
+def _content_hash(parts: dict[str, str]) -> str:
+    return hashlib.sha256("".join(parts[name] for name in ("USER.md","AGENT.md","CURRENT.md")).encode("utf-8")).hexdigest()
+
+
+def build_hot_memory(root: Path, *, subject_id: str, profile_id: str = "default", workspace_id: str = "default", force: bool = False) -> dict[str, object]:
+    claims = _eligible_claims(root, subject_id)
+    for claim in claims: claim["score"] = hot_memory_score(claim)
     claims.sort(key=lambda item: (float(item["score"]), float(item["importance"])), reverse=True)
-    quotas = {"profile": 5, "state": 3, "goal": 3, "relationship": 2, "domain": 3}
-    chosen: list[dict[str, object]] = []
-    counts: dict[str, int] = {}
+    quotas, selected = {"profile":5,"state":3,"goal":3,"relationship":2,"domain":3}, []
+    counts: dict[str,int] = {}
     for claim in claims:
         kind = str(claim["memory_kind"])
-        if counts.get(kind, 0) >= quotas.get(kind, 1):
-            continue
-        counts[kind] = counts.get(kind, 0) + 1
-        chosen.append(claim)
-    user = [item for item in chosen if str(item["memory_kind"]) in {"profile", "relationship"}]
-    current = [item for item in chosen if str(item["memory_kind"]) in {"state", "goal", "event"}]
-    agent = [item for item in chosen if str(item["memory_kind"]) == "domain"]
-    hot_dir = root / "hot"
-    hot_dir.mkdir(parents=True, exist_ok=True)
-    rendered = {
-        "USER.md": _render("Core User Memory", user, int(get("hot_memory.user_max_chars"))),
-        "AGENT.md": _render("Agent Operating Principles", agent, int(get("hot_memory.agent_max_chars"))),
-        "CURRENT.md": _render("Current Priorities", current, int(get("hot_memory.current_max_chars"))),
-    }
-    hashes: dict[str, str] = {}
-    source_claims: dict[str, list[str]] = {}
-    changed = False
-    for filename, (content, ids) in rendered.items():
-        path = hot_dir / filename
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        hashes[filename] = digest
-        source_claims[filename] = ids
-        if force or not path.exists() or path.read_text(encoding="utf-8") != content:
-            path.write_text(content, encoding="utf-8", newline="\n")
-            changed = True
-    snapshot = {"schema_version": 1, "subject_id": subject_id, "profile_id": profile_id, "generated_at": utc_now(), "hashes": hashes, "source_claim_ids": source_claims, "budgets": {"USER.md": int(get("hot_memory.user_max_chars")), "AGENT.md": int(get("hot_memory.agent_max_chars")), "CURRENT.md": int(get("hot_memory.current_max_chars"))}}
-    snapshot_text = json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
-    snapshot_path = hot_dir / "snapshot.json"
-    if force or not snapshot_path.exists() or snapshot_path.read_text(encoding="utf-8") != snapshot_text:
-        snapshot_path.write_text(snapshot_text, encoding="utf-8", newline="\n")
-        changed = True
-    snapshot["changed"] = changed
-    return snapshot
+        if counts.get(kind,0) < quotas.get(kind,1): counts[kind] = counts.get(kind,0)+1; selected.append(claim)
+    user = [item for item in selected if item["memory_kind"] in {"profile","relationship"}]
+    current = [item for item in selected if item["memory_kind"] in {"state","goal","event"}]
+    agent = [item for item in selected if str(item.get("predicate") or "") in AGENT_PREDICATES]
+    rendered = {"USER.md": _render("Core User Memory", user, int(get("hot_memory.user_max_chars"))), "AGENT.md": _render("Agent Operating Principles", agent, int(get("hot_memory.agent_max_chars"))), "CURRENT.md": _render("Current Priorities", current, int(get("hot_memory.current_max_chars")))}
+    texts = {name: pair[0] for name, pair in rendered.items()}; ids = [claim_id for _, claim_ids in rendered.values() for claim_id in claim_ids]; digest = _content_hash(texts)
+    conn = open_db(root)
+    previous = conn.execute("SELECT snapshot_uid, content_hash FROM hot_snapshots WHERE workspace_id=? AND profile_id=? AND subject_id=? AND session_id='' ORDER BY created_at DESC LIMIT 1", (workspace_id, profile_id, subject_id)).fetchone()
+    if previous and str(previous[1]) == digest and not force:
+        conn.execute("UPDATE hot_snapshots SET last_checked_at=? WHERE snapshot_uid=?", (utc_now(), previous[0])); conn.commit(); conn.close()
+        return {"snapshot_uid": str(previous[0]), "content_hash": digest, "changed": False, "scope": str(hot_scope_dir(root, workspace_id=workspace_id, profile_id=profile_id, subject_id=subject_id)), "source_claim_ids": ids}
+    # The canonical snapshot is mutable and unique per scope. Frozen session
+    # snapshots are copied into their own rows, so this never changes a
+    # conversation that has already been prepared.
+    uid = str(previous[0]) if previous else str(uuid.uuid4())
+    if previous:
+        conn.execute("UPDATE hot_snapshots SET content_hash=?, user_text=?, agent_text=?, current_text=?, source_claim_ids=?, created_at=?, last_checked_at=? WHERE snapshot_uid=?", (digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False), utc_now(), utc_now(), uid))
+    else:
+        conn.execute("INSERT INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids) VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?)", (uid, workspace_id, profile_id, subject_id, digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False)))
+    conn.commit(); conn.close()
+    directory = hot_scope_dir(root, workspace_id=workspace_id, profile_id=profile_id, subject_id=subject_id)
+    for name, text in texts.items():
+        path = directory / name
+        if force or not path.exists() or path.read_text(encoding="utf-8") != text: _atomic_write(path, text)
+    snapshot = {"schema_version":2,"snapshot_uid":uid,"workspace_id":workspace_id,"profile_id":profile_id,"subject_id":subject_id,"content_hash":digest,"source_claim_ids":ids,"budgets":{"USER.md":int(get("hot_memory.user_max_chars")),"AGENT.md":int(get("hot_memory.agent_max_chars")),"CURRENT.md":int(get("hot_memory.current_max_chars"))}}
+    _atomic_write(directory / "snapshot.json", json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
+    return {**snapshot,"changed":True,"scope":str(directory)}
 
 
-def load_hot_memory(root: Path) -> tuple[str, str]:
-    hot_dir = root / "hot"
-    parts: list[str] = []
-    hashes: list[str] = []
-    for name in ("USER.md", "AGENT.md", "CURRENT.md"):
-        path = hot_dir / name
-        if path.exists():
-            content = path.read_text(encoding="utf-8")
-            parts.append(content.rstrip())
-            hashes.append(hashlib.sha256(content.encode("utf-8")).hexdigest())
-    return "\n\n".join(parts).strip() + ("\n" if parts else ""), hashlib.sha256("".join(hashes).encode("utf-8")).hexdigest()
+def freeze_hot_snapshot(root: Path, *, internal_session_id: str, subject_id: str, profile_id: str = "default", workspace_id: str = "default", policy: str = "frozen") -> dict[str, object]:
+    conn = open_db(root)
+    row = conn.execute("SELECT hot_snapshot_uid, hot_snapshot_hash FROM sessions WHERE session_id=? AND subject_id=? AND workspace_id=? AND profile_id=?", (internal_session_id, subject_id, workspace_id, profile_id)).fetchone()
+    if policy in {"frozen", "manual"} and row and row[0]:
+        uid = str(row[0]); conn.close(); return load_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, snapshot_uid=uid)
+    conn.close()
+    latest = build_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id)
+    uid = str(latest["snapshot_uid"])
+    conn = open_db(root)
+    source = conn.execute("SELECT user_text, agent_text, current_text, source_claim_ids FROM hot_snapshots WHERE snapshot_uid=?", (uid,)).fetchone()
+    session_uid = str(uuid.uuid4())
+    conn.execute("INSERT OR REPLACE INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (session_uid, workspace_id, profile_id, subject_id, internal_session_id, latest["content_hash"], *source))
+    conn.execute("UPDATE sessions SET hot_snapshot_uid=?, hot_snapshot_hash=?, hot_snapshot_created_at=? WHERE session_id=?", (session_uid, latest["content_hash"], utc_now(), internal_session_id)); conn.commit(); conn.close()
+    return load_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, snapshot_uid=session_uid)
+
+
+def load_hot_memory(root: Path, *, subject_id: str, profile_id: str, workspace_id: str, snapshot_uid: str = "") -> dict[str, object]:
+    conn = open_db(root)
+    if snapshot_uid: row = conn.execute("SELECT snapshot_uid, content_hash, user_text, agent_text, current_text, source_claim_ids FROM hot_snapshots WHERE snapshot_uid=? AND subject_id=? AND profile_id=? AND workspace_id=?", (snapshot_uid, subject_id, profile_id, workspace_id)).fetchone()
+    else: row = conn.execute("SELECT snapshot_uid, content_hash, user_text, agent_text, current_text, source_claim_ids FROM hot_snapshots WHERE subject_id=? AND profile_id=? AND workspace_id=? AND session_id='' ORDER BY created_at DESC LIMIT 1", (subject_id, profile_id, workspace_id)).fetchone()
+    conn.close()
+    if not row: return {"snapshot_uid":"","content_hash":"","content":"","source_claim_ids":[]}
+    content = "\n\n".join(part.rstrip() for part in row[2:5] if str(part).strip()).strip() + "\n"
+    return {"snapshot_uid":str(row[0]),"content_hash":str(row[1]),"content":content,"source_claim_ids":json.loads(str(row[5] or "[]"))}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compile bounded hot memory from active verified claims.")
-    parser.add_argument("--store", help=DEFAULT_STORE_HELP)
-    parser.add_argument("--subject-id", required=True)
-    parser.add_argument("--profile-id", default="default")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
-    emit(build_hot_memory(store_root(args.store), subject_id=args.subject_id, profile_id=args.profile_id, force=args.force))
+    parser = argparse.ArgumentParser(description="Compile scope-isolated hot memory from verified sourced claims.")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP); parser.add_argument("--subject-id", required=True); parser.add_argument("--profile-id", default="default"); parser.add_argument("--workspace-id", default="default"); parser.add_argument("--force", action="store_true")
+    args = parser.parse_args(); emit(build_hot_memory(store_root(args.store), subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, force=args.force))
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

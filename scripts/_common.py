@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -28,6 +29,9 @@ DEFAULT_DIRS = [
     "resources",
     "db",
 ]
+
+_MIGRATED_DBS: set[str] = set()
+_MIGRATION_LOCK = threading.Lock()
 
 REPORTABLE_LAYOUT = [
     "profile",
@@ -199,12 +203,24 @@ def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]
 
 def open_db(root: Path) -> sqlite3.Connection:
     ensure_default_dirs(root)
-    conn = sqlite3.connect(db_path(root))
+    path = db_path(root)
+    conn = sqlite3.connect(path, timeout=10)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     # Schema changes are deliberately centralized in versioned migrations.
     # Import lazily to keep every standalone script executable from this folder.
     from db_migrations import run_migrations
 
-    run_migrations(conn)
+    key = str(path.resolve())
+    if key not in _MIGRATED_DBS:
+        with _MIGRATION_LOCK:
+            if key not in _MIGRATED_DBS:
+                run_migrations(conn)
+                _MIGRATED_DBS.add(key)
     return conn
 
 

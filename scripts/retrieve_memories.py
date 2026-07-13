@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
+from config import get
 from llm_client import embed
 
 
@@ -84,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool", type=int, default=24, help="Maximum internally ranked candidates before final trimming")
     parser.add_argument("--expand-hops", type=int, default=1, help="Association expansion hops through related fields, 0-2")
     parser.add_argument("--session-id", default="", help="Optional session id recorded with retrieval telemetry")
+    parser.add_argument("--workspace-id", default="default", help="Entity/graph workspace scope")
     parser.add_argument("--valid-at", help="Retrieve facts valid at this ISO timestamp; defaults to now")
     parser.add_argument("--no-chunks", action="store_true", help="Disable chunk-level BM25 recall")
     parser.add_argument("--include-embeddings", action="store_true", help="Fuse optional external embedding results when available")
@@ -482,14 +484,25 @@ def expand_associations(items: list[dict[str, object]], expand_hops: int) -> Non
 
 
 def rrf_fuse(items: list[dict[str, object]], rrf_k: int) -> None:
-    signals = ["field_score", "fts_score", "chunk_score", "embedding_score", "entity_score", "graph_score", "association_score"]
+    signal_keys = {
+        "field_score": "retrieval.weights.field",
+        "fts_score": "retrieval.weights.document_bm25",
+        "chunk_score": "retrieval.weights.chunk_bm25",
+        "embedding_score": "retrieval.weights.embedding",
+        "entity_score": "retrieval.weights.entity",
+        "graph_score": "retrieval.weights.graph",
+        "association_score": "retrieval.weights.graph",
+    }
     for row in items:
         row["rrf_score"] = 0.0
-    for signal in signals:
+    for signal, config_key in signal_keys.items():
+        weight = float(get(config_key))
+        if weight <= 0:
+            continue
         ranked = [row for row in items if float(row.get(signal, 0.0) or 0.0) > 0.0]
         ranked.sort(key=lambda row: float(row.get(signal, 0.0) or 0.0), reverse=True)
         for rank, row in enumerate(ranked, start=1):
-            row["rrf_score"] = float(row["rrf_score"]) + 1.0 / (max(1, rrf_k) + rank)
+            row["rrf_score"] = float(row["rrf_score"]) + weight / (max(1, rrf_k) + rank)
     for row in items:
         row["rrf_score"] = round(float(row["rrf_score"] or 0.0), 6)
 
@@ -522,9 +535,8 @@ def record_retrieval(conn, selected: list[dict[str, object]], query: str, filter
     conn.commit()
 
 
-def main() -> None:
-    args = parse_args()
-    query = read_query(args)
+def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str, object]:
+    query = query if query is not None else read_query(args)
     root = store_root(args.store)
     conn = open_db(root)
     domains = [item.casefold() for item in args.domain]
@@ -675,7 +687,7 @@ def main() -> None:
         items.append(row)
 
     from entity_resolution import enrich_retrieval_scores
-    enrich_retrieval_scores(conn, items, terms)
+    enrich_retrieval_scores(conn, items, terms, workspace_id=args.workspace_id)
 
     expand_associations(items, args.expand_hops)
     rrf_fuse(items, args.rrf_k)
@@ -727,8 +739,7 @@ def main() -> None:
     )
     conn.close()
 
-    emit(
-        {
+    return {
             "status": "ok",
             "query": query,
             "terms": terms[:20],
@@ -757,8 +768,11 @@ def main() -> None:
                 }
                 for row in selected
             ],
-        }
-    )
+    }
+
+
+def main() -> None:
+    emit(retrieve(parse_args()))
 
 
 if __name__ == "__main__":

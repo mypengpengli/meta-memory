@@ -19,6 +19,8 @@ def main() -> None:
     cases = json.loads(Path(args.cases_file).read_text(encoding="utf-8-sig"))
     if not isinstance(cases, list):
         raise SystemExit("Cases file must be a JSON array")
+    if args.strict and not cases:
+        raise SystemExit("Strict evaluation requires at least one writeback case.")
     root = store_root(args.store)
     results: list[dict[str, object]] = []
     for case in cases:

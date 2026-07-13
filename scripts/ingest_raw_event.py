@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,6 +17,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     parser.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     parser.add_argument("--session-id", default="", help="Session id for grouping recent events")
+    parser.add_argument("--profile-id", default="default", help="Profile scope for the session projection")
+    parser.add_argument("--workspace-id", default="default", help="Workspace scope for the session projection")
     parser.add_argument("--source-type", default="conversation", help="Source type such as conversation, note, log")
     parser.add_argument("--source-ref", default="", help="Optional source reference or external id")
     parser.add_argument("--topic-hint", default="", help="Optional topic hint")
@@ -64,6 +69,8 @@ def insert_raw_event(
     event_time: str = "",
     content: str,
     allow_duplicate: bool = False,
+    profile_id: str = "default",
+    workspace_id: str = "default",
 ) -> dict[str, object]:
     conn = open_db(root)
     content_hash = sha256_text(content)
@@ -119,24 +126,9 @@ def insert_raw_event(
             event_time,
         ),
     )
-    conn.commit()
     event_id = int(cursor.lastrowid)
-    conn.close()
-
     try:
         from session_archive import record_session_message
-        record_session_message(root, subject_id=subject_id, session_id=session_id, source_type=source_type, content=content, raw_event_id=event_id, timestamp=event_time)
-    except Exception:
-        # The raw evidence write is authoritative. Archive/FTS failure is a
-        # recoverable projection failure and must never drop a user turn.
-        pass
-
-    # Raw evidence and the original dialogue archive deliberately coexist:
-    # provenance needs the former, while user-visible historical discovery
-    # needs the latter.  A failure to index FTS never loses the raw event.
-    try:
-        from session_archive import record_session_message
-
         record_session_message(
             root,
             subject_id=subject_id,
@@ -145,9 +137,16 @@ def insert_raw_event(
             content=content,
             raw_event_id=event_id,
             timestamp=event_time,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            conn=conn,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Raw evidence remains authoritative, but make projection failures
+        # observable instead of silently paying the same failure every turn.
+        LOGGER.warning("Session archive projection failed for raw_event=%s: %s", event_id, exc)
+    conn.commit()
+    conn.close()
 
     return {
         "status": "ok",
@@ -178,6 +177,8 @@ def main() -> None:
     domain_hint = str(arg_or_payload(args, payload, "domain_hint", ""))
     event_time = str(arg_or_payload(args, payload, "event_time", ""))
     allow_duplicate = bool(payload.get("allow_duplicate", False) or args.allow_duplicate)
+    profile_id = str(arg_or_payload(args, payload, "profile_id", "default"))
+    workspace_id = str(arg_or_payload(args, payload, "workspace_id", "default"))
 
     root = store_root(args.store)
     emit(
@@ -193,6 +194,8 @@ def main() -> None:
             event_time=event_time,
             content=content,
             allow_duplicate=allow_duplicate,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
         )
     )
 

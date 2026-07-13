@@ -17,6 +17,47 @@ from write_memory import write_payload
 from _common import DEFAULT_STORE_HELP, emit, ensure_store_ready, open_db, sha256_text, store_root
 
 
+def _retrieval_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Adapt the host runtime options to the shared retrieval service.
+
+    Keeping this as a direct Python call is important: a user turn must not
+    create subprocesses merely to read memory.
+    """
+    return argparse.Namespace(
+        store=str(store_root(args.store)), query=None, query_file=None,
+        top_k=args.top_k, candidate_pool=args.candidate_pool,
+        expand_hops=args.expand_hops, session_id=args.session_id,
+        workspace_id=args.workspace_id, valid_at=None, no_chunks=False,
+        include_embeddings=False, embedding_model="external", rrf_k=60,
+        subject_id=args.subject_id, subject_name=args.subject_name,
+        domain=[], memory_kind=[], include_candidates=args.include_candidates,
+        no_basics=args.no_basics,
+    )
+
+
+def _raw_search_args(args: argparse.Namespace) -> argparse.Namespace:
+    return argparse.Namespace(
+        store=str(store_root(args.store)), subject_id=args.subject_id,
+        session_id=args.session_id, query=None, query_file=None, topic=[],
+        domain=[], source_type=[], processed_state=["organized"], since=None,
+        until=None, limit=args.raw_limit, full_content=False,
+    )
+
+
+def _auxiliary_context(*, sessions: dict[str, object] | None, procedures: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    session_rows = list((sessions or {}).get("sessions", []))
+    if session_rows:
+        lines.extend(["## Relevant Past Sessions"])
+        for item in session_rows[:3]:
+            lines.append(f"- {item.get('title') or item.get('external_session_id') or 'session'}: {item.get('match_snippet', '')}")
+    if procedures:
+        lines.extend(["", "## Reusable Procedures"])
+        for item in procedures[:4]:
+            lines.append(f"- {item.get('task_class', 'procedure')}: {item.get('instruction_text', '')}")
+    return "\n".join(lines).strip()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Host-facing runtime bridge for recording events, preparing context, and explicit remember actions."
@@ -32,6 +73,9 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     prepare.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     prepare.add_argument("--session-id", default="", help="Session id")
+    prepare.add_argument("--profile-id", default="default")
+    prepare.add_argument("--workspace-id", default="default")
+    prepare.add_argument("--hot-snapshot-policy", choices=["frozen", "refresh", "manual"], default="frozen")
     prepare.add_argument("--query", help="Current user query")
     prepare.add_argument("--query-file", help="Read the current user query from a UTF-8 text file")
     prepare.add_argument("--topic-hint", default="", help="Optional topic hint for the raw event")
@@ -61,6 +105,8 @@ def parse_args() -> argparse.Namespace:
     finalize.add_argument("--subject-id", default="person-unknown", help="Primary subject id")
     finalize.add_argument("--subject-name", default="Unknown", help="Primary subject display name")
     finalize.add_argument("--session-id", default="", help="Session id")
+    finalize.add_argument("--profile-id", default="default")
+    finalize.add_argument("--workspace-id", default="default")
     finalize.add_argument("--reply", help="Assistant reply text")
     finalize.add_argument("--reply-file", help="Read the assistant reply from a UTF-8 text file")
     finalize.add_argument("--topic-hint", default="", help="Optional topic hint")
@@ -139,9 +185,9 @@ def parse_args() -> argparse.Namespace:
     session_flush = subparsers.add_parser("session-flush", help="Build a session card and queue restricted review")
     session_flush.add_argument("--store", help=DEFAULT_STORE_HELP); session_flush.add_argument("--subject-id", required=True); session_flush.add_argument("--session-id", default="")
     session_search = subparsers.add_parser("session-search", help="Discover original archived sessions")
-    session_search.add_argument("--store", help=DEFAULT_STORE_HELP); session_search.add_argument("--subject-id", required=True); session_search.add_argument("--query", required=True)
+    session_search.add_argument("--store", help=DEFAULT_STORE_HELP); session_search.add_argument("--subject-id", required=True); session_search.add_argument("--profile-id", default="default"); session_search.add_argument("--workspace-id", default="default"); session_search.add_argument("--query", required=True)
     session_scroll = subparsers.add_parser("session-scroll", help="Scroll original messages around an anchor")
-    session_scroll.add_argument("--store", help=DEFAULT_STORE_HELP); session_scroll.add_argument("--session-id", required=True); session_scroll.add_argument("--around-message-id", type=int, required=True); session_scroll.add_argument("--window", type=int, default=6)
+    session_scroll.add_argument("--store", help=DEFAULT_STORE_HELP); session_scroll.add_argument("--session-id", required=True); session_scroll.add_argument("--subject-id", required=True); session_scroll.add_argument("--profile-id", default="default"); session_scroll.add_argument("--workspace-id", default="default"); session_scroll.add_argument("--around-message-id", type=int, required=True); session_scroll.add_argument("--window", type=int, default=6)
     extract = subparsers.add_parser("extract-units", help="Extract atomic units from session cards")
     extract.add_argument("--store", help=DEFAULT_STORE_HELP); extract.add_argument("--subject-id"); extract.add_argument("--limit", type=int, default=20)
     dream = subparsers.add_parser("dream", help="Run deferred extraction and semantic consolidation")
@@ -165,7 +211,7 @@ def parse_args() -> argparse.Namespace:
         marker = subparsers.add_parser(command, help=f"Record {feedback} memory feedback")
         marker.add_argument("--store", help=DEFAULT_STORE_HELP); marker.add_argument("--claim-id", required=True); marker.add_argument("--note", default="")
     for command, help_text in [("hot-memory-build", "Compile bounded hot-memory files"), ("hot-memory-show", "Show the frozen hot-memory projection"), ("hot-memory-status", "Show hot-memory snapshot metadata")]:
-        hot = subparsers.add_parser(command, help=help_text); hot.add_argument("--store", help=DEFAULT_STORE_HELP); hot.add_argument("--subject-id", required=True)
+        hot = subparsers.add_parser(command, help=help_text); hot.add_argument("--store", help=DEFAULT_STORE_HELP); hot.add_argument("--subject-id", required=True); hot.add_argument("--profile-id", default="default"); hot.add_argument("--workspace-id", default="default")
     skills_pending = subparsers.add_parser("skills-pending", help="List skill changes awaiting approval")
     skills_pending.add_argument("--store", help=DEFAULT_STORE_HELP)
     skill_diff = subparsers.add_parser("skill-diff", help="Show a staged skill diff")
@@ -343,66 +389,28 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     if not query:
         raise SystemExit("Query is required via --query or --query-file.")
 
-    from build_hot_memory import build_hot_memory, load_hot_memory
+    from build_hot_memory import freeze_hot_snapshot
     from query_router import route_query
+    from session_archive import ensure_session
+    from retrieve_memories import retrieve
+    from search_raw_events import search_events
+    from session_search import discovery
+    from procedural_learning import retrieve_procedures
     route = route_query(query)
-    build_hot_memory(root, subject_id=args.subject_id)
-    hot_context, hot_snapshot_hash = load_hot_memory(root)
-    heartbeat = None
-    if not args.skip_heartbeat:
-        heartbeat_args = [
-            "--store",
-            str(root),
-            "--subject-id",
-            args.subject_id,
-            "--policy",
-            args.heartbeat_policy,
-            "--interval-minutes",
-            str(args.heartbeat_interval_minutes),
-            "--min-pending",
-            str(args.heartbeat_min_pending),
-            "--max-events",
-            str(args.heartbeat_max_events),
-        ]
-        heartbeat = run_json_script("run_heartbeat.py", *heartbeat_args)
-
-    retrieve_args = [
-        "--store",
-        str(root),
-        "--subject-id",
-        args.subject_id,
-        "--query",
-        query,
-        "--top-k",
-        str(args.top_k),
-        "--candidate-pool",
-        str(args.candidate_pool),
-        "--expand-hops",
-        str(args.expand_hops),
-        "--session-id",
-        args.session_id,
-    ]
-    if args.include_candidates:
-        retrieve_args.append("--include-candidates")
-    if args.no_basics:
-        retrieve_args.append("--no-basics")
-    retrieved = run_json_script("retrieve_memories.py", *retrieve_args)
+    internal_session_id = ensure_session(root, subject_id=args.subject_id, session_id=args.session_id, profile_id=args.profile_id, workspace_id=args.workspace_id)
+    hot_snapshot = freeze_hot_snapshot(root, internal_session_id=internal_session_id, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, policy=args.hot_snapshot_policy)
+    hot_context, hot_snapshot_hash = str(hot_snapshot["content"]), str(hot_snapshot["content_hash"])
+    retrieved = retrieve(_retrieval_args(args), query=query) if bool(route.get("needs_deep_memory", True)) else {"status": "ok", "selected": [], "query": query}
 
     raw_evidence = None
     if not args.skip_raw_evidence and args.raw_limit > 0:
-        raw_args = [
-            "--store",
-            str(root),
-            "--subject-id",
-            args.subject_id,
-            "--query",
-            query,
-            "--processed-state",
-            "organized",
-            "--limit",
-            str(args.raw_limit),
-        ]
-        raw_evidence = run_json_script("search_raw_events.py", *raw_args)
+        raw_evidence = search_events(_raw_search_args(args), query=query)
+
+    session_evidence = discovery(
+        root, subject_id=args.subject_id, query=query, limit=3,
+        workspace_id=args.workspace_id, profile_id=args.profile_id,
+    ) if route.get("needs_session_search") else None
+    procedures = retrieve_procedures(root, subject_id=args.subject_id, query=query) if route.get("needs_procedure") else []
 
     recorded = None
     if not args.skip_record_query:
@@ -418,9 +426,14 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
             event_time=args.event_time,
             content=query,
             allow_duplicate=args.allow_duplicate,
+            profile_id=args.profile_id,
+            workspace_id=args.workspace_id,
         )
 
     context = assemble_context(retrieved, raw_evidence, token_budget=args.context_token_budget)
+    auxiliary = _auxiliary_context(sessions=session_evidence, procedures=procedures)
+    if auxiliary:
+        context = context.rstrip() + "\n\n" + auxiliary + "\n"
     if args.context_out_file:
         Path(args.context_out_file).write_text(context, encoding="utf-8")
 
@@ -431,11 +444,15 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         "query": query,
         "query_route": route,
         "hot_memory_snapshot_hash": hot_snapshot_hash,
+        "hot_memory_snapshot_uid": hot_snapshot["snapshot_uid"],
+        "internal_session_id": internal_session_id,
         "static_hot_context": hot_context,
         "recorded_raw_event": recorded,
-        "heartbeat": heartbeat,
+        "heartbeat": {"status": "deferred", "reason": "review is scheduled after the assistant reply"},
         "retrieved": retrieved,
         "raw_evidence": raw_evidence,
+        "session_evidence": session_evidence,
+        "procedures": procedures,
         "context_markdown": context,
     }
     write_json_file(args.out_file, result)
@@ -656,27 +673,29 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
             event_time=args.event_time,
             content=reply,
             allow_duplicate=args.allow_duplicate,
+            profile_id=args.profile_id,
+            workspace_id=args.workspace_id,
         )
 
     artifact = capture_reply_artifact(root, args, reply, recorded)
 
     heartbeat = None
     if not args.skip_heartbeat:
-        heartbeat_args = [
-            "--store",
-            str(root),
-            "--subject-id",
-            args.subject_id,
-            "--policy",
-            args.heartbeat_policy,
-            "--interval-minutes",
-            str(args.heartbeat_interval_minutes),
-            "--min-pending",
-            str(args.heartbeat_min_pending),
-            "--max-events",
-            str(args.heartbeat_max_events),
-        ]
-        heartbeat = run_json_script("run_heartbeat.py", *heartbeat_args)
+        from background_review import enqueue_review
+        conn = open_db(root)
+        bounds = conn.execute(
+            "SELECT MIN(id), MAX(id) FROM raw_events WHERE subject_id=? AND COALESCE(session_id, '')=? AND processed_state IN ('pending', 'sessionized')",
+            (args.subject_id, args.session_id),
+        ).fetchone()
+        conn.close()
+        if bounds and bounds[0] is not None:
+            heartbeat = enqueue_review(
+                root, subject_id=args.subject_id, session_id=args.session_id,
+                event_start_id=int(bounds[0]), event_end_id=int(bounds[1]),
+                trigger_type="turn_end", workspace_id=args.workspace_id,
+            )
+        else:
+            heartbeat = {"status": "not_scheduled", "reason": "no pending session events"}
 
     result = {
         "status": "ok",
@@ -714,10 +733,10 @@ def main() -> None:
         return
     if args.command == "session-search":
         from session_search import discovery
-        emit(discovery(root, subject_id=args.subject_id, query=args.query)); return
+        emit(discovery(root, subject_id=args.subject_id, query=args.query, profile_id=args.profile_id, workspace_id=args.workspace_id)); return
     if args.command == "session-scroll":
         from session_search import scroll
-        emit(scroll(root, session_id=args.session_id, around_message_id=args.around_message_id, window=args.window)); return
+        emit(scroll(root, session_id=args.session_id, around_message_id=args.around_message_id, window=args.window, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id)); return
     if args.command == "extract-units":
         from extract_memory_units import extract_units
         emit(extract_units(root, subject_id=args.subject_id, limit=args.limit)); return
@@ -735,7 +754,7 @@ def main() -> None:
         conn = open_db(root); rows = conn.execute("SELECT job_uid, subject_id, session_id, trigger_type, status, attempt_count, last_error, created_at FROM review_jobs ORDER BY created_at DESC").fetchall(); conn.close()
         emit({"status": "ok", "jobs": [{"id": row[0], "subject_id": row[1], "session_id": row[2], "trigger": row[3], "status": row[4], "attempts": row[5], "error": row[6], "created_at": row[7]} for row in rows]}); return
     if args.command.startswith("proposal-") or args.command == "proposals-list":
-        from proposal_manager import get_proposal, list_proposals, reject_proposal
+        from proposal_manager import approve_memory_proposal, get_proposal, list_proposals, reject_proposal
         if args.command == "proposals-list": emit({"status": "ok", "proposals": list_proposals(root)}); return
         if args.command in {"proposal-show", "proposal-diff"}:
             proposal = get_proposal(root, args.id)
@@ -743,22 +762,17 @@ def main() -> None:
         if args.command == "proposal-reject": emit({"status": "ok", "rejected": reject_proposal(root, args.id, note=args.note)}); return
         if args.command == "proposal-approve":
             proposals = [get_proposal(root, args.id)] if args.id else [get_proposal(root, item["id"]) for item in list_proposals(root)]
-            results = []
-            for proposal in proposals:
-                if not proposal or (args.all_low_risk and str(proposal["action"]) in {"CORRECT", "SUPERSEDE"}): continue
-                from apply_memory_plan import apply_plan
-                result = apply_plan(root, {"schema_version": 3, "subject_id": proposal["subject_id"], "policy": "balanced", "actions": [proposal["plan"]]}, review_approved=True)
-                conn = open_db(root); conn.execute("UPDATE write_proposals SET status='approved', reviewed_at=CURRENT_TIMESTAMP WHERE proposal_uid=? AND status='pending'", (proposal["id"],)); conn.commit(); conn.close(); results.append(result)
+            results = [approve_memory_proposal(root, proposal["id"]) for proposal in proposals if proposal and not (args.all_low_risk and str(proposal["action"]) in {"CORRECT", "SUPERSEDE"})]
             emit({"status": "ok", "results": results}); return
     if args.command.startswith("mark-"):
         from feedback_memory import record_feedback
         emit(record_feedback(root, claim_id=args.claim_id, feedback_type=args.command.removeprefix("mark-").replace("helpful", "helpful"), note=args.note)); return
     if args.command.startswith("hot-memory-"):
         from build_hot_memory import build_hot_memory, load_hot_memory
-        if args.command == "hot-memory-build": emit(build_hot_memory(root, subject_id=args.subject_id, force=True)); return
+        if args.command == "hot-memory-build": emit(build_hot_memory(root, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, force=True)); return
         if args.command == "hot-memory-show":
-            build_hot_memory(root, subject_id=args.subject_id); text, digest = load_hot_memory(root); emit({"status": "ok", "snapshot_hash": digest, "content": text}); return
-        snapshot = root / "hot" / "snapshot.json"; emit({"status": "ok", "snapshot": json.loads(snapshot.read_text(encoding="utf-8")) if snapshot.exists() else {}}); return
+            build_hot_memory(root, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id); snapshot = load_hot_memory(root, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id); emit({"status": "ok", **snapshot}); return
+        snapshot = load_hot_memory(root, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id); emit({"status": "ok", "snapshot": snapshot}); return
     if args.command.startswith("skill") or args.command == "skills-pending":
         from procedural_learning import approve_skill, skill_diff
         from proposal_manager import list_proposals, reject_proposal
