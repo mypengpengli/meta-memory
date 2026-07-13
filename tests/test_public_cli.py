@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from meta_memory.backup import backup_store, restore_store
 from meta_memory.config import AppConfig, load_config, save_config
@@ -10,6 +11,10 @@ from meta_memory.dream import run_dream
 from meta_memory.maintenance import maintain
 from meta_memory.project_detection import bind_project, resolve_project
 from meta_memory.runtime import after, before, search
+from meta_memory.legacy import bootstrap
+
+bootstrap()
+from _common import emit
 
 
 class PublicCliRuntimeTests(unittest.TestCase):
@@ -52,6 +57,12 @@ class PublicCliRuntimeTests(unittest.TestCase):
         result = restore_store(archive, restored)
         self.assertEqual(result["status"], "ok")
         self.assertTrue((restored / "db" / "memory_index.sqlite").is_file())
+
+    def test_json_emit_falls_back_to_ascii_for_legacy_windows_console(self) -> None:
+        encoding_error = UnicodeEncodeError("cp1252", "→", 0, 1, "undefined")
+        with patch("builtins.print", side_effect=[encoding_error, None]) as printed:
+            emit({"relation": "→"})
+        self.assertIn("\\u2192", printed.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":

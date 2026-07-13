@@ -399,4 +399,11 @@ def sha256_text(text: str) -> str:
 
 
 def emit(payload: dict[str, object]) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Windows CI may inherit a CP1252 console.  Preserve valid JSON rather
+        # than failing a successful memory operation because a recalled title
+        # or Markdown field contains Chinese or a Unicode relation symbol.
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
