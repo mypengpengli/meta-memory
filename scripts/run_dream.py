@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run the deferred session-card -> unit -> consolidation pipeline.
+"""Legacy/internal deferred consolidation pipeline.
+
+Use ``meta-memory dream`` for the safe public nightly synthesis.  This module
+remains available only for development compatibility.
 
 The default is shadow mode: it reports validated actions without changing durable
 claims.  `--apply` is intentionally explicit.

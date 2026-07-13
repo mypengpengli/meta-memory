@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Small local HTTP boundary for a centrally hosted Meta Memory store.
+"""Advanced / optional HTTP boundary for a centrally hosted Meta Memory store.
 
 Clients authenticate with a bearer token defined outside the repository.  A
 token binds profile, agent and allowed workspaces, so request JSON cannot
-impersonate another agent by changing identity fields.
+impersonate another agent by changing identity fields.  It is intentionally not
+part of the default local CLI workflow; see ``docs/advanced-http.md``.
 """
 from __future__ import annotations
 

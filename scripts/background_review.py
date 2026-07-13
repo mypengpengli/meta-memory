@@ -82,7 +82,14 @@ def run_pending(root, *, max_jobs: int=10, policy: str="conservative", apply_low
             renew_lease(root,str(uid),worker_id)
             unit_ids=[int(item["unit_id"]) for item in units["created"] if item.get("unit_id")]
             plan=build_plan(root,str(subject_id),policy=policy,unit_ids=unit_ids,limit=max(1,len(unit_ids) or 1),profile_id=str(profile_id),workspace_id=str(workspace_id),origin_agent_id=str(origin_agent_id))
-            for action in plan["actions"]: action.update({"origin":"background_review","session_id":str(session_id),"profile_id":str(profile_id),"workspace_id":str(workspace_id),"origin_agent_id":str(origin_agent_id)})
+            for action in plan["actions"]:
+                action.update({"origin":"background_review","session_id":str(session_id),"profile_id":str(profile_id),"workspace_id":str(workspace_id),"origin_agent_id":str(origin_agent_id)})
+                # Automatic memory is deliberately narrow: only a verified,
+                # normal-sensitivity CREATE without a conflict can bypass the
+                # review queue. Source events are user-only because the
+                # extractor excludes assistant content by default.
+                if apply_low_risk and str(action.get("action")) == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("sensitivity")) == "normal" and not bool(action.get("requires_review")):
+                    action["auto_promote"] = True
             outcome=apply_plan(root,plan,skip_index=True) if apply_low_risk and plan["actions"] else {"status":"shadow","actions":plan["actions"]}
             status="applied" if apply_low_risk and outcome.get("status")=="ok" else "staged" if plan["actions"] else "planned"; _finish(root,str(uid),status=status,plan=plan);results.append({"job_id":uid,"status":status,"card_ids":card_ids,"unit_ids":unit_ids,"outcome":outcome})
         except Exception as exc:

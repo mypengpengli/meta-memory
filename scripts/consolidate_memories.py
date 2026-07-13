@@ -113,7 +113,7 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
     visibility, owner = str(unit.get("visibility_scope") or "global"), str(unit.get("owner_agent_id") or "")
     exact_scope = "profile_id=? AND workspace_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=?"
     exact = conn.execute(f"SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected') AND {exact_scope}", (unit["subject_id"], unit["content_hash"], profile, workspace, visibility, owner)).fetchone()
-    base = {"plan_id": str(uuid.uuid4()), "subject_id": unit["subject_id"], "unit_id": unit["id"], "source_event_ids": list(unit["source_event_ids"]), "topic": unit["topic"], "domain": unit["domain"], "confidence": round(float(unit["confidence"]), 3), "uncertainty": round(float(unit["uncertainty"]), 3), "importance": round(float(unit["importance"]), 3), "durability": round(float(unit["durability"]), 3), "sensitivity": unit["sensitivity"], "predicate": unit["predicate"], "subject_text": unit["subject_text"], "object_text": unit["object_text"], "qualifiers": unit["qualifiers"], "valid_from": unit["valid_from"], "valid_to": unit["valid_to"], "observed_at": unit["observed_at"], "entities": unit["entities"], "profile_id": profile, "workspace_id": workspace, "visibility_scope": visibility, "owner_agent_id": owner, "origin_agent_id": str(unit.get("origin_agent_id") or "")}
+    base = {"plan_id": str(uuid.uuid4()), "subject_id": unit["subject_id"], "subject_name": str(unit.get("subject_name") or "Unknown"), "unit_id": unit["id"], "source_event_ids": list(unit["source_event_ids"]), "topic": unit["topic"], "domain": unit["domain"], "confidence": round(float(unit["confidence"]), 3), "uncertainty": round(float(unit["uncertainty"]), 3), "importance": round(float(unit["importance"]), 3), "durability": round(float(unit["durability"]), 3), "sensitivity": unit["sensitivity"], "predicate": unit["predicate"], "subject_text": unit["subject_text"], "object_text": unit["object_text"], "qualifiers": unit["qualifiers"], "valid_from": unit["valid_from"], "valid_to": unit["valid_to"], "observed_at": unit["observed_at"], "entities": unit["entities"], "profile_id": profile, "workspace_id": workspace, "visibility_scope": visibility, "owner_agent_id": owner, "origin_agent_id": str(unit.get("origin_agent_id") or "")}
     if exact:
         conn.close()
         return {**base, "action": "CORROBORATE", "relation": "EXACT_SAME", "target_claim_id": str(exact[0]), "memory_kind": str(exact[2]), "title": str(exact[1]), "content": ""}
@@ -167,14 +167,14 @@ def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", lim
     if workspace_id is not None:
         scope += " AND workspace_id=?"; scope_params.append(workspace_id)
     rows = conn.execute(
-        """SELECT id, unit_kind, domain, topic, content, content_hash, confidence, uncertainty, importance, durability,
+        """SELECT id, subject_name, unit_kind, domain, topic, content, content_hash, confidence, uncertainty, importance, durability,
                   sensitivity, source_event_ids, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json,
                   profile_id, workspace_id, visibility_scope, origin_agent_id, owner_agent_id
            FROM memory_units WHERE subject_id=? AND status='pending' AND security_state!='blocked'""" + scope + " ORDER BY id LIMIT ?",
         (subject_id, *scope_params, max(1, limit)),
     ).fetchall()
     conn.close()
-    keys = ["id", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json", "profile_id", "workspace_id", "visibility_scope", "origin_agent_id", "owner_agent_id"]
+    keys = ["id", "subject_name", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json", "profile_id", "workspace_id", "visibility_scope", "origin_agent_id", "owner_agent_id"]
     actions: list[dict[str, object]] = []
     for row in rows:
         unit = dict(zip(keys, row))

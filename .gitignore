@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 memory-data/
+build/
+dist/
+*.egg-info/

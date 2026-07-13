@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recovery and health maintenance; consolidation belongs to the review worker."""
+"""Legacy/internal maintenance entry point; use ``meta-memory maintain`` instead."""
 from __future__ import annotations
 
 import argparse
@@ -24,7 +24,7 @@ def run_script(script: Path, root: Path) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Recover leases, backfill scopes, compact projections, and report health. It never consolidates evidence directly.")
-    parser.add_argument("--store", help=DEFAULT_STORE_HELP); parser.add_argument("--max-projection-jobs", type=int, default=500); parser.add_argument("--skip-projections", action="store_true")
+    parser.add_argument("--store", help=DEFAULT_STORE_HELP); parser.add_argument("--max-projection-jobs", type=int, default=500); parser.add_argument("--skip-projections", action="store_true"); parser.add_argument("--shadow-high-risk", action="store_true", help="Legacy no-op retained for CI compatibility")
     args = parser.parse_args(); root = store_root(args.store); steps: list[dict[str, object]] = []
     conn = open_db(root); migrations = [str(row[0]) for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]; conn.close(); steps.append({"step": "run_migrations", "versions": migrations})
     steps.append({"step": "backfill_session_scopes", "result": backfill(root)})

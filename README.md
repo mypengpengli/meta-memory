@@ -1,517 +1,1380 @@
 # Meta Memory
 
-一句话：**Meta Memory 是一套给 Codex / AI 智能体用的本地记忆工具。**
+**A shared long-term memory Skill for Claude Code, Codex, OpenClaw and custom AI agents.**
 
-它要解决的问题很简单：你希望智能体真的“记得你”，但又不想每次把所有聊天记录、项目资料、旧文件全部塞进上下文。
+**一个让 Claude Code、Codex、OpenClaw 和自定义智能体共享长期记忆的本地 SKILL。**
 
-它主要做两件事：
+> 默认入口是 `meta-memory` CLI。`scripts/` 中的旧入口仅用于开发、兼容和高级排障。
 
-1. **回答前找出来**：你提问时，它只取出和当前问题有关的少量记忆，让智能体参考，不读取全部历史。
-2. **回答后记下来**：把这轮对话事件保存下来；如果你明确说“记住”，再把稳定、有用的信息写成长期记忆。
+---
 
-普通说法就是：**该记的记住，该查的查出来，不该读的别塞进上下文。**
+# 中文
 
-它适合你在这些情况下使用：
+## Meta Memory 是什么？
 
-- 你长期让 Codex 帮你做同一个项目，不想每次重新解释项目背景。
-- 你希望它记住你的偏好、写作风格、工作习惯、常用约束。
-- 你希望它记住一个客户、一个人、一个产品、一个家庭事务或一段长期学习计划。
-- 你希望它回答前能想起相关背景，但不要把所有旧内容都读进来。
-- 你希望记忆存在本地 Markdown 和 SQLite 里，能看、能改、能追溯来源。
-- 你不想只依赖 embedding，因为你需要更稳定、更可解释的召回。
+Meta Memory 是一套安装在你自己电脑、Mac mini 或云服务器上的长期记忆系统。
 
-英文版在后面。前半部分先用中文把它讲清楚。
-
-## Meta Memory 2.2：共享智能体安全
-
-共享部署必须显式传入 `--profile-id`、`--workspace-id`、`--agent-id` 和由宿主生成的稳定 `--session-id`；启用 `--shared-mode` 后不允许空会话 ID。可见性只有三种：`global`、`workspace`、`agent`。
-
-- Raw event、card、unit、claim、document、chunk、review job、proposal、procedure、Hot Snapshot 与检索都携带并校验作用域。
-- agent 私有信息只会进入 owner 的检索结果和专属 Hot Snapshot；workspace 信息不会跨项目泄漏。
-- `remember` 成功返回前会处理其派生投影，保证写后立即可读；assistant artifact 只会以不可注入上下文的 candidate 保存。
-- 每个 store 只运行一个 `background_review.py --loop --apply-low-risk` 和一个 `projection_outbox.py --loop`。两个队列均有 lease、续租、批处理和指数退避。
-
-```bash
-python scripts/memory_runtime.py prepare-context \
-  --profile-id li-peng --workspace-id project-meta-memory \
-  --agent-id codex --session-id codex:<uuid> --shared-mode \
-  --subject-id project:meta-memory --query-file query.txt
-```
-
-For a central host, copy `config/agents.example.json` to a private file,
-provide the listed token environment variables, then bind the API to localhost
-or a private overlay network:
-
-```bash
-python scripts/memory_api.py --store /srv/meta-memory \
-  --agents-file /srv/meta-memory/config/agents.json
-```
-
-## Meta Memory 2.1：现在多了什么
-
-2.1 将按需检索的长期记忆与每轮固定注入的核心记忆分开，并补齐了长运行 Agent 的运行时能力：
-
-- `hot/USER.md`、`AGENT.md`、`CURRENT.md` 只从有来源、已验证、仍有效的 claim 编译；带严格预算和冻结快照哈希。
-- `sessions` / `session_messages` 保存原始对话，支持 discovery、scroll、browse 三种无需 LLM 的历史查询。
-- 原子 unit 含 `subject/predicate/object`、实体、限定词和时间字段；整合器支持语义佐证、细化、纠正、替代与冲突暂存。
-- `claims` 是事实源；Markdown、documents、chunks 都是投影。替代或纠正会同步写回旧 Markdown。
-- 高风险写入、冲突、负反馈和所有 skill 修改都会成为可审计 proposal，批准后才生效。
-- Provider 生命周期、持久化 review job、单主体顺序 worker、压缩前 flush、实体/边/反馈、查询路由和安全扫描均已实现。
-
-常用的 2.1 运维命令：
-
-```bash
-python scripts/memory_runtime.py hot-memory-build --subject-id person:me
-python scripts/memory_runtime.py session-search --subject-id person:me --query "上次 Docker UFW 如何解决"
-python scripts/memory_runtime.py proposals-list
-python scripts/memory_runtime.py maintenance --shadow-high-risk
-python scripts/memory_runtime.py doctor
-```
-
-## 先说清楚：这是什么
-
-Meta Memory 不是一个聊天记录备份器。
-
-它也不是“把所有历史资料丢给 AI，然后让 AI 自己找”。
-
-它是一套**本地脚本 + Markdown 记忆文件 + SQLite 检索索引**：
-
-- 脚本负责读写记忆。
-- Markdown 文件保存人能看懂、能修改的长期记忆。
-- SQLite 索引负责快速查找，不用每次扫完整个目录。
-
-每轮对话前后，智能体可以调用这些脚本，完成两件事：回答前读取相关记忆，回答后记录新事件。
-
-最小工作方式是这样：
-
-1. 你问问题。
-2. 智能体先调用 `prepare-context`。
-3. Meta Memory 根据你的问题，从本地记忆里找出相关内容。
-4. 智能体只读取返回结果里的 `context_markdown`。
-5. 智能体回答你。
-6. 回答后调用 `finalize-turn`，保存这轮发生了什么。
-7. 如果你明确说“记住这件事”，再调用 `remember` 写入长期记忆。
-
-这就是它的核心：**不是让模型凭印象记，也不是把历史全塞给模型，而是让模型先从本地文件和索引里查到该看的那一小部分。**
-
-需要说明清楚：Meta Memory 本身不是魔法开关，不会让所有 AI 自动拥有长期记忆。它提供的是一套本地记忆工具和 Codex skill 说明。智能体要按 `SKILL.md` 调用这些脚本；如果你手动使用，也可以直接运行下面的命令。
-
-## 它到底能做什么
-
-### 1. 让智能体下次不用从零开始
-
-比如你告诉智能体：
-
-> 我这个项目叫 meta-memory，目标是做一个 Codex 用的长期记忆 skill，不想依赖 embedding 作为默认召回。
-
-以后你再说：
-
-> 继续优化这个记忆项目的 README。
-
-它应该能先找出和 `meta-memory`、`README`、`memory skill`、`embedding` 有关的记忆，再把这些摘要交给智能体，而不是让你重新解释一遍。
-
-### 2. 把“原始记录”和“长期记忆”分开
-
-这点很重要。
-
-一次对话里可能有很多内容：问题、尝试、猜测、临时想法、错误判断、最终决定。它们不应该全部变成长期记忆。
-
-Meta Memory 会先保存原始事件。真正稳定、重要、以后还会用到的信息，才适合写进长期记忆。
-
-这样做的好处是：
-
-- 原始记录还在，需要追溯时能查。
-- 长期记忆保持干净，不会被普通闲聊污染。
-- 以后发现旧记忆错了，可以替换、废弃、标记来源。
-
-### 3. 回答前只读取相关记忆
-
-它不会默认把 `memory-data/` 整个目录塞给智能体。
-
-它会先按 `subject-id` 限定范围。比如：
-
-- `person:me`: 你的个人记忆
-- `project:meta-memory`: 这个项目的记忆
-- `client:acme`: 某个客户的记忆
-
-然后再查标题、主题、标签、摘要、正文、相关人物、相关事件、相关来源。
-
-如果找到一条相关记忆，它还可以顺着显式关联继续找一两步。比如：
-
-- 这个项目关联到 `README`
-- `README` 关联到 `Codex skill`
-- `Codex skill` 关联到 `trigger rules`
-
-这样就能做到比较接近“顺着主题想起来”，但又不是把所有东西都读出来。
-
-### 4. 不把 embedding 当成默认答案
-
-embedding 可以有用，但它不是这个项目的默认主路径。
-
-原因很实际：很多时候你要找的是一条具体记忆，不是“语义上差不多”的一堆内容。只靠 embedding，可能会漏掉关键词明确但语义分数不高的内容，也可能召回看起来相关但实际没用的内容。
-
-所以 Meta Memory 默认先用更可解释的方法：
-
-- 字段匹配：标题、标签、主题、人物、事件、来源
-- 全文检索：SQLite FTS/BM25
-- 显式关联：`related_topics`、`related_people`、`related_events`、`related_sources`
-- 重要性排序：重要记忆优先
-- 生命周期：过期、替换、废弃的记忆降权或不返回
-
-## 记忆怎么分层
-
-长期记忆不是一个大杂烩。默认按用途分层：
-
-- `profile`: 稳定身份、长期偏好、固定风格
-- `states`: 当前状态、近期阶段变化
-- `events`: 关键事件、时间线、转折点
-- `relationships`: 重要人物、关系模式、沟通边界
-- `goals`: 长期目标、项目、约束
-- `domains`: 工作、学习、健康、财务、日常等领域经验
-- `sessions`: 当前会话和短期任务状态
-- `candidates`: 未验证、待观察、可能冲突的信息
-- `archive`: 原始来源和导入材料
-
-这套分层的目的不是复杂，而是避免所有记忆混在一起。稳定身份和临时任务不应该放在同一个地方；已验证事实和待确认猜测也不应该放在同一个地方。
-
-## 快速开始
-
-第一次运行会自动创建：
-
-- `memory-data/`: 默认本地记忆目录
-- `memory-data/db/memory_index.sqlite`: 检索、来源、状态索引
-
-最常用的流程只有三步：回答前读取、回答后记录、明确要求时写入长期记忆。
-
-第一步，回答前读取相关记忆：
-
-```bash
-python scripts/memory_runtime.py prepare-context \
-  --subject-id person:me \
-  --subject-name 我 \
-  --session-id session-20260424 \
-  --query-file query.txt
-```
-
-只使用返回 JSON 里的 `context_markdown`。不要把完整 JSON、`memory-data/`、`references/` 或单个记忆文件全量塞进模型上下文。
-
-第二步，回答后记录这轮回复：
-
-```bash
-python scripts/memory_runtime.py finalize-turn \
-  --subject-id person:me \
-  --subject-name 我 \
-  --session-id session-20260424 \
-  --reply-file reply.txt
-```
-
-第三步，用户明确要求“记住”时，再写入长期记忆：
-
-```bash
-python scripts/memory_runtime.py remember \
-  --subject-id person:me \
-  --subject-name 我 \
-  --title-file title.txt \
-  --content-file memory.txt \
-  --related-topic answer-style \
-  --importance 0.9 \
-  --use-underlying-kind
-```
-
-中文、多行文本、引号较多的内容，优先使用 `--query-file`、`--reply-file`、`--title-file`、`--content-file` 或 `--payload-file`，避免 shell 编码和转义问题。
-
-## Recall Model
-
-Meta Memory currently uses an explainable, non-embedding default recall path:
-
-1. **Scope filter**: `--subject-id` isolates memory by person, project, client, or other container.
-2. **Direct field match**: title, topic, tags, summary, people, events, topics, sources.
-3. **Full-text recall**: SQLite FTS/BM25 indexes title, summary, body text, and relation fields.
-4. **Associative expansion**: after a direct hit, retrieval expands through shared `related_people`, `related_events`, `related_topics`, and `related_sources`.
-5. **Lifecycle ranking**: active memories rise; ended, superseded, or replaced memories fall or disappear.
-6. **Importance ranking**: each memory has `importance`; durable high-impact facts outrank ordinary notes.
-
-You can widen internal recall without increasing final context:
-
-```bash
-python scripts/memory_runtime.py prepare-context \
-  --subject-id person:me \
-  --subject-name 我 \
-  --session-id session-20260424 \
-  --query-file query.txt \
-  --candidate-pool 32 \
-  --expand-hops 2
-```
-
-The final prompt remains controlled by `--top-k` and `context_markdown`.
-
-## Writeback Policy
-
-Default behavior is conservative:
-
-- Raw events are preserved first in `raw_events`.
-- Automatic organization writes to `session` or `candidate` by default.
-- Long-term layers should come from explicit `remember`, validated promotion, or intentional artifact capture.
-- Use `supersedes` / `replaced_by` or `status: superseded` for conflicts and replacements.
-- Do not promote normal user questions, one-off chat, unverified guesses, or long transcripts directly into long-term memory.
-
-## As A Codex Skill
-
-`SKILL.md` is the agent-facing runtime contract. This `README.md` is for humans.
-
-When the skill triggers, the agent should:
-
-- Read `SKILL.md`.
-- Run `scripts/memory_runtime.py prepare-context` before answering.
-- Use only `context_markdown` as memory context.
-- Run `scripts/memory_runtime.py finalize-turn` after answering.
-- Run `scripts/memory_runtime.py remember` only for explicit durable memory.
-
-The agent should not load these by default:
-
-- `README.md`
-- `references/`
-- `memory-data/`
-- individual memory Markdown files
-- full runtime JSON diagnostics
-
-## Maintenance
-
-Run the standard maintenance sequence:
-
-```bash
-python scripts/run_maintenance.py
-```
-
-This performs recovery only: migrations, legacy scope backfill, lease recovery,
-snapshot retention, projection draining, generated views, and lint. It never
-consolidates evidence directly; that responsibility belongs to the single
-durable review worker.
-
-Run lint only:
-
-```bash
-python scripts/lint_memory.py
-```
-
-Compile scripts:
-
-```bash
-python -m compileall scripts
-```
-
-Validate the skill folder:
-
-```bash
-python <path-to-skill-creator>/scripts/quick_validate.py .
-```
-
-## Retrieval Evaluation
-
-To stop guessing whether recall is good, create retrieval cases:
-
-```json
-[
-  {
-    "name": "answer style",
-    "query": "how should answers be structured",
-    "subject_id": "person:me",
-    "must_include": ["answer style preference"],
-    "must_not_include": ["obsolete"]
-  }
-]
-```
-
-Run:
-
-```bash
-python scripts/evaluate_retrieval.py --cases-file retrieval-cases.json --strict
-```
-
-The evaluator reports `recall_at_k`, selected titles, missing expectations, and unexpected matches. This is the recommended way to improve recall over time.
-
-## Repository Layout
+安装一次以后，你可以把它接入多个智能体：
 
 ```text
-SKILL.md                  Agent-facing runtime contract
-agents/openai.yaml        UI metadata
-scripts/                  Runtime, indexing, retrieval, writeback, lint, evaluation
-config/default.yaml       Conservative 2.1 runtime defaults
-migrations/               Transactional, checksummed SQLite schema migrations
-prompts/                  Optional LLM fallback contracts
-references/               On-demand design and policy references
-assets/templates/         Memory note templates
-memory-data/              Default local memory store, git-ignored
+Claude Code
+Codex
+OpenClaw
+自定义 Agent
+        ↓
+同一个 Meta Memory
+        ↓
+共享用户记忆、项目记忆和历史对话
 ```
 
-Generated views inside `memory-data/`:
+这些 Agent 不需要各自保存一套互不相通的记忆。
 
-- `index.md`: compiled memory navigation
-- `log.md`: raw event timeline
-- `sources.md`: source layer and memory-source mapping
+例如：
 
-## Meta Memory 2.1: Auditable Memory Formation
+* 你用 Claude Code 开发一个项目；
+* 后来换 Codex 继续开发；
+* 又让 OpenClaw 整理项目说明；
+* 三个 Agent 都能读取这个项目之前的决定、当前状态和你的使用偏好。
 
-The 2.0 runtime preserves the project's local-first design while adding a safe
-path from raw conversation to durable memory:
+---
+
+## 最简单的理解
+
+Meta Memory 每轮主要做两件事。
+
+### 回答前
+
+根据当前问题找出少量相关记忆：
 
 ```text
-hot snapshot ← eligible active claims ← validated plans ← semantic consolidation ← atomic units ← session cards ← raw events
-                                  ↓                          ↓
-                           fixed session prompt       durable approval/review queue
+用户喜欢怎样的回答
+这个项目正在做什么
+以前做过什么决定
+上次问题怎么解决
 ```
 
-- SQLite changes are checksummed, transactional migrations in `migrations/`.
-- A heartbeat only builds incremental session cards; it never directly appends
-  a conversation into a profile or other long-term page.
-- `run_dream.py` is shadow-mode by default. It produces inspectable plans with
-  `CREATE`, `CORROBORATE`, `REFINE`, `CORRECT`, `SUPERSEDE`, or `IGNORE`.
-- Every durable change validates sources, subject scope, sensitivity, temporal
-  rules, and path safety before an atomic Markdown + SQLite update.
-- Retrieval fuses field match, document BM25, chunk BM25, typed graph/entity
-  signals, and optional embeddings via RRF. Embeddings are never a hard dependency.
-- Retrieval telemetry is separate from usefulness: use
-  `mark_memory_usage.py` only after a memory was actually used or confirmed.
+然后只把相关内容交给智能体。
 
-Typical deferred processing:
+### 回答后
+
+保存这一轮发生的事情：
+
+```text
+用户说了什么
+智能体回答了什么
+有没有新的决定
+有没有新的项目状态
+有没有需要长期记住的内容
+```
+
+后台再把值得保存的信息整理成长期记忆。
+
+---
+
+## 它与普通聊天记录有什么区别？
+
+聊天记录只是保存所有对话。
+
+Meta Memory 会把不同内容分开：
+
+```text
+原始对话
+长期事实
+当前项目状态
+历史事实
+待确认内容
+错误或已经过期的事实
+```
+
+例如你先说：
+
+```text
+项目现在使用 SQLite。
+```
+
+后来又说：
+
+```text
+项目已经迁移到 PostgreSQL。
+```
+
+系统不会简单保留两个互相冲突的“当前数据库”。
+
+它会尝试理解为：
+
+```text
+SQLite：过去有效
+PostgreSQL：现在有效
+```
+
+---
+
+# 核心目标
+
+Meta Memory 优先保证：
+
+1. 记忆准确；
+2. 自动保存有用信息；
+3. 多个智能体共享；
+4. 运行轻量；
+5. 安装简单。
+
+它不是完整的 Agent OS，也不会替代 Claude Code、Codex 或 OpenClaw。
+
+它只专注一件事：
+
+> 给所有智能体提供同一套可靠的长期记忆。
+
+---
+
+# 默认使用方式
+
+Meta Memory 默认运行在一台设备上。
+
+例如：
+
+```text
+Mac mini
+├── Claude Code
+├── Codex
+├── OpenClaw
+├── Meta Memory
+└── 共享记忆数据库
+```
+
+所有 Agent 直接执行同一个本地命令：
 
 ```bash
-# Inspect the proposed writes without changing long-term memory.
-python scripts/run_dream.py --subject-id person:me
-
-# Apply only low-risk validated actions.
-python scripts/run_dream.py --subject-id person:me --apply
-
-# Inspect or explicitly approve temporal corrections.
-python scripts/review_memory_plan.py
+meta-memory
 ```
 
-Optional external integrations are command adapters, not required packages:
+默认不需要：
 
-- `META_MEMORY_LLM_COMMAND` enables low-confidence classification fallback.
-- `META_MEMORY_EMBEDDINGS_COMMAND` enables `embedding_index.py` and optional
-  embedding RRF. Without either variable, all deterministic functionality still works.
+* HTTP API；
+* MCP；
+* Token；
+* 多用户权限系统；
+* 独立向量数据库；
+* 多个常驻 Worker。
 
-## English Version
+远程 API 仍然可以作为高级可选功能使用。
 
-### What It Is
+---
 
-Meta Memory is a local memory tool for Codex and AI agents.
+# 安装
 
-It solves a simple problem: you want the agent to remember useful things about you, your projects, your clients, or your long-running work, but you do not want to paste every old conversation and every project file into the prompt each time.
-
-Meta Memory does two jobs:
-
-1. **Before the answer, retrieve memory**: it finds a small amount of relevant memory for the current question.
-2. **After the answer, record what happened**: it stores raw conversation events, and only writes durable long-term memory when the user explicitly asks for it or when a workflow intentionally promotes it.
-
-In plain terms: **remember what should be remembered, retrieve what is needed, and keep unrelated history out of the context window.**
-
-### What It Is Not
-
-Meta Memory is not just a chat log backup.
-
-It is not a folder where the agent blindly reads every old note.
-
-It is not an embedding-only RAG system.
-
-It is a small local stack:
-
-- Python scripts read, write, index, and retrieve memory.
-- Markdown files store durable memories that humans can inspect and edit.
-- SQLite stores the search index, source mapping, lifecycle state, and retrieval metadata.
-
-### How It Works In One Turn
-
-The normal loop is:
-
-1. The user asks a question.
-2. The agent calls `prepare-context`.
-3. Meta Memory searches local memory for relevant items.
-4. The agent reads only the returned `context_markdown`.
-5. The agent answers the user.
-6. The agent calls `finalize-turn` to store the raw turn event.
-7. If the user explicitly says to remember something, the agent calls `remember` to write durable memory.
-
-This matters because the model is not expected to remember from vague impressions, and it is not given the entire memory folder. It gets only the small piece of memory selected for the current task.
-
-### When To Use It
-
-Use Meta Memory when:
-
-- You use Codex on the same project over many sessions.
-- You want the agent to remember preferences, writing style, working habits, or constraints.
-- You need memory for a person, project, client, product, family topic, learning plan, or long-running task.
-- You want memory that stays local, is readable as Markdown, and can be corrected later.
-- You want recall to be explainable instead of relying only on embedding similarity.
-
-### Why Retrieval Is Deterministic By Default
-
-Embeddings can be useful, but they are not the default recall path here.
-
-The practical reason is that long-term memory often needs exact, inspectable recall. If you need a specific fact, preference, decision, or project constraint, “semantically similar” is not always good enough.
-
-Meta Memory therefore starts with methods that are easier to inspect:
-
-- Field matching: title, tags, topic, people, events, and sources.
-- Full-text search: SQLite FTS/BM25 over memory text and relation fields.
-- Explicit associations: `related_topics`, `related_people`, `related_events`, and `related_sources`.
-- Importance ranking: high-impact memory is preferred.
-- Lifecycle state: expired, superseded, or replaced memory is down-ranked or removed.
-
-### Memory Layers
-
-Long-term memory is split by purpose:
-
-- `profile`: stable identity, preferences, and long-term style
-- `states`: current state and recent changes
-- `events`: important events and timeline facts
-- `relationships`: important people and relationship context
-- `goals`: goals, projects, and constraints
-- `domains`: work, study, health, finance, daily life, and other domain knowledge
-- `sessions`: current conversation and short-term task state
-- `candidates`: unverified, uncertain, or conflicting information
-- `archive`: raw sources and imported material
-
-The point is not complexity. The point is to keep stable facts, temporary state, raw evidence, and unverified guesses from mixing into one messy memory pile.
-
-### Quick Start
+## 方式一：Python 安装
 
 ```bash
-python scripts/memory_runtime.py prepare-context \
-  --subject-id person:me \
-  --subject-name "Me" \
-  --session-id session-1 \
-  --query-file query.txt
+pip install meta-memory
 ```
 
-Use only `context_markdown` from the returned JSON as memory context.
+然后运行：
 
 ```bash
-python scripts/memory_runtime.py finalize-turn \
-  --subject-id person:me \
-  --subject-name "Me" \
-  --session-id session-1 \
-  --reply-file reply.txt
+meta-memory setup
 ```
 
-Write durable memory only when it is intentional:
+安装程序会询问：
+
+```text
+你的名称
+记忆保存位置
+是否自动整理
+是否开启夜间 Dream
+需要接入哪些智能体
+```
+
+示例：
+
+```text
+User: Li Peng
+Store: ~/.meta-memory
+Automatic maintenance: Yes
+Dream: Every night at 23:30
+Agents: Claude Code, Codex, OpenClaw
+```
+
+安装程序会自动：
+
+* 初始化数据库；
+* 创建配置；
+* 安装定时整理；
+* 安装 Dream；
+* 给选中的 Agent 安装 SKILL；
+* 添加必要的常驻调用说明；
+* 检查安装是否正常。
+
+---
+
+## 方式二：Docker
 
 ```bash
-python scripts/memory_runtime.py remember \
-  --subject-id person:me \
-  --subject-name "Me" \
-  --title-file title.txt \
-  --content-file memory.txt \
-  --related-topic answer-style \
-  --importance 0.9 \
-  --use-underlying-kind
+docker compose up -d
 ```
 
-## Design Influences
+然后：
 
-- Andrej Karpathy's [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f): compile durable knowledge instead of repeatedly rereading raw material.
-- [supermemory](https://github.com/supermemoryai/supermemory): scoped memory and tool-first retrieval.
-- [mem0](https://github.com/mem0ai/mem0): User/Session/Agent memory split and retrieve-generate-store loop.
+```bash
+docker compose exec meta-memory meta-memory setup
+```
 
-Meta Memory keeps those ideas local-first, dependency-light, and inspectable.
+Docker 适合云服务器或不希望管理 Python 环境的用户。
+
+本机上的 Agent 最好通过项目提供的 wrapper 调用：
+
+```bash
+meta-memory before ...
+```
+
+而不需要知道 Meta Memory 实际运行在 Docker 中。
+
+---
+
+# 接入智能体
+
+## 一键接入
+
+```bash
+meta-memory install-agent claude-code
+meta-memory install-agent codex
+meta-memory install-agent openclaw
+```
+
+全部安装：
+
+```bash
+meta-memory install-agent --all
+```
+
+自定义 Agent：
+
+```bash
+meta-memory install-agent custom \
+  --skill-dir /path/to/agent/skills
+```
+
+安装命令会：
+
+1. 安装或链接 Meta Memory SKILL；
+2. 写入共享数据目录；
+3. 添加每轮调用说明；
+4. 测试 Agent 是否可以执行 `meta-memory`；
+5. 不创建新的独立数据库。
+
+所有 Agent 使用同一套记忆。
+
+---
+
+# 新增一个 Agent 需要做什么？
+
+通常只需要运行：
+
+```bash
+meta-memory install-agent <agent-name>
+```
+
+例如：
+
+```bash
+meta-memory install-agent codex
+```
+
+不需要：
+
+* 创建新用户；
+* 创建新 Token；
+* 创建新数据库；
+* 复制旧记忆；
+* 配置向量数据库；
+* 启动新服务。
+
+---
+
+# 普通用户只需要理解三个概念
+
+## 用户
+
+表示这些记忆属于谁。
+
+例如：
+
+```text
+Li Peng
+```
+
+用户记忆可以包括：
+
+* 回答语言；
+* 写作偏好；
+* 长期习惯；
+* 长期目标；
+* 稳定个人信息。
+
+这些记忆默认可以被所有已接入 Agent 读取。
+
+---
+
+## 项目
+
+表示当前正在处理的事情。
+
+例如：
+
+```text
+meta-memory
+company-ai
+novel
+cloud-server
+family-health
+```
+
+项目记忆可以包括：
+
+* 当前状态；
+* 技术栈；
+* 项目决定；
+* 任务进度；
+* 项目问题；
+* 历史解决方案。
+
+不同项目的状态不会默认混在一起。
+
+---
+
+## 会话
+
+表示当前这一次对话或任务。
+
+例如：
+
+```text
+claude-code:2026-07-13:001
+codex:2026-07-13:002
+```
+
+会话用于：
+
+* 保存原始对话；
+* 继续当前任务；
+* 查找上次讨论；
+* 避免不同对话互相混合。
+
+通常由 Agent 自动生成，用户不需要手工管理。
+
+---
+
+# 项目如何确定？
+
+Meta Memory 默认自动判断项目。
+
+判断顺序：
+
+1. 当前 Git 仓库；
+2. 当前工作目录绑定；
+3. Agent 显式提供；
+4. 默认项目。
+
+例如你在：
+
+```text
+/home/li/projects/meta-memory
+```
+
+目录中使用 Claude Code，Meta Memory 可以自动使用项目：
+
+```text
+meta-memory
+```
+
+手工绑定当前目录：
+
+```bash
+meta-memory project set meta-memory
+```
+
+查看当前项目：
+
+```bash
+meta-memory project current
+```
+
+---
+
+# 智能体每轮会做什么？
+
+接入后的 Agent 应遵循固定流程。
+
+## 回答前
+
+运行：
+
+```bash
+meta-memory before \
+  --project auto \
+  --session <session-id> \
+  --query-file request.txt
+```
+
+Meta Memory 会自动判断需要搜索到什么程度。
+
+普通问题可能只读取：
+
+* 用户核心偏好；
+* 当前项目状态；
+* 精确关键词结果。
+
+涉及历史时可能进一步搜索：
+
+* 以前的长期记忆；
+* 旧会话；
+* 历史项目决定；
+* 某个时间点的状态。
+
+返回结果主要有：
+
+```text
+hot_context
+context
+```
+
+智能体只应把这两部分作为记忆上下文。
+
+---
+
+## 回答后
+
+运行：
+
+```bash
+meta-memory after \
+  --project auto \
+  --session <session-id> \
+  --user-file request.txt \
+  --assistant-file response.txt
+```
+
+这个命令会快速完成：
+
+* 保存用户消息；
+* 保存 Assistant 回复；
+* 记录 Agent 来源；
+* 创建后台整理任务。
+
+它不会让用户等待 Dream 或大型整理。
+
+---
+
+## 用户明确说“记住”
+
+运行：
+
+```bash
+meta-memory remember \
+  --project auto \
+  --session <session-id> \
+  --content "Meta Memory 默认使用 SQLite。"
+```
+
+显式 Remember 会优先进入长期记忆，并保证下一次可以读取。
+
+---
+
+## 用户说旧记忆不对
+
+运行：
+
+```bash
+meta-memory correct \
+  --memory <memory-id> \
+  --content "项目现在已经迁移到 PostgreSQL。"
+```
+
+系统会判断这是：
+
+* 原事实错误；
+* 状态发生变化；
+* 需要用户进一步确认。
+
+旧记忆不会被无痕覆盖，来源和历史仍然可以追溯。
+
+---
+
+# 搜索深度
+
+Meta Memory 不会每轮扫描全部历史。
+
+它会自动选择搜索深度。
+
+## 轻量搜索
+
+每轮默认执行：
+
+```text
+核心用户记忆
+当前项目状态
+FTS 关键词检索
+```
+
+不调用 LLM，速度优先。
+
+## 普通搜索
+
+问题明显涉及以前的内容时：
+
+```text
+长期 Claim
+Chunk
+相关主题
+相关实体
+近期 Session
+```
+
+## 深层搜索
+
+只有真正需要时：
+
+```text
+旧会话原文
+历史时间点
+跨项目用户偏好
+原始证据
+```
+
+这保证了：
+
+* 上下文不会太大；
+* 回答不会太慢；
+* 旧内容不会无缘无故干扰当前任务。
+
+---
+
+# 自动记忆
+
+Meta Memory 默认开启自动记忆。
+
+这不代表把每句话都当成正式事实。
+
+## 通常会自动长期保存
+
+用户明确表达的：
+
+* 长期偏好；
+* 项目决定；
+* 当前状态；
+* 确定结果；
+* 重要约束；
+* 明确纠正。
+
+例如：
+
+```text
+以后给我中文回答。
+这个项目不使用 Docker。
+数据库已经迁移到 PostgreSQL。
+```
+
+---
+
+## 通常会先保存为候选
+
+以下内容不会立即作为强事实：
+
+* 用户猜测；
+* 临时计划；
+* 尚未确认的判断；
+* Assistant 推断；
+* 自动生成的总结；
+* 单次情绪；
+* 预测。
+
+后续有更多证据或用户确认时，再升级为正式记忆。
+
+---
+
+## Assistant 回复不是用户事实
+
+Meta Memory 会保存 Assistant 回复，方便回看和追踪。
+
+但 Assistant 自己说出的内容不会自动变成：
+
+* 用户身份；
+* 用户偏好；
+* 真实世界事实。
+
+这能减少 Agent 自己“编出一条记忆，然后以后又把它当真”的问题。
+
+---
+
+# 后台自动整理
+
+默认安装一个轻量定时任务。
+
+例如每五分钟执行：
+
+```bash
+meta-memory maintain
+```
+
+它会处理：
+
+```text
+新对话
+→ Session Card
+→ 原子记忆
+→ 去重
+→ 冲突检查
+→ 长期 Claim
+→ 更新索引
+→ 更新下一会话的 Hot Memory
+```
+
+这个任务不是大型常驻服务。
+
+没有 Agent 使用时，它几乎不消耗资源。
+
+---
+
+# Dream
+
+Dream 用来做更高层的整理。
+
+默认每天夜间运行：
+
+```bash
+meta-memory dream
+```
+
+Dream 不只是简单总结当天聊天。
+
+它会观察一段时间内的记忆，尝试发现：
+
+* 稳定用户偏好；
+* 项目阶段总结；
+* 多次重复的方法；
+* 重要决定；
+* 尚未解决的冲突；
+* 经常被提到的主题。
+
+Dream 可以生成：
+
+```text
+用户摘要
+项目摘要
+流程候选
+未解决问题
+```
+
+Dream 产生的推论会保留来源，并标记为系统推断。
+
+它不会：
+
+* 删除原始证据；
+* 无来源地改写事实；
+* 自动执行外部操作；
+* 直接修改其他 Agent 的 Skill；
+* 把所有推断当成确定事实。
+
+手工运行：
+
+```bash
+meta-memory dream
+```
+
+查看最近 Dream：
+
+```bash
+meta-memory dream show
+```
+
+---
+
+# 查询以前的对话
+
+搜索长期记忆：
+
+```bash
+meta-memory search \
+  --project meta-memory \
+  "项目数据库是什么？"
+```
+
+搜索历史会话：
+
+```bash
+meta-memory history \
+  --project meta-memory \
+  "之前是怎么解决 UFW 问题的？"
+```
+
+查看当前项目摘要：
+
+```bash
+meta-memory project show meta-memory
+```
+
+---
+
+# 查看和纠正记忆
+
+列出最近记忆：
+
+```bash
+meta-memory memories recent
+```
+
+搜索：
+
+```bash
+meta-memory memories search "PostgreSQL"
+```
+
+查看来源：
+
+```bash
+meta-memory memories show <memory-id>
+```
+
+标记有用：
+
+```bash
+meta-memory memories helpful <memory-id>
+```
+
+标记错误：
+
+```bash
+meta-memory memories incorrect <memory-id>
+```
+
+标记过期：
+
+```bash
+meta-memory memories outdated <memory-id>
+```
+
+---
+
+# 数据保存在什么地方？
+
+默认目录：
+
+```text
+~/.meta-memory/
+├── config.toml
+├── data/
+│   ├── db/
+│   │   └── memory.sqlite
+│   ├── memories/
+│   ├── hot/
+│   ├── sessions/
+│   ├── archive/
+│   └── resources/
+└── backups/
+```
+
+SQLite 保存：
+
+* 原始事件；
+* 会话；
+* Claims；
+* 来源关系；
+* 检索索引；
+* 后台任务。
+
+Markdown 保存人能阅读的记忆投影。
+
+---
+
+# 数据库和 Markdown 谁是准的？
+
+Claims 和原始证据是系统中的权威数据。
+
+Markdown 是人类可读投影。
+
+不要直接编辑：
+
+```text
+hot/
+```
+
+如果手工修改普通记忆 Markdown，应执行：
+
+```bash
+meta-memory reindex
+```
+
+更推荐通过：
+
+```bash
+meta-memory correct
+meta-memory remember
+```
+
+修改长期记忆。
+
+---
+
+# 多个智能体能做什么？
+
+多个 Agent 可以共享：
+
+* 用户长期偏好；
+* 同一项目的当前状态；
+* 历史决定；
+* 以前的解决方案；
+* 会话记录；
+* 已确认的流程；
+* Dream 项目摘要。
+
+例如：
+
+```text
+Claude Code 完成数据库迁移
+→ Meta Memory 保存结果
+→ Codex 下次可以直接知道已经迁移
+→ OpenClaw 可以据此更新项目文档
+```
+
+---
+
+# 多个智能体不能保证什么？
+
+Meta Memory 无法强制所有 Agent 一定正确调用 SKILL。
+
+因此安装程序会同时尝试：
+
+* 安装 SKILL；
+* 写入全局常驻调用说明；
+* 安装宿主支持的 Hook。
+
+如果某个 Agent 不遵循调用规则，它可能：
+
+* 不读取记忆；
+* 不保存当前对话；
+* 错过自动整理。
+
+Meta Memory 也不能保证：
+
+* LLM 每次抽取都完全正确；
+* 用户说的所有内容本身都真实；
+* 自动 Dream 的每条推断都正确；
+* 多台独立设备可以同时直接写同一个 SQLite；
+* 记忆可以代替密码管理器；
+* 记忆可以代替完整文件知识库。
+
+---
+
+# 使用限制
+
+当前默认 SQLite 模式适合：
+
+* 一台中心设备；
+* 大约几个到十几个 Agent；
+* 多读、适量并发写；
+* 个人和家庭使用；
+* 项目开发；
+* 长期个人记忆。
+
+不适合：
+
+* 多台服务器同时直接写 SQLite；
+* 数百个并发写入 Agent；
+* 大规模多租户 SaaS；
+* 通过网盘实时同步数据库。
+
+---
+
+# 多设备怎么使用？
+
+推荐：
+
+```text
+所有 Agent 都在一台中心设备运行
+```
+
+或者：
+
+```text
+远程设备通过高级 HTTP 模式访问中心设备
+```
+
+不推荐：
+
+```text
+设备 A 一份 SQLite
+设备 B 一份 SQLite
+然后通过 OneDrive 或 iCloud 双向同步
+```
+
+实时 SQLite 不应放入：
+
+* OneDrive；
+* Dropbox；
+* iCloud Drive；
+* 普通双向同步目录。
+
+---
+
+# 换电脑或服务器
+
+## 创建备份
+
+```bash
+meta-memory backup
+```
+
+指定文件：
+
+```bash
+meta-memory backup \
+  --output ~/backups/meta-memory-backup.tar.zst
+```
+
+备份应包括：
+
+* SQLite；
+* Markdown；
+* 配置；
+* 项目目录映射；
+* Dream 数据；
+* 资源索引；
+* Schema 版本。
+
+---
+
+## 在新设备恢复
+
+安装程序：
+
+```bash
+pip install meta-memory
+```
+
+恢复：
+
+```bash
+meta-memory restore \
+  ~/backups/meta-memory-backup.tar.zst
+```
+
+然后执行：
+
+```bash
+meta-memory migrate
+meta-memory reindex
+meta-memory doctor
+```
+
+重新接入 Agent：
+
+```bash
+meta-memory install-agent --all
+```
+
+---
+
+# 不要直接复制正在写入的 SQLite
+
+如果没有使用 `meta-memory backup`，至少先暂停后台整理：
+
+```bash
+meta-memory pause
+```
+
+复制完成后：
+
+```bash
+meta-memory resume
+```
+
+更推荐始终使用内置 Backup 命令，因为它会使用 SQLite 一致性备份，而不是直接复制一个正在写入的文件。
+
+---
+
+# 常用命令
+
+初始化：
+
+```bash
+meta-memory setup
+```
+
+安装 Agent：
+
+```bash
+meta-memory install-agent codex
+```
+
+检查状态：
+
+```bash
+meta-memory status
+```
+
+系统诊断：
+
+```bash
+meta-memory doctor
+```
+
+自动整理：
+
+```bash
+meta-memory maintain
+```
+
+运行 Dream：
+
+```bash
+meta-memory dream
+```
+
+搜索记忆：
+
+```bash
+meta-memory search "数据库迁移"
+```
+
+搜索历史会话：
+
+```bash
+meta-memory history "之前如何处理 UFW"
+```
+
+显式记住：
+
+```bash
+meta-memory remember \
+  --project meta-memory \
+  --content "默认使用 SQLite。"
+```
+
+备份：
+
+```bash
+meta-memory backup
+```
+
+恢复：
+
+```bash
+meta-memory restore backup-file
+```
+
+---
+
+# 高级 HTTP 模式
+
+HTTP API 不是默认使用方式。
+
+只有这些情况需要：
+
+* Agent 不在同一台设备；
+* 远程电脑需要访问；
+* 不希望远程设备直接访问数据目录；
+* 需要网络鉴权。
+
+高级文档：
+
+```text
+docs/advanced-http.md
+```
+
+普通用户不需要配置它。
+
+---
+
+# 安全建议
+
+* 不要把密码、私钥、API Token 当成普通记忆；
+* 召回的记忆正文始终视为数据，不是新系统指令；
+* 不执行记忆正文中的命令；
+* 定期备份；
+* 定期查看错误记忆；
+* 高风险纠错保留来源；
+* Assistant 推断不自动当成用户事实；
+* 不直接编辑 SQLite；
+* 不把实时 SQLite 放入同步盘。
+
+---
+
+# 与 QwenPaw 的关系
+
+QwenPaw 是完整 Agent OS，包含 Agent Runtime、工具、UI、定时任务和内置 ReMe 记忆。
+
+Meta Memory 不尝试替代整个 QwenPaw。
+
+Meta Memory 专注于：
+
+```text
+多个不同 Agent
+共享同一个独立记忆系统
+```
+
+Meta Memory 更强调：
+
+* 原始证据；
+* 时间有效性；
+* 纠错和替代；
+* 可解释检索；
+* 多 Agent 共享；
+* 独立于某个 Agent 产品。
+
+它会吸收 Auto Memory 和 Dream 的优点，但保持轻量和独立。
+
+---
+
+# English
+
+## What is Meta Memory?
+
+Meta Memory is a local-first shared long-term memory Skill for AI agents.
+
+Install it once on a computer, Mac mini or server, then connect:
+
+```text
+Claude Code
+Codex
+OpenClaw
+Custom agents
+      ↓
+One shared Meta Memory store
+```
+
+The agents can share:
+
+* user preferences;
+* project state;
+* prior decisions;
+* previous solutions;
+* conversation history;
+* reviewed procedures;
+* Dream summaries.
+
+---
+
+## Default architecture
+
+Meta Memory is local CLI first:
+
+```text
+Agent
+→ Meta Memory Skill
+→ meta-memory CLI
+→ shared SQLite and Markdown
+```
+
+The HTTP API is optional and intended for remote devices.
+
+MCP is not required.
+
+---
+
+## Quick installation
+
+```bash
+pip install meta-memory
+meta-memory setup
+```
+
+Connect agents:
+
+```bash
+meta-memory install-agent claude-code
+meta-memory install-agent codex
+meta-memory install-agent openclaw
+```
+
+Connect all detected agents:
+
+```bash
+meta-memory install-agent --all
+```
+
+---
+
+## The three user-facing concepts
+
+### User
+
+Shared personal identity, preferences and durable habits.
+
+### Project
+
+Project-specific state, decisions, progress and history.
+
+### Session
+
+One current conversation or task.
+
+Internal concepts such as claims, projections and leases are hidden from normal users.
+
+---
+
+## Per-turn lifecycle
+
+Before answering:
+
+```bash
+meta-memory before \
+  --project auto \
+  --session <session-id> \
+  --query-file request.txt
+```
+
+After answering:
+
+```bash
+meta-memory after \
+  --project auto \
+  --session <session-id> \
+  --user-file request.txt \
+  --assistant-file response.txt
+```
+
+Explicit memory:
+
+```bash
+meta-memory remember \
+  --project auto \
+  --session <session-id> \
+  --content "The project currently uses SQLite."
+```
+
+---
+
+## Automatic memory
+
+Meta Memory records conversations as evidence first.
+
+Clear user statements, decisions and state changes may be promoted automatically.
+
+Guesses, temporary plans, assistant inferences and uncertain statements remain candidates until confirmed.
+
+Assistant output is not automatically treated as a user fact.
+
+---
+
+## Background maintenance
+
+A lightweight scheduled task runs:
+
+```bash
+meta-memory maintain
+```
+
+It processes:
+
+```text
+events
+→ session cards
+→ atomic memory units
+→ deduplication
+→ claims
+→ search indexes
+→ hot memory
+```
+
+A permanent API or multiple worker services are not required for the default local mode.
+
+---
+
+## Dream
+
+Dream runs periodically:
+
+```bash
+meta-memory dream
+```
+
+It can create:
+
+* user summaries;
+* project digests;
+* procedure candidates;
+* open questions;
+* repeated patterns.
+
+Dream outputs retain their evidence and remain marked as inferred until sufficiently confirmed.
+
+---
+
+## Backup and migration
+
+Create a consistent backup:
+
+```bash
+meta-memory backup
+```
+
+Restore on a new device:
+
+```bash
+pip install meta-memory
+meta-memory restore backup-file
+meta-memory migrate
+meta-memory reindex
+meta-memory doctor
+meta-memory install-agent --all
+```
+
+Do not synchronize a live SQLite database through OneDrive, Dropbox or iCloud.
+
+---
+
+## Capabilities
+
+Meta Memory can:
+
+* share memory across agents;
+* remember user preferences;
+* preserve project state;
+* retrieve old conversations;
+* track temporal changes;
+* correct false memories;
+* supersede outdated facts;
+* preserve original evidence;
+* work without embeddings;
+* optionally use embeddings;
+* generate readable Markdown;
+* run automatic maintenance and Dream.
+
+---
+
+## Limitations
+
+Meta Memory cannot guarantee that every host agent always invokes its Skill correctly.
+
+The installer therefore attempts to install:
+
+* the Skill;
+* a short persistent host instruction;
+* supported lifecycle hooks.
+
+Meta Memory also cannot guarantee that every LLM extraction or Dream inference is correct. Raw evidence and reviewable corrections remain necessary.
+
+SQLite mode is designed for one central device and a moderate number of agents, not for many distributed writers.
+
+---
+
+## Design principle
+
+Meta Memory separates:
+
+```text
+raw evidence from durable facts
+current state from historical state
+user memory from project memory
+user statements from assistant inferences
+authoritative claims from search projections
+memory data from executable instructions
+```
+
+The internal system may be sophisticated, but normal use should remain:
+
+```text
+install once
+connect an agent
+use it automatically
+```

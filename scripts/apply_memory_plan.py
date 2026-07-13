@@ -159,7 +159,7 @@ def queue_review(conn, action: dict[str, object], reason: str) -> str:
 def apply_action(root: Path, action: dict[str, object], policy: str, review_approved: bool) -> dict[str, object]:
     conn = open_db(root)
     name = str(action["action"]).upper()
-    must_review = name in HIGH_RISK or bool(action.get("requires_review")) or (name == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("origin", "")) == "background_review")
+    must_review = name in HIGH_RISK or bool(action.get("requires_review")) or (name == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("origin", "")) == "background_review" and not bool(action.get("auto_promote")))
     if must_review and not review_approved:
         proposal_id = queue_review(conn, action, "high_risk_or_policy_review")
         conn.commit(); conn.close()
