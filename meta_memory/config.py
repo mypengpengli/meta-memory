@@ -28,15 +28,17 @@ class AppConfig:
     user_name: str = "User"
     user_id: str = "user"
     store: Path = field(default_factory=lambda: Path.home() / ".meta-memory" / "data")
-    auto_memory: bool = True
     memory_mode: str = "automatic"
     default_project: str = "general"
     search_depth: str = "auto"
-    maintenance_enabled: bool = False
+    maintenance_enabled: bool = True
     maintenance_interval_minutes: int = 5
-    dream_enabled: bool = False
+    dream_enabled: bool = True
     dream_schedule: str = "23:30"
     dream_scan_days: int = 7
+    dream_provider: str = "deterministic"
+    dream_command: str = ""
+    session_auto_expire_hours: int = 8
     top_k: int = 8
     embeddings: bool = False
     http_api: bool = False
@@ -51,10 +53,39 @@ class AppConfig:
     def profile_id(self) -> str:
         return self.user_id
 
+    @property
+    def auto_memory(self) -> bool:
+        """Compatibility shim for integrations that predate memory_mode."""
+        return self.memory_mode == "automatic"
+
 
 def _value(data: dict[str, Any], group: str, name: str, default: Any) -> Any:
     section = data.get(group, {})
     return section.get(name, default) if isinstance(section, dict) else default
+
+
+def _bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
+def normalize_memory_mode(value: Any, *, fallback: str = "automatic") -> str:
+    mode = str(value or "").strip().casefold()
+    return mode if mode in {"manual", "conservative", "automatic"} else fallback
+
+
+def normalize_search_depth(value: Any) -> str:
+    depth = str(value or "").strip().casefold()
+    return depth if depth in {"light", "normal", "deep", "auto"} else "auto"
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -65,24 +96,33 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     raw_projects = data.get("projects", {})
     projects = {str(key): slug(str(value), "general") for key, value in raw_projects.items()} if isinstance(raw_projects, dict) else {}
     name = str(_value(data, "user", "name", "User"))
+    behavior = data.get("behavior", {}) if isinstance(data.get("behavior", {}), dict) else {}
+    legacy_auto = _bool(behavior.get("auto_memory", True), True)
+    configured_mode = behavior.get("memory_mode")
+    memory_mode = normalize_memory_mode(
+        configured_mode,
+        fallback="automatic" if legacy_auto else "manual",
+    )
     return AppConfig(
         path=config_path,
         user_name=name,
         user_id=slug(str(_value(data, "user", "id", slug(name, "user"))), "user"),
         store=Path(str(_value(data, "storage", "path", Path.home() / ".meta-memory" / "data"))).expanduser(),
-        auto_memory=bool(_value(data, "behavior", "auto_memory", True)),
-        memory_mode=str(_value(data, "behavior", "memory_mode", "automatic")),
+        memory_mode=memory_mode,
         default_project=slug(str(_value(data, "behavior", "default_project", "general")), "general"),
-        search_depth=str(_value(data, "behavior", "search_depth", "auto")),
-        maintenance_enabled=bool(_value(data, "maintenance", "enabled", False)),
+        search_depth=normalize_search_depth(_value(data, "behavior", "search_depth", "auto")),
+        maintenance_enabled=_bool(_value(data, "maintenance", "enabled", True), True),
         maintenance_interval_minutes=max(1, int(_value(data, "maintenance", "interval_minutes", 5))),
-        dream_enabled=bool(_value(data, "dream", "enabled", False)),
+        dream_enabled=_bool(_value(data, "dream", "enabled", True), True),
         dream_schedule=str(_value(data, "dream", "schedule", "23:30")),
         dream_scan_days=max(1, int(_value(data, "dream", "scan_days", 7))),
+        dream_provider=str(_value(data, "dream", "provider", "deterministic")).strip().casefold() or "deterministic",
+        dream_command=str(_value(data, "dream", "command", "")),
+        session_auto_expire_hours=max(1, int(_value(data, "session", "auto_expire_hours", 8))),
         top_k=max(1, int(_value(data, "retrieval", "top_k", 8))),
-        embeddings=bool(_value(data, "retrieval", "embeddings", False)),
-        http_api=bool(_value(data, "advanced", "http_api", False)),
-        agent_private_memory=bool(_value(data, "advanced", "agent_private_memory", False)),
+        embeddings=_bool(_value(data, "retrieval", "embeddings", False), False),
+        http_api=_bool(_value(data, "advanced", "http_api", False), False),
+        agent_private_memory=_bool(_value(data, "advanced", "agent_private_memory", False), False),
         projects=projects,
     )
 
@@ -97,9 +137,10 @@ def save_config(config: AppConfig) -> Path:
         "# Meta Memory user configuration. Internal database scope fields stay hidden.",
         "[user]", f"name = {_quote(config.user_name)}", f"id = {_quote(config.user_id)}", "",
         "[storage]", f"path = {_quote(str(config.store))}", "",
-        "[behavior]", f"auto_memory = {str(config.auto_memory).lower()}", f"memory_mode = {_quote(config.memory_mode)}", f"default_project = {_quote(config.default_project)}", f"search_depth = {_quote(config.search_depth)}", "",
+        "[behavior]", f"memory_mode = {_quote(normalize_memory_mode(config.memory_mode))}", f"default_project = {_quote(config.default_project)}", f"search_depth = {_quote(normalize_search_depth(config.search_depth))}", "",
+        "[session]", f"auto_expire_hours = {max(1, int(config.session_auto_expire_hours))}", "",
         "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", "",
-        "[dream]", f"enabled = {str(config.dream_enabled).lower()}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {config.dream_scan_days}", "",
+        "[dream]", f"enabled = {str(config.dream_enabled).lower()}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {config.dream_scan_days}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
         "[retrieval]", f"top_k = {config.top_k}", f"embeddings = {str(config.embeddings).lower()}", "",
         "[advanced]", f"http_api = {str(config.http_api).lower()}", f"agent_private_memory = {str(config.agent_private_memory).lower()}", "",
         "[projects]",

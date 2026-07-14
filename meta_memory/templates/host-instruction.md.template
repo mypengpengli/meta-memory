@@ -1,0 +1,6 @@
+<!-- meta-memory:begin -->
+For every user turn, use the installed Meta Memory Skill for `{{ agent_id }}`.
+Its launcher is `{{ launcher_path }}` and it uses `{{ config_path }}`. Recall
+with `before`, draft and save the complete answer with `after` **before**
+sending that same draft to the user.
+<!-- meta-memory:end -->

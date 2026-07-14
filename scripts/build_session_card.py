@@ -83,6 +83,9 @@ def build_cards(
     if workspace_id is not None:
         clauses.append("workspace_id = ?")
         params.append(workspace_id)
+    if origin_agent_id is not None:
+        clauses.append("COALESCE(origin_agent_id, '') = ?")
+        params.append(origin_agent_id)
     if session_id is not None:
         clauses.append("COALESCE(session_id, '') = ?")
         params.append(session_id)
@@ -94,10 +97,10 @@ def build_cards(
         params.append(event_end_id)
     groups = conn.execute(
         f"""
-        SELECT subject_id, MAX(subject_name), COALESCE(session_id, ''), profile_id, workspace_id, MAX(origin_agent_id), COUNT(*)
+        SELECT subject_id, MAX(subject_name), COALESCE(session_id, ''), profile_id, workspace_id, COALESCE(origin_agent_id, ''), COUNT(*)
         FROM raw_events
         WHERE {' AND '.join(clauses)}
-        GROUP BY subject_id, COALESCE(session_id, ''), profile_id, workspace_id
+        GROUP BY subject_id, COALESCE(session_id, ''), profile_id, workspace_id, COALESCE(origin_agent_id, '')
         ORDER BY MIN(id)
         """,
         tuple(params),
@@ -109,8 +112,8 @@ def build_cards(
         sess = str(raw_session or "")
         key = session_key(sess)
         card = conn.execute(
-            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=?",
-            (sid, key, raw_profile, raw_workspace),
+            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?",
+            (sid, key, raw_profile, raw_workspace, raw_agent),
         ).fetchone()
         last_event_id = int(card[1] or 0) if card else 0
         events_raw = conn.execute(
@@ -118,9 +121,10 @@ def build_cards(
             SELECT id, source_type, content, created_at, event_time
             FROM raw_events
             WHERE subject_id = ? AND COALESCE(session_id, '') = ?
-              AND profile_id=? AND workspace_id=? AND id > ? AND processed_state IN ('pending', 'sessionized')
+              AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?
+              AND id > ? AND processed_state IN ('pending', 'sessionized')
             """ + (" AND id <= ?" if event_end_id is not None else "") + " ORDER BY id ASC LIMIT ?",
-            (sid, sess, raw_profile, raw_workspace, max(last_event_id, (event_start_id or 0) - 1), *((event_end_id,) if event_end_id is not None else ()), max_events),
+            (sid, sess, raw_profile, raw_workspace, raw_agent, max(last_event_id, (event_start_id or 0) - 1), *((event_end_id,) if event_end_id is not None else ()), max_events),
         ).fetchall()
         events = [
             {"id": int(row[0]), "source_type": str(row[1] or "conversation"), "content": str(row[2] or ""), "created_at": str(row[3] or ""), "event_time": str(row[4] or "")}
@@ -165,7 +169,7 @@ def build_cards(
                 (card_id, now, *[event["id"] for event in events]),
             )
             conn.executemany("INSERT OR IGNORE INTO session_card_events(card_id, raw_event_id) VALUES(?, ?)", [(card_id, event["id"]) for event in events])
-        results.append({"subject_id": sid, "session_id": sess, "card_id": card_id if not dry_run else (int(card[0]) if card else None), "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions})
+        results.append({"subject_id": sid, "session_id": sess, "origin_agent_id": str(raw_agent or ""), "card_id": card_id if not dry_run else (int(card[0]) if card else None), "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions})
     if not dry_run:
         conn.commit()
     conn.close()
@@ -174,7 +178,7 @@ def build_cards(
 
 def main() -> None:
     args = parse_args()
-    emit(build_cards(store_root(args.store), subject_id=args.subject_id, session_id=args.session_id, min_events=max(1, args.min_events), max_events=max(1, args.max_events), force=args.force, dry_run=args.dry_run, event_start_id=args.event_start_id, event_end_id=args.event_end_id, profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id))
+    emit(build_cards(store_root(args.store), subject_id=args.subject_id, session_id=args.session_id, min_events=max(1, args.min_events), max_events=max(1, args.max_events), force=args.force, dry_run=args.dry_run, event_start_id=args.event_start_id, event_end_id=args.event_end_id, profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id or None))
 
 
 if __name__ == "__main__":

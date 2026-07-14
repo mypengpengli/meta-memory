@@ -19,6 +19,22 @@ def compact(value: str, limit: int = 460) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def verification_label(value: object) -> str:
+    """Render provenance in a form a person can recognise at a glance."""
+    normalized = str(value or "unverified").strip().casefold().replace("-", "_")
+    if normalized in {"agent_observed", "tool_observed", "subagent_observed"}:
+        return "Agent-observed"
+    return str(value or "unverified")
+
+
+def raw_evidence_label(source_type: object) -> str:
+    """Do not let an agent or tool observation look like user evidence."""
+    normalized = str(source_type or "").strip().casefold().replace("_", "-")
+    if normalized in {"agent-observation", "tool-result", "subagent"}:
+        return "Agent-observed"
+    return "Recorded evidence"
+
+
 def render_item(item: dict[str, object]) -> str:
     chunk = item.get("best_chunk") if isinstance(item.get("best_chunk"), dict) else {}
     excerpt = compact(str(chunk.get("content", "") or item.get("summary", "") or item.get("title", "")))
@@ -29,10 +45,13 @@ def render_item(item: dict[str, object]) -> str:
     source = f"{path}{line_range}" if path else "structured memory"
     valid_to = item.get("valid_to") or item.get("end_at")
     validity = "current" if not valid_to else f"until {valid_to}"
+    memory_id = str(item.get("memory_id") or item.get("id") or "")
+    verification = verification_label(item.get("verification_state"))
+    identity = f" [memory:{memory_id}][{verification}]" if memory_id else f" [{verification}]"
     return "\n".join(
         [
             f"### {item.get('title', 'Untitled memory')}",
-            f"- Type: {item.get('memory_kind', 'note')} | Status: {item.get('status', 'active')} | Validity: {validity}",
+            f"- Type: {item.get('memory_kind', 'note')}{identity} | Status: {item.get('status', 'active')} | Validity: {validity}",
             f"- Source: {source}",
             f"- Recall: {', '.join(str(value) for value in item.get('reasons', [])[:3]) or 'ranked match'}",
             f"- Memory: {excerpt}",
@@ -40,10 +59,36 @@ def render_item(item: dict[str, object]) -> str:
     )
 
 
+def prompt_eligible(item: dict[str, object]) -> bool:
+    """Interpret prompt eligibility defensively across JSON and Python callers."""
+    value = item.get("prompt_eligible", str(item.get("memory_kind", "")) != "resource")
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def prompt_safe(item: dict[str, object]) -> bool:
+    """Keep administrative/inferred material out of ordinary prompt context."""
+    if not prompt_eligible(item) or bool(item.get("admin_only", False)):
+        return False
+    return not (
+        str(item.get("memory_kind", "")).casefold() == "dream"
+        and str(item.get("inference_level", "extractive")).casefold() != "extractive"
+    )
+
+
 def assemble_context(retrieved: dict[str, object] | None, raw_evidence: dict[str, object] | None = None, *, token_budget: int | None = None) -> str:
     budget = token_budget or int(get("retrieval.context_token_budget"))
     selected = list((retrieved or {}).get("selected", []))
-    selected = [item for item in selected if float(item.get("query_score", 0.0) or 0.0) > 0.0]
+    selected = [
+        item
+        for item in selected
+        if float(item.get("query_score", 0.0) or 0.0) > 0.0
+        # Resource chunks are intentionally available only through an
+        # explicit search result.  This guard keeps a caller that accidentally
+        # forwards such results from injecting file text into an AI prompt.
+        and prompt_safe(item)
+    ]
     sections: dict[str, list[dict[str, object]]] = {"Current Relevant Memory": [], "Current Project State": [], "Candidates": []}
     for item in selected:
         kind = str(item.get("memory_kind", ""))
@@ -78,12 +123,25 @@ def assemble_context(retrieved: dict[str, object] | None, raw_evidence: dict[str
     if conflicts:
         lines.extend(["", "## Conflicts"])
         lines.extend(f"- {item.get('title', 'memory')} is {item.get('status')} and excluded from current facts." for item in conflicts)
-    evidence = list((raw_evidence or {}).get("results", []))[:3]
+    # Raw resource events contain only audit previews, but even those previews
+    # belong to explicit evidence search rather than a normal AI prompt.
+    evidence = [
+        item
+        for item in list((raw_evidence or {}).get("results", []))
+        if str(item.get("source_type", "")).casefold() != "resource"
+    ][:3]
     if evidence and used < budget:
         lines.extend(["", "## Raw Evidence"])
         for item in evidence:
             snippet = compact(str(item.get("snippet", "")), 220)
-            candidate = f"- raw_event:{item.get('id', '')} | {item.get('effective_time', '')} | {snippet}"
+            source_type = str(item.get("source_type", "") or "unknown")
+            source_ref = compact(str(item.get("source_ref", "") or ""), 120)
+            provenance = raw_evidence_label(source_type)
+            reference = f" | ref:{source_ref}" if source_ref else ""
+            candidate = (
+                f"- raw_event:{item.get('id', '')} | {item.get('effective_time', '')}"
+                f" | {provenance} ({source_type}){reference} | {snippet}"
+            )
             if used + estimate_tokens(candidate) <= budget:
                 lines.append(candidate)
                 used += estimate_tokens(candidate)

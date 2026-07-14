@@ -10,6 +10,7 @@ from pathlib import Path
 from build_session_card import QUESTION
 from classify_memory import classify, first_sentence
 from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root, utc_now
+from meta_memory.scope_inference import inferred_visibility
 from llm_client import complete
 from runtime_identity import add_identity_args
 from validate_memory_units import validate_unit
@@ -125,6 +126,7 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
     if identifiers: clauses.append("id IN ({})".format(", ".join("?" for _ in identifiers))); params.extend(identifiers)
     if profile_id is not None: clauses.append("profile_id=?"); params.append(profile_id)
     if workspace_id is not None: clauses.append("workspace_id=?"); params.append(workspace_id)
+    if origin_agent_id: clauses.append("COALESCE(origin_agent_id,'')=?"); params.append(origin_agent_id)
     cards = conn.execute(f"SELECT id,subject_id,subject_name,session_id,last_extracted_event_id,profile_id,workspace_id,origin_agent_id FROM session_cards WHERE {' AND '.join(clauses)} ORDER BY updated_at LIMIT ?", (*params,max(1,limit))).fetchall()
     created, skipped = [], []
     for cid, sid, name, sess, last_extracted, card_profile, card_workspace, card_agent in cards:
@@ -133,7 +135,14 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
         if event_end_id is not None: event_clauses.append("id<=?"); event_params.append(event_end_id)
         events = conn.execute(f"SELECT id,source_type,content,topic_hint,domain_hint,event_time,created_at,profile_id,workspace_id,visibility_scope,origin_agent_id FROM raw_events WHERE {' AND '.join(event_clauses)} ORDER BY id", event_params).fetchall()
         max_seen = int(last_extracted or 0)
-        llm_by_event = optional_llm_units_batch([{"raw_event_id": int(row[0]), "content": str(row[2] or "")} for row in events])
+        # Imported resources may contain third-party or historical material.
+        # Keep their extraction deterministic and local; they can become only
+        # non-prompt candidates, never an LLM-promoted user fact.
+        llm_by_event = optional_llm_units_batch([
+            {"raw_event_id": int(row[0]), "content": str(row[2] or "")}
+            for row in events
+            if str(row[1] or "") != "resource"
+        ])
         for event_id, source_type, content, topic_hint, domain_hint, event_time, created_at, event_profile, event_workspace, event_visibility, event_agent in events:
             max_seen = max(max_seen,int(event_id)); source_type, content = str(source_type or ""), " ".join(str(content or "").split())[:2000]
             if not content or ACK.match(content): skipped.append({"raw_event_id":event_id,"reason":"empty_or_ack"}); continue
@@ -144,12 +153,33 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
                 if not clause or ACK.match(clause) or (is_question(clause) and not contains_assertion(clause)): skipped.append({"raw_event_id":event_id,"reason":"question_or_nonmemory"}); continue
                 fallback = structured_fields(clause,str(topic_hint or ""),str(domain_hint or "")); fields = normalize_extracted_unit(extracted if llm else {}, fallback=fallback, raw_event=raw)
                 classified = classify(str(topic_hint or first_sentence(clause)[:80] or f"raw-event-{event_id}"), clause, str(sid), str(name or "Unknown")); confidence = clamp01(extracted.get("confidence"), float(classified["suggested_payload"]["confidence"])) if llm else (min(float(classified["suggested_payload"]["confidence"]),.25) if source_type=="conversation-assistant" else float(classified["suggested_payload"]["confidence"]))
+                if source_type == "resource":
+                    # A resource is evidence, not a statement from the user.
+                    # Preserve a reviewable candidate while preventing it from
+                    # ever being selected for normal prompt context.
+                    fields["unit_kind"] = "candidate"
+                    fields["domain"] = "resource"
+                    confidence = min(confidence, 0.60)
+                base_visibility = str(event_visibility or visibility_scope or "workspace")
+                inferred = inferred_visibility(clause, unit_kind=str(fields["unit_kind"]), source_type=source_type)
+                unit_visibility = "global" if base_visibility != "agent" and inferred == "global" else base_visibility
+                unit_workspace = "global" if unit_visibility == "global" else str(event_workspace or card_workspace)
+                if unit_visibility == "global":
+                    # A user-wide response/identity preference deserves the
+                    # same durable treatment whether it arrived through an
+                    # explicit `remember` call or the normal turn pipeline.
+                    fields["unit_kind"] = "profile"
+                    fields["predicate"] = "prefers"
+                    fields["subject_text"] = "user"
+                    fields["object_text"] = clause
+                    fields["durability"] = max(float(fields["durability"]), 0.90)
+                    confidence = max(confidence, 0.90)
                 unit = {"subject_id":str(sid),"claim_text":clause,"source_event_ids":[int(event_id)],"memory_kind":fields["unit_kind"],"predicate":fields["predicate"],"confidence":confidence,"uncertainty":clamp01(extracted.get("uncertainty"), .7 if UNCERTAIN.search(clause) else max(.05,1-float(classified["classification_confidence"]))),"importance":clamp01(extracted.get("importance"),float(classified["suggested_payload"]["importance"])),"durability":fields["durability"],"valid_from":fields["valid_from"],"valid_to":fields["valid_to"]}
                 validation = validate_unit(root,unit)
                 if not validation["valid"]: skipped.append({"raw_event_id":event_id,"reason":"validation","errors":validation["errors"]}); continue
                 if dry_run: created.append({"unit_id":None,"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]}); continue
                 key=sha256_text(f"{sid}:{event_id}:{clause_index}:{EXTRACTION_VERSION}:{sha256_text(clause)}")
-                cursor=conn.execute("""INSERT OR IGNORE INTO memory_units(unit_key,subject_id,subject_name,session_id,session_card_id,raw_event_id,source_event_ids,unit_kind,topic,content,content_hash,confidence,uncertainty,importance,sensitivity,source_type,status,domain,predicate,subject_text,object_text,qualifiers_json,valid_from,valid_to,observed_at,durability,entities_json,security_state,security_findings_json,clause_index,extraction_version,profile_id,workspace_id,visibility_scope,origin_agent_id,owner_agent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (key,sid,name,sess,cid,event_id,json.dumps([event_id]),fields["unit_kind"],fields["topic"],clause,sha256_text(clause),confidence,unit["uncertainty"],unit["importance"],sensitivity(clause),source_type,fields["domain"],fields["predicate"],fields["subject_text"],fields["object_text"],json.dumps(fields["qualifiers"],ensure_ascii=False),fields["valid_from"],fields["valid_to"],fields["observed_at"] or utc_now(),fields["durability"],json.dumps(fields["entities"],ensure_ascii=False),validation["security_state"],json.dumps(validation["security_findings"],ensure_ascii=False),clause_index,EXTRACTION_VERSION,event_profile or card_profile,event_workspace or card_workspace,event_visibility or visibility_scope,event_agent or origin_agent_id or card_agent or "",(event_agent or owner_agent_id) if (event_visibility or visibility_scope)=="agent" else None))
+                cursor=conn.execute("""INSERT OR IGNORE INTO memory_units(unit_key,subject_id,subject_name,session_id,session_card_id,raw_event_id,source_event_ids,unit_kind,topic,content,content_hash,confidence,uncertainty,importance,sensitivity,source_type,status,domain,predicate,subject_text,object_text,qualifiers_json,valid_from,valid_to,observed_at,durability,entities_json,security_state,security_findings_json,clause_index,extraction_version,profile_id,workspace_id,visibility_scope,origin_agent_id,owner_agent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (key,sid,name,sess,cid,event_id,json.dumps([event_id]),fields["unit_kind"],fields["topic"],clause,sha256_text(clause),confidence,unit["uncertainty"],unit["importance"],sensitivity(clause),source_type,fields["domain"],fields["predicate"],fields["subject_text"],fields["object_text"],json.dumps(fields["qualifiers"],ensure_ascii=False),fields["valid_from"],fields["valid_to"],fields["observed_at"] or utc_now(),fields["durability"],json.dumps(fields["entities"],ensure_ascii=False),validation["security_state"],json.dumps(validation["security_findings"],ensure_ascii=False),clause_index,EXTRACTION_VERSION,event_profile or card_profile,unit_workspace,unit_visibility,event_agent or origin_agent_id or card_agent or "",(event_agent or owner_agent_id) if unit_visibility=="agent" else None))
                 if cursor.rowcount: created.append({"unit_id":int(cursor.lastrowid),"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]})
         if not dry_run and max_seen > int(last_extracted or 0):
             remaining = conn.execute("SELECT EXISTS(SELECT 1 FROM raw_events WHERE session_card_id=? AND id>?)", (cid, max_seen)).fetchone()[0]

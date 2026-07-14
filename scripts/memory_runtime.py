@@ -28,8 +28,12 @@ def _retrieval_args(args: argparse.Namespace) -> argparse.Namespace:
         store=str(store_root(args.store)), query=None, query_file=None,
         top_k=args.top_k, candidate_pool=args.candidate_pool,
         expand_hops=args.expand_hops, session_id=args.session_id,
-        workspace_id=args.workspace_id, profile_id=args.profile_id, agent_id=args.agent_id, active_subject_id=[], valid_at=None, no_chunks=False,
-        include_embeddings=False, embedding_model="external", rrf_k=60,
+        workspace_id=args.workspace_id, profile_id=args.profile_id, agent_id=args.agent_id, active_subject_id=[], valid_at=None, no_chunks=bool(getattr(args, "no_chunks", False)),
+        include_embeddings=bool(getattr(args, "include_embeddings", False)), embedding_model="external", rrf_k=60,
+        include_dreams=bool(getattr(args, "include_dreams", True)),
+        # Imported files are source evidence, not prompt memories.  Only the
+        # explicit public search path opts into resource results.
+        include_resources=False,
         subject_id=args.subject_id, subject_name=args.subject_name,
         domain=[], memory_kind=[], include_candidates=args.include_candidates,
         no_basics=args.no_basics,
@@ -40,7 +44,7 @@ def _raw_search_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         store=str(store_root(args.store)), subject_id=args.subject_id,
         session_id=args.session_id, query=None, query_file=None, topic=[],
-        domain=[], source_type=[], processed_state=["organized"], since=None,
+        domain=[], source_type=[], exclude_source_type=["resource", "agent-observation", "tool-result"], processed_state=["organized"], since=None,
         until=None, limit=args.raw_limit, full_content=False, profile_id=args.profile_id,
         workspace_id=args.workspace_id, agent_id=args.agent_id,
     )
@@ -48,7 +52,10 @@ def _raw_search_args(args: argparse.Namespace) -> argparse.Namespace:
 
 def _auxiliary_context(*, sessions: dict[str, object] | None, procedures: list[dict[str, object]]) -> str:
     lines: list[str] = []
-    session_rows = list((sessions or {}).get("sessions", []))
+    session_rows = [
+        item for item in list((sessions or {}).get("sessions", []))
+        if str(item.get("source", "")).casefold() not in {"resource", "tool", "subagent", "agent-observation"}
+    ]
     if session_rows:
         lines.extend(["## Relevant Past Sessions"])
         for item in session_rows[:3]:
@@ -205,9 +212,9 @@ def parse_args() -> argparse.Namespace:
     session_flush = subparsers.add_parser("session-flush", help="Build a session card and queue restricted review")
     session_flush.add_argument("--store", help=DEFAULT_STORE_HELP); session_flush.add_argument("--subject-id", required=True); session_flush.add_argument("--session-id", default="")
     session_search = subparsers.add_parser("session-search", help="Discover original archived sessions")
-    session_search.add_argument("--store", help=DEFAULT_STORE_HELP); session_search.add_argument("--subject-id", required=True); session_search.add_argument("--profile-id", default="default"); session_search.add_argument("--workspace-id", default="default"); session_search.add_argument("--query", required=True)
+    session_search.add_argument("--store", help=DEFAULT_STORE_HELP); session_search.add_argument("--subject-id", required=True); session_search.add_argument("--profile-id", default="default"); session_search.add_argument("--workspace-id", default="default"); session_search.add_argument("--agent-id", default=""); session_search.add_argument("--query", required=True)
     session_scroll = subparsers.add_parser("session-scroll", help="Scroll original messages around an anchor")
-    session_scroll.add_argument("--store", help=DEFAULT_STORE_HELP); session_scroll.add_argument("--session-id", required=True); session_scroll.add_argument("--subject-id", required=True); session_scroll.add_argument("--profile-id", default="default"); session_scroll.add_argument("--workspace-id", default="default"); session_scroll.add_argument("--around-message-id", type=int, required=True); session_scroll.add_argument("--window", type=int, default=6)
+    session_scroll.add_argument("--store", help=DEFAULT_STORE_HELP); session_scroll.add_argument("--session-id", required=True); session_scroll.add_argument("--subject-id", required=True); session_scroll.add_argument("--profile-id", default="default"); session_scroll.add_argument("--workspace-id", default="default"); session_scroll.add_argument("--agent-id", default=""); session_scroll.add_argument("--around-message-id", type=int, required=True); session_scroll.add_argument("--window", type=int, default=6)
     extract = subparsers.add_parser("extract-units", help="Extract atomic units from session cards")
     extract.add_argument("--store", help=DEFAULT_STORE_HELP); extract.add_argument("--subject-id"); extract.add_argument("--limit", type=int, default=20)
     dream = subparsers.add_parser("dream", help="Run deferred extraction and semantic consolidation")
@@ -295,11 +302,17 @@ def run_json_script(script_name: str, *args: str) -> dict[str, object]:
 
 def format_memory_context(retrieved: dict[str, object], raw_evidence: dict[str, object] | None) -> str:
     evidence_rows = list((raw_evidence or {}).get("results", []))
+    evidence_rows = [item for item in evidence_rows if str(item.get("source_type", "")).casefold() != "resource"]
     positive_evidence = [item for item in evidence_rows if float(item.get("score", 0.0) or 0.0) > 0.0]
     if positive_evidence:
         evidence_rows = positive_evidence
 
-    selected = list(retrieved.get("selected", []))
+    selected = [
+        item
+        for item in list(retrieved.get("selected", []))
+        if str(item.get("memory_kind", "")).casefold() != "resource"
+        and str(item.get("prompt_eligible", "true")).strip().casefold() not in {"0", "false", "no", "off"}
+    ]
     relevant_selected = [item for item in selected if float(item.get("query_score", 0.0) or 0.0) > 0.0]
 
     lines = [
@@ -318,8 +331,10 @@ def format_memory_context(retrieved: dict[str, object], raw_evidence: dict[str, 
     else:
         for item in display_selected:
             summary = str(item.get("summary", "")).strip() or str(item.get("topic", "")).strip() or str(item.get("title", "")).strip()
+            verification = str(item.get("verification_state", "")).casefold().replace("-", "_")
+            provenance = " [Agent-observed]" if verification == "agent_observed" else ""
             lines.append(
-                f"- [{item.get('memory_kind', 'note')}] {item.get('title', '')} | {item.get('domain', '')} / {item.get('topic', '')} | {summary}"
+                f"- [{item.get('memory_kind', 'note')}] {item.get('title', '')}{provenance} | {item.get('domain', '')} / {item.get('topic', '')} | {summary}"
             )
 
     lines.extend(["", "## Raw Evidence"])
@@ -327,8 +342,14 @@ def format_memory_context(retrieved: dict[str, object], raw_evidence: dict[str, 
         lines.append("- No additional raw evidence was selected.")
     else:
         for item in evidence_rows:
+            source_type = str(item.get("source_type", "") or "")
+            observed = source_type.casefold() in {"agent-observation", "tool-result", "subagent"}
+            provenance = "Agent-observed" if observed else "Recorded evidence"
+            reference = str(item.get("source_ref", "") or "")
             lines.append(
-                f"- {item.get('effective_time', '')} | {item.get('domain_hint', '')} / {item.get('topic_hint', '')} | {item.get('snippet', '')}"
+                f"- {item.get('effective_time', '')} | {provenance} ({source_type or 'unknown'})"
+                f" | {item.get('domain_hint', '')} / {item.get('topic_hint', '')}"
+                f" | {reference if reference else 'no-ref'} | {item.get('snippet', '')}"
             )
 
     return "\n".join(lines).strip() + "\n"
@@ -418,18 +439,32 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     from session_search import discovery
     from procedural_learning import retrieve_procedures
     route = route_query(query)
-    internal_session_id = ensure_session(root, subject_id=args.subject_id, session_id=args.session_id, profile_id=args.profile_id, workspace_id=args.workspace_id, shared_mode=args.shared_mode)
+    depth = str(getattr(args, "search_depth", "auto") or "auto").casefold()
+    if depth not in {"light", "normal", "deep", "auto"}:
+        depth = "auto"
+    if depth == "light":
+        route.update(needs_deep_memory=True, needs_raw_evidence=False, needs_session_search=False, needs_procedure=False, needs_dream_digest=False)
+    elif depth == "normal":
+        route.update(needs_deep_memory=True, needs_raw_evidence=False, needs_session_search=False, needs_procedure=False)
+    elif depth == "deep":
+        route.update(needs_deep_memory=True, needs_raw_evidence=True, needs_session_search=True, needs_procedure=True, needs_dream_digest=True)
+    route["search_depth"] = depth
+    internal_session_id = ensure_session(root, subject_id=args.subject_id, session_id=args.session_id, profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id, shared_mode=args.shared_mode)
     hot_snapshot = freeze_hot_snapshot(root, internal_session_id=internal_session_id, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id, policy=args.hot_snapshot_policy)
     hot_context, hot_snapshot_hash = str(hot_snapshot["content"]), str(hot_snapshot["content_hash"])
-    retrieved = retrieve(_retrieval_args(args), query=query) if bool(route.get("needs_deep_memory", True)) else {"status": "ok", "selected": [], "query": query}
+    retrieval_args = _retrieval_args(args)
+    retrieval_args.no_chunks = bool(getattr(args, "no_chunks", False) or depth == "light")
+    retrieval_args.include_dreams = bool(route.get("needs_dream_digest", True))
+    retrieved = retrieve(retrieval_args, query=query) if bool(route.get("needs_deep_memory", True)) else {"status": "ok", "selected": [], "query": query}
 
     raw_evidence = None
-    if not args.skip_raw_evidence and args.raw_limit > 0:
+    if not args.skip_raw_evidence and args.raw_limit > 0 and bool(route.get("needs_raw_evidence")):
         raw_evidence = search_events(_raw_search_args(args), query=query)
 
     session_evidence = discovery(
         root, subject_id=args.subject_id, query=query, limit=3,
         workspace_id=args.workspace_id, profile_id=args.profile_id,
+        agent_id=args.agent_id, exclude_session_id=args.session_id,
     ) if route.get("needs_session_search") else None
     procedures = retrieve_procedures(root, subject_id=args.subject_id, query=query, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id) if route.get("needs_procedure") else []
 
@@ -587,12 +622,41 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
     subject_id = str(payload.get("subject_id", args.subject_id))
     subject_name = str(payload.get("subject_name", args.subject_name))
 
+    source_kind = str(getattr(args, "source_kind", "user") or "user").casefold()
+    source_types = {
+        "user": "explicit-memory",
+        "agent-observation": "agent-observation",
+        "tool-result": "tool-result",
+        "resource": "resource",
+    }
+    if source_kind not in source_types:
+        raise ValueError("source_kind must be user, agent-observation, tool-result, or resource.")
+    if source_kind == "agent-observation" and not str(args.source_ref or "").strip():
+        raise ValueError("Agent observations require --source-ref evidence such as a commit, file, or command result.")
+    if source_kind in {"agent-observation", "tool-result", "resource"} and (
+        str(args.visibility_scope or "").casefold() != "workspace"
+        or str(args.workspace_id or "").casefold() == "global"
+    ):
+        raise ValueError("Agent observations, tool results, and resources must use a project workspace scope.")
+
+    # A deliberate remember is new evidence even when the wording repeats.
+    # In contrast, a tool host call and a resource file have natural stable
+    # identities, so retrying their ingestion must remain idempotent.
+    if source_kind == "user":
+        event_key = f"remember:{uuid.uuid4()}"
+    elif source_kind == "tool-result":
+        event_key = f"tool:{str(args.source_ref or '').strip() or uuid.uuid4()}"
+    elif source_kind == "resource":
+        event_key = f"resource:{str(args.source_ref or '').strip() or sha256_text(content)}"
+    else:
+        event_key = f"agent-observation:{str(args.source_ref or '').strip()}"
+
     raw_record = insert_raw_event(
         root,
         subject_id=subject_id,
         subject_name=subject_name,
         session_id=args.session_id,
-        source_type="explicit-memory",
+        source_type=source_types[source_kind],
         source_ref=args.source_ref,
         topic_hint=args.topic_hint or args.topic or "",
         domain_hint=args.domain_hint or args.domain or "",
@@ -603,6 +667,8 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         workspace_id=args.workspace_id,
         origin_agent_id=args.agent_id,
         visibility_scope=args.visibility_scope,
+        event_uid=event_key,
+        idempotency_key=event_key,
         shared_mode=args.shared_mode,
     )
     if not raw_record.get("inserted"):
@@ -611,7 +677,11 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
     classification = classify(title, content, subject_id, subject_name)
     recommended = str(classification["recommended_kind"])
     kind = args.force_kind or (str(classification["underlying_long_term_kind"]) if args.use_underlying_kind or recommended in {"candidate", "session"} else recommended)
-    confidence = max(float(classification["suggested_payload"]["confidence"]), 0.95)
+    # Tool-backed observations describe project state/work, never a user's
+    # personal profile even when a short sentence confuses the classifier.
+    if source_kind in {"agent-observation", "tool-result"} and kind == "profile":
+        kind = "state"
+    confidence = 0.80 if source_kind in {"agent-observation", "tool-result"} else max(float(classification["suggested_payload"]["confidence"]), 0.95)
     # Explicit remember uses the same semantic consolidation path as the
     # background pipeline. Hash equality is only the first fast-path; same
     # predicate/object and state changes are handled as corroborate/refine/
@@ -628,11 +698,14 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
         "valid_from": args.start_at or args.event_time or "", "valid_to": args.end_at or "", "observed_at": "", "entities": [],
         "profile_id": args.profile_id, "workspace_id": args.workspace_id, "origin_agent_id": args.agent_id,
         "visibility_scope": args.visibility_scope, "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else "",
+        "source_type": source_types[source_kind],
     }
     action = build_plan_for_unit(root, unit, policy="balanced")
-    action.update({"subject_name": subject_name, "title": title, "origin": "explicit_remember", "profile_id": args.profile_id, "workspace_id": args.workspace_id, "origin_agent_id": args.agent_id, "visibility_scope": args.visibility_scope, "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else ""})
+    action.update({"subject_name": subject_name, "title": title, "origin": "explicit_remember", "profile_id": args.profile_id, "workspace_id": args.workspace_id, "origin_agent_id": args.agent_id, "visibility_scope": args.visibility_scope, "owner_agent_id": args.agent_id if args.visibility_scope == "agent" else "", "source_type": source_types[source_kind], "source_kind": source_kind, "explicit_user_action": source_kind == "user", "prompt_eligible": source_kind != "resource"})
     if action["action"] == "CREATE":
-        action.update({"memory_kind": kind, "verification_state": "verified" if kind not in {"candidate", "session"} else "unverified"})
+        verification = "agent_observed" if source_kind in {"agent-observation", "tool-result"} else "resource" if source_kind == "resource" else "verified" if kind not in {"candidate", "session"} else "unverified"
+        final_kind = "state" if source_kind in {"agent-observation", "tool-result"} and kind in {"profile", "candidate", "session"} else kind
+        action.update({"memory_kind": final_kind, "verification_state": verification})
     from apply_memory_plan import apply_plan
 
     applied = apply_plan(root, {"schema_version": 2, "subject_id": subject_id, "policy": "balanced", "actions": [action]}, skip_index=args.skip_index)
@@ -785,10 +858,10 @@ def main() -> None:
         return
     if args.command == "session-search":
         from session_search import discovery
-        emit(discovery(root, subject_id=args.subject_id, query=args.query, profile_id=args.profile_id, workspace_id=args.workspace_id)); return
+        emit(discovery(root, subject_id=args.subject_id, query=args.query, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id)); return
     if args.command == "session-scroll":
         from session_search import scroll
-        emit(scroll(root, session_id=args.session_id, around_message_id=args.around_message_id, window=args.window, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id)); return
+        emit(scroll(root, session_id=args.session_id, around_message_id=args.around_message_id, window=args.window, subject_id=args.subject_id, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id)); return
     if args.command == "extract-units":
         from extract_memory_units import extract_units
         emit(extract_units(root, subject_id=args.subject_id, limit=args.limit)); return

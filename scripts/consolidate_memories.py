@@ -104,9 +104,37 @@ def _sources(conn, claim_id: str) -> list[int]:
     return [int(row[0]) for row in conn.execute("SELECT raw_event_id FROM claim_sources WHERE claim_id=? ORDER BY raw_event_id", (claim_id,))]
 
 
+def _normal_text(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _safe_refinement(unit: dict[str, object], target: dict[str, object], relation: str) -> bool:
+    """Allow automatic REFINE only for a strictly additive qualifier update.
+
+    A relation classifier can be helpful but is not authoritative enough to
+    rewrite a user memory.  The old structured fact must stay identical and
+    its text/qualifiers must be retained verbatim inside the new observation.
+    """
+    if relation not in {"NARROWS", "ADDS_QUALIFIER"}:
+        return False
+    if any(
+        _normal_text(unit.get(key)) != _normal_text(target.get(key))
+        for key in ("predicate", "subject_text", "object_text")
+    ):
+        return False
+    old_content, new_content = _normal_text(target.get("content")), _normal_text(unit.get("content"))
+    if not old_content or old_content not in new_content:
+        return False
+    old_qualifiers = target.get("qualifiers") if isinstance(target.get("qualifiers"), dict) else {}
+    new_qualifiers = unit.get("qualifiers") if isinstance(unit.get("qualifiers"), dict) else {}
+    return all(key in new_qualifiers and new_qualifiers[key] == value for key, value in old_qualifiers.items())
+
+
 def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> dict[str, object]:
     conn = open_db(root)
     profile, workspace = str(unit.get("profile_id") or "default"), str(unit.get("workspace_id") or "global")
+    source_type = str(unit.get("source_type") or "").casefold()
+    tool_backed = source_type in {"agent-observation", "tool-result"}
     # API callers predating RuntimeIdentity did not carry a scope; retain
     # their historical profile-wide behavior. Runtime/extractor callers now
     # always supply an explicit workspace or agent visibility.
@@ -114,9 +142,49 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
     exact_scope = "profile_id=? AND workspace_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=?"
     exact = conn.execute(f"SELECT id, title, memory_kind FROM claims WHERE subject_id=? AND content_hash=? AND status NOT IN ('superseded', 'corrected') AND {exact_scope}", (unit["subject_id"], unit["content_hash"], profile, workspace, visibility, owner)).fetchone()
     base = {"plan_id": str(uuid.uuid4()), "subject_id": unit["subject_id"], "subject_name": str(unit.get("subject_name") or "Unknown"), "unit_id": unit["id"], "source_event_ids": list(unit["source_event_ids"]), "topic": unit["topic"], "domain": unit["domain"], "confidence": round(float(unit["confidence"]), 3), "uncertainty": round(float(unit["uncertainty"]), 3), "importance": round(float(unit["importance"]), 3), "durability": round(float(unit["durability"]), 3), "sensitivity": unit["sensitivity"], "predicate": unit["predicate"], "subject_text": unit["subject_text"], "object_text": unit["object_text"], "qualifiers": unit["qualifiers"], "valid_from": unit["valid_from"], "valid_to": unit["valid_to"], "observed_at": unit["observed_at"], "entities": unit["entities"], "profile_id": profile, "workspace_id": workspace, "visibility_scope": visibility, "owner_agent_id": owner, "origin_agent_id": str(unit.get("origin_agent_id") or "")}
+    if source_type == "resource":
+        # Imported material is useful as a reviewable project lead, but it is
+        # never direct user testimony.  Do not consolidate it into, or
+        # corroborate it against, an active factual Claim.
+        conn.close()
+        return {
+            **base,
+            "action": "CREATE",
+            "relation": "RESOURCE_EVIDENCE",
+            "memory_kind": "candidate",
+            "verification_state": "resource",
+            "title": str(unit["topic"]),
+            "content": str(unit["content"]),
+            "prompt_eligible": False,
+            "resource_candidate": True,
+        }
+    if tool_backed and exact:
+        conn.close()
+        if str(exact[2]) == "profile":
+            return {**base, "action": "IGNORE", "relation": "PROFILE_PROTECTED", "memory_kind": "profile", "title": str(exact[1]), "content": "", "requires_review": True}
+        return {**base, "action": "CORROBORATE", "relation": "EXACT_SAME", "target_claim_id": str(exact[0]), "memory_kind": str(exact[2]), "title": str(exact[1]), "content": "", "verification_state": "agent_observed"}
     if exact:
         conn.close()
         return {**base, "action": "CORROBORATE", "relation": "EXACT_SAME", "target_claim_id": str(exact[0]), "memory_kind": str(exact[2]), "title": str(exact[1]), "content": ""}
+    if tool_backed:
+        # Evidence from a successful tool or another Agent can be shared as a
+        # project observation, but it must never infer a semantic mutation of
+        # an existing Claim.  A separately traceable state Claim is safer than
+        # letting an LLM relation rewrite user-authored content.
+        conn.close()
+        kind = str(unit.get("unit_kind") or "state")
+        if kind in {"profile", "candidate", "session"}:
+            kind = "state"
+        return {
+            **base,
+            "action": "CREATE",
+            "relation": "AGENT_OBSERVATION",
+            "memory_kind": kind,
+            "verification_state": "agent_observed",
+            "title": str(unit["topic"]),
+            "content": str(unit["content"]),
+            "prompt_eligible": True,
+        }
     candidate_rows = conn.execute(
         """SELECT id, memory_kind, title, content, content_hash, predicate, subject_text, object_text, status, qualifiers_json, valid_from, observed_at
            FROM claims WHERE subject_id=? AND status='active' AND security_state!='blocked' AND """ + exact_scope + " ORDER BY importance DESC LIMIT 20",
@@ -145,8 +213,14 @@ def build_plan_for_unit(root: Path, unit: dict[str, object], *, policy: str) -> 
         conn = open_db(root)
         combined_sources = list(dict.fromkeys(_sources(conn, target["id"]) + list(unit["source_event_ids"])))
         conn.close()
-        return {**base, "action": action, "relation": relation, "target_claim_id": target["id"], "source_event_ids": combined_sources, "memory_kind": unit["unit_kind"], "verification_state": "verified", "title": unit["topic"], "content": unit["content"], "requires_review": True}
+        return {**base, "action": action, "relation": relation, "target_claim_id": target["id"], "source_event_ids": combined_sources, "memory_kind": unit["unit_kind"], "verification_state": "agent_observed" if tool_backed else "verified", "title": unit["topic"], "content": unit["content"], "requires_review": True, "refine_safe": _safe_refinement(unit, target, relation) if action == "REFINE" else False}
     kind, verification = choose_kind(str(unit["unit_kind"]), float(unit["confidence"]), str(unit["sensitivity"]), policy)
+    if tool_backed:
+        # A successful tool call is useful project evidence, not a statement
+        # about the user's personal profile.  It stays reviewable through the
+        # policy gate and carries its distinct provenance when promoted.
+        kind = "state" if kind == "profile" else kind
+        verification = "agent_observed"
     result = {**base, "action": "CREATE", "relation": relation, "memory_kind": kind, "verification_state": verification, "title": str(unit["topic"]), "content": str(unit["content"])}
     if relation == "CONTRADICTS_UNRESOLVED":
         result["requires_review"] = True
@@ -168,13 +242,13 @@ def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", lim
         scope += " AND workspace_id=?"; scope_params.append(workspace_id)
     rows = conn.execute(
         """SELECT id, subject_name, unit_kind, domain, topic, content, content_hash, confidence, uncertainty, importance, durability,
-                  sensitivity, source_event_ids, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json,
+                  sensitivity, source_event_ids, source_type, predicate, subject_text, object_text, qualifiers_json, valid_from, valid_to, observed_at, entities_json,
                   profile_id, workspace_id, visibility_scope, origin_agent_id, owner_agent_id
            FROM memory_units WHERE subject_id=? AND status='pending' AND security_state!='blocked'""" + scope + " ORDER BY id LIMIT ?",
         (subject_id, *scope_params, max(1, limit)),
     ).fetchall()
     conn.close()
-    keys = ["id", "subject_name", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json", "profile_id", "workspace_id", "visibility_scope", "origin_agent_id", "owner_agent_id"]
+    keys = ["id", "subject_name", "unit_kind", "domain", "topic", "content", "content_hash", "confidence", "uncertainty", "importance", "durability", "sensitivity", "source_event_ids", "source_type", "predicate", "subject_text", "object_text", "qualifiers_json", "valid_from", "valid_to", "observed_at", "entities_json", "profile_id", "workspace_id", "visibility_scope", "origin_agent_id", "owner_agent_id"]
     actions: list[dict[str, object]] = []
     for row in rows:
         unit = dict(zip(keys, row))
@@ -183,6 +257,7 @@ def build_plan(root: Path, subject_id: str, *, policy: str = "conservative", lim
         unit["qualifiers"] = json.loads(str(unit.pop("qualifiers_json") or "{}"))
         unit["entities"] = json.loads(str(unit.pop("entities_json") or "[]"))
         action = build_plan_for_unit(root, unit, policy=policy)
+        action["source_type"] = str(unit.get("source_type") or "")
         if origin_agent_id:
             action["origin_agent_id"] = origin_agent_id
         actions.append(action)

@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--domain", action="append", default=[], help="Domain hint filter; may be repeated")
     parser.add_argument("--source-type", action="append", default=[], help="Source type filter; may be repeated")
     parser.add_argument(
+        "--exclude-source-type",
+        action="append",
+        default=[],
+        help="Source type to omit; may be repeated",
+    )
+    parser.add_argument(
         "--processed-state",
         action="append",
         default=[],
@@ -148,6 +154,7 @@ def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict
     since = parse_db_time(args.since)
     until = parse_db_time(args.until)
     source_types = [item.casefold() for item in args.source_type]
+    excluded_source_types = [str(item).casefold() for item in getattr(args, "exclude_source_type", [])]
     processed_states = [item.casefold() for item in args.processed_state]
 
     root = store_root(args.store)
@@ -167,6 +174,10 @@ def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict
         placeholders = ", ".join("?" for _ in source_types)
         clauses.append(f"LOWER(r.source_type) IN ({placeholders})")
         params.extend(source_types)
+    if excluded_source_types:
+        placeholders = ", ".join("?" for _ in excluded_source_types)
+        clauses.append(f"LOWER(COALESCE(r.source_type, '')) NOT IN ({placeholders})")
+        params.extend(excluded_source_types)
     if processed_states:
         placeholders = ", ".join("?" for _ in processed_states)
         clauses.append(f"LOWER(r.processed_state) IN ({placeholders})")
@@ -290,6 +301,7 @@ def search_events(args: argparse.Namespace, *, query: str | None = None) -> dict
                 "topic": args.topic,
                 "domain": args.domain,
                 "source_type": args.source_type,
+                "exclude_source_type": excluded_source_types,
                 "processed_state": args.processed_state,
                 "since": args.since,
                 "until": args.until,

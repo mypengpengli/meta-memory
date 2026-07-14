@@ -72,10 +72,11 @@ meta-memory setup
 
 它会保存姓名、记忆库位置和是否启用定时整理/Dream。默认配置文件为 `~/.meta-memory/config.toml`，默认记忆库为 `~/.meta-memory/data`。
 
-第一次建议先不启用定时任务，确认流程正常后再开启。非交互式示例：
+`setup` 默认启用每 5 分钟的维护任务和每天一次 Dream；首次安装也可以先用
+`--no-schedule` 只初始化数据，确认后再安装平台定时任务。非交互式示例：
 
 ```bash
-meta-memory setup --name "Li Peng" --maintenance no --dream no --no-schedule --non-interactive
+meta-memory setup --name "Li Peng" --maintenance yes --dream yes --no-schedule --non-interactive
 meta-memory status
 meta-memory doctor
 ```
@@ -112,7 +113,7 @@ meta-memory search --project demo "SQLite"
 
 ### 接入 Agent
 
-先确认 Agent 所在的终端也能执行 `meta-memory --help`，然后安装对应 Skill：
+在安装 Meta Memory 的 Python 环境中执行以下命令来安装对应 Skill：
 
 ```bash
 meta-memory install-agent codex
@@ -120,7 +121,7 @@ meta-memory install-agent claude-code
 meta-memory install-agent openclaw
 ```
 
-一次写入三个预设位置：
+一次安装所有**已检测到**的预设 Agent：
 
 ```bash
 meta-memory install-agent all
@@ -138,33 +139,40 @@ meta-memory install-agent custom --skill-dir /path/to/agent/skills
 | Claude Code | `~/.claude/skills/meta-memory/SKILL.md` 和 `~/.claude/CLAUDE.md` |
 | OpenClaw | `~/.openclaw/skills/meta-memory/SKILL.md` 和 `~/.openclaw/AGENTS.md` |
 
-安装器只会写入 Skill 和一段宿主说明：它不会检测 Agent 是否已安装、不会安装 Hook，也不会替 Agent 配置 Python 路径。因此建议在安装后重启 Agent 会话，并在 Agent 实际使用的终端执行一次 `meta-memory --help`。
+安装器会为每个 Agent 写入 Skill、宿主说明和专用 Launcher。例如 Codex 的
+Launcher 位于 `~/.meta-memory/bin/meta-memory-codex`（Windows 为 `.cmd`），其中
+固定了当前 Python、配置路径和 `agent_id=codex`。`install-agent all` 不会猜测未
+安装的宿主；若需要某一个未检测到的 Agent，请显式执行它的安装命令。
 
-同一系统账户下的 Agent 默认读取同一个配置和记忆库。如需使用非默认配置，可让所有 Agent 使用同一个 `META_MEMORY_CONFIG` 环境变量或全局 `--config <path>` 参数。
+安装结果中的 `cli_visible`、`config_visible` 和 `memory_status` 应为可用状态。安装
+后重启 Agent 会话；也可直接运行安装结果给出的 Launcher 加 `status` 来核验。
+
+同一系统账户下的 Agent 默认读取同一个配置和记忆库。专用 Launcher 会固定安装时的配置路径；如需使用非默认配置，请先通过同一个 `META_MEMORY_CONFIG` 环境变量，或 `meta-memory --config <path> install-agent <agent>`，为每个 Agent 安装/重装 Launcher，然后使用新生成的 Launcher。
 
 ### 集成者：每轮真实调用顺序
 
-对自己实现的 Agent，使用下面的生命周期。`session` 必须在同一段对话中保持稳定。
+对自己实现的 Agent，使用下面的生命周期。默认 `--session auto` 会优先采用宿主
+会话 ID，其次复用终端/父进程派生的本地会话；通常不需要手写会话 ID。
 
 ```bash
-# 回答前：只把 JSON 里的 hot_context 和 context 当作可参考记忆
+# 回答前：用户请求先原子落盘，再返回 turn_id、hot_context 和 context
 meta-memory before \
   --project auto \
-  --session conversation-20260714-001 \
+  --session auto \
   --query-file request.txt
 
-# 正常生成回答后：保存双方原话，并把整理工作放入队列
-meta-memory after \
-  --project auto \
-  --session conversation-20260714-001 \
-  --user-file request.txt \
-  --assistant-file response.txt
+# 生成完整回答草稿并写入 response.txt；发送给用户前保存同一份草稿
+meta-memory after --turn <before 返回的 turn_id> --assistant-file response.txt
 
 # 未启用定时任务时，手动处理排队的整理工作
 meta-memory maintain
 ```
 
-`before` 不会记录用户问题；它返回有边界的 `hot_context` 和 `context`。`after` 只快速保存原始事件并入队，不会在用户等待时进行大型整理。若没有启用定时任务，必须由你手动运行 `maintain`。
+`before` 已经保存用户原话，因此 Agent 即使中断，用户请求也不会丢失。`after`
+只快速保存 Assistant 草稿并入队，不会在用户等待时进行大型整理；相同 `turn_id`
+和相同草稿可以安全重试。若 `after` 遇到暂时的 SQLite/文件错误，运行时会写入
+本地 Spool，下一次 `maintain` 会自动重放。旧的 `after --session --user-file`
+参数暂时兼容，但会返回 `legacy_after_arguments` 警告。
 
 ---
 
@@ -178,7 +186,17 @@ meta-memory maintain
 | 项目 | 某件事的状态、技术决策和历史方案 | `meta-memory`、`company-ai` |
 | 会话 | 一段连续对话或任务的原始记录 | `codex:2026-07-14:001` |
 
-`--project auto` 时，Meta Memory 先以当前 Git 根目录（没有 Git 时为当前目录）作为工作区；如果该目录已经绑定项目名，就使用绑定；否则使用目录名，最后才回退到默认项目。
+`--project auto` 时，Meta Memory 先以当前 Git 根目录（没有 Git 时为当前目录）作为工作区；如果该目录已经绑定项目名，就使用绑定。未绑定 Git 项目会优先使用 `origin` 远端地址生成稳定标识，普通克隆到新电脑后仍可找回同一项目；没有远端时使用“目录名 + 本机路径指纹”以避免两个同名目录串记忆。
+
+自动会话默认 8 小时无活动后轮换。需要排查或主动切换时再使用：
+
+```bash
+meta-memory session current --project auto
+meta-memory session new --project auto
+meta-memory session close --project auto
+```
+
+若宿主设置了 `META_MEMORY_HOST_SESSION_ID`（或你显式传入非 `auto` 的 `--session`），它是权威会话 ID；`session new` 不会替宿主改写它，只会轮换终端/父进程派生的本地自动会话。
 
 在项目根目录中绑定名称：
 
@@ -193,7 +211,7 @@ meta-memory search --project auto "SQLite"
 meta-memory search --cwd "D:\work\meta-memory" --project auto "SQLite"
 ```
 
-`search`、`history` 和 `before` 的输出都会带回实际解析到的 `project` 与 `project_root`，可用于核对当前作用域。
+`search`、`history` 和 `before` 的输出都会带回实际解析到的 `project`；`before` 还会返回 `project_root`，可用于核对当前作用域。
 
 ---
 
@@ -205,25 +223,27 @@ meta-memory search --cwd "D:\work\meta-memory" --project auto "SQLite"
 | 做健康检查 | `meta-memory doctor` | 迁移、FTS、阻塞 Claim 等检查 |
 | 让对话入队后立即整理 | `meta-memory maintain --max-jobs 20` | 处理原始事件、候选和投影 |
 | 显式保存一条记忆 | `meta-memory remember --project auto --content "…"` | 带来源立即写入并更新投影 |
-| 搜索结构化记忆 | `meta-memory search --project auto "关键词"` | 返回 Claim 结果及 ID |
+| 搜索记忆与来源证据 | `meta-memory search --project auto "关键词"` | 返回 Claim、Dream 或资源证据；只有 `page_role: claim` 的 ID 可用于纠正 |
 | 搜索历史原话 | `meta-memory history --project auto "关键词"` | 返回会话中的历史消息 |
 | 生成近期 Dream 报告 | `meta-memory dream --scan-days 7` | JSON 的 `report` 给出报告文件路径 |
 | 导入已有资料 | `meta-memory import notes.md --project auto` | 保存原始资料证据和资源卡 |
 | 备份本地记忆库 | `meta-memory backup` | 生成一致性 `.zip` 备份 |
+| 安装或检查定时任务 | `meta-memory schedule install` / `meta-memory schedule status` | 安装或显示当前平台的维护/Dream 任务 |
 
 ### 导入已有笔记、资料或导出文件
 
 `import` 支持 `.md`、`.txt`、`.json`、`.jsonl`、`.csv`、`.yaml`、`.yml`、`.html` 和 `.htm`：
 
 ```bash
-meta-memory import ./notes/architecture.md --project meta-memory --session import-001
+meta-memory import ./notes/architecture.md --project meta-memory
 ```
 
 导入内容被保存为**可追溯的来源证据**，不是自动写成“用户事实”。当前公开 CLI 不会因为导入文件就自动把它提升为长期记忆；这是为了避免把文档里的旧结论或第三方内容误认为你的偏好和当前项目状态。
+每个文件会使用由内容 Hash 派生的 `resource:<hash>` 合成会话，因此相同文件重试不会重复导入。
 
 ### 查看和纠正错误记忆
 
-先搜索并复制结果中的 Claim ID：
+先搜索并复制结果中 `page_role` 为 `claim` 的 Claim ID；`resource:<...>` 是来源证据，不能直接作为 `correct --memory` 的参数：
 
 ```bash
 meta-memory search --project meta-memory "SQLite"
@@ -232,13 +252,16 @@ meta-memory correct \
   --content "项目现在已迁移到 PostgreSQL，SQLite 是过去的方案。"
 ```
 
-`correct` 会保存替换证据并创建待审查的纠正提案，**不会无痕覆盖旧 Claim**。这是有意的安全边界：历史来源仍可追溯。当前公开 CLI 还没有提案的列表/批准界面，因此请保留命令返回的 proposal 信息，并把纠正内容写完整、可验证。
+`correct` 会立刻保存替换证据并让新 Claim 可检索；旧 Claim 会标为 `corrected`
+或 `superseded`，而不是被无痕覆盖。命令返回的 `new_claim_id` 可以用于核对下
+一次检索结果。
 
 ---
 
 ## 自动整理与 Dream
 
-自动整理和 Dream 默认均为关闭状态；只有在 `setup` 中明确选择后才会创建平台定时任务。
+自动整理和 Dream 默认均为启用状态；`setup` 会按配置安装平台定时任务，也可稍后
+手动执行 `meta-memory schedule install`。
 
 - Windows：Task Scheduler；
 - macOS：LaunchAgents；
@@ -252,6 +275,11 @@ meta-memory dream --scan-days 7
 ```
 
 自动整理会把原始对话组织为会话卡、原子记忆、候选、Claim 和检索投影。Dream 只生成带来源的推断报告，例如重复主题、项目摘要和未解决问题；它不会删除原始证据，也不会把推断直接伪装成确定事实。
+
+`memory_mode` 位于配置的 `[behavior]` 区段，可取 `manual`、`conservative` 或
+`automatic`（默认）。显式 `remember` 和 `correct` 同步生效；自动模式只会提升有
+用户来源、已验证、低风险的内容。Assistant 推断、Agent 观察和导入资料保留来源及
+范围，不会伪装成用户偏好。
 
 ---
 
@@ -288,7 +316,7 @@ meta-memory backup
 meta-memory backup --output "$HOME/meta-memory-backup.zip"
 ```
 
-备份格式是 `.zip`。它只包含**记忆库 store**，不包含外层的 `~/.meta-memory/config.toml`，因此也不包含目录到项目的绑定。迁移设备前，请单独保存配置文件；恢复后确认其 `[storage]` 路径指向恢复目录。
+当前可移植备份格式是 `.zip`，其中包含 `manifest.json`、`checksums.sha256`、`config.toml` 和完整 `store/`。SQLite 会通过一致性快照写入，WAL/SHM 等临时文件不会被打包。旧版仅含 `store/` 的归档仍可用于兼容恢复，但不会携带本机配置映射。
 
 恢复到一个空目录：
 
@@ -297,11 +325,12 @@ meta-memory restore "$HOME/meta-memory-backup.zip" \
   --destination "$HOME/.meta-memory-restored"
 ```
 
-只有在确认目标内容可以被替换时才使用 `--force`。恢复后可以用 `setup --store <恢复目录>` 更新本机配置，再运行：
+恢复会先校验 Manifest、校验和与 SQLite 完整性，再把归档中的配置写到当前配置位置，并将 `[storage].path` 更新为恢复目标。只有在确认目标内容可以被替换时才使用 `--force`。恢复后运行：
 
 ```bash
 meta-memory doctor
 meta-memory status
+meta-memory schedule install  # 需要恢复本机定时任务时
 ```
 
 升级源码版本前先备份，然后：
@@ -324,7 +353,7 @@ meta-memory doctor
 | `after` 后搜索不到内容 | 执行 `meta-memory maintain`，再用 `meta-memory status` 查看是否还有待处理任务 |
 | 搜索结果为空 | 用具体关键词；确认 `--project` / `--cwd` 是否指向同一项目；运行 `meta-memory doctor` |
 | 新空库的 `doctor` 显示 `fts_available: false` | 只要整体 `status` 为 `ok`，这通常表示还没有可索引内容；先写入一条记忆并运行 `maintain`，再检查 |
-| Agent 没有自动读取或写入 | 确认 Agent 实际终端能找到 `meta-memory`，检查对应 `SKILL.md`，然后重启会话 |
+| Agent 没有自动读取或写入 | 在安装 Meta Memory 的环境中重新执行 `install-agent <agent>`；确认返回的专用 Launcher 可运行 `status`，检查对应 `SKILL.md`，然后重启会话 |
 | 定时任务失败 | 先手动运行 `meta-memory maintain`；本机权限或调度器问题不会阻止手动使用 |
 | 恢复被拒绝 | `restore` 只能写入空目录；确认安全后才使用 `--force` |
 | 旧版 Windows 控制台中文乱码或编码报错 | 发生 Unicode 编码错误时 CLI 会回退为合法的 ASCII 转义 JSON；切换到 UTF-8 终端可获得更易读的中文输出 |
@@ -379,7 +408,7 @@ Meta Memory 把“所有历史”与“可安全复用的记忆”分开：
 
 ### 多 Agent 共享与边界
 
-多个 Agent 可以共享同一用户的偏好、项目决策、历史方案和会话记录。它不能保证某个宿主 Agent 一定遵循 Skill，也不能保证 LLM 的抽取或 Dream 推断永远正确。
+多个 Agent 可以共享同一用户的偏好、项目决策和结构化项目记忆。原始会话与 `history` 结果会按来源 Agent 隔离：即使宿主复用了同一个会话 ID，也不会把另一个 Agent 的对话原文注入当前上下文。带 `Agent-observed` 标记的项目记忆来自可追溯的工具/Agent 证据，不等同于用户事实。它不能保证某个宿主 Agent 一定遵循 Skill，也不能保证 LLM 的抽取或 Dream 推断永远正确。
 
 SQLite 模式适合一台中心设备、个人或小团队的适量并发写入；不适合多台机器直接同时写同一文件、数百个并发写入 Agent 或多租户 SaaS。
 
@@ -424,7 +453,7 @@ meta-memory status
 meta-memory doctor
 ```
 
-The default configuration is `~/.meta-memory/config.toml` and the default store is `~/.meta-memory/data`. Maintenance and Dream schedules are opt-in during setup.
+The default configuration is `~/.meta-memory/config.toml` and the default store is `~/.meta-memory/data`. Maintenance and Dream are enabled by default; use `--no-schedule` during setup if you want to verify the local data flow before installing platform tasks.
 
 Verify a complete write/read path:
 
@@ -437,7 +466,7 @@ Commands return JSON. Prefer distinctive search terms such as project names, `SQ
 
 ## Connect an agent
 
-Make sure the agent's own terminal can execute `meta-memory --help`, then install its Skill:
+From the Python environment where Meta Memory is installed, install the Agent Skill:
 
 ```bash
 meta-memory install-agent codex
@@ -452,9 +481,9 @@ For a custom agent:
 meta-memory install-agent custom --skill-dir /path/to/agent/skills
 ```
 
-The installer writes a `SKILL.md` and a small host-instruction block. It does not detect installed agents, install hooks, or fix PATH settings, so restart the agent session afterwards and verify the command in its real execution environment.
+The installer writes a `SKILL.md`, a small host-instruction block, and an Agent-specific launcher that pins the Python executable, config path, and agent id. `install-agent all` installs only detected built-in hosts; explicitly name a host to install it even when detection is unavailable. Check `cli_visible`, `config_visible`, and `memory_status` in the JSON result, then restart the Agent session.
 
-Agents using the same system account share the default configuration and store. To use a non-default configuration, point every agent to the same `META_MEMORY_CONFIG` path (or pass `--config <path>` before the subcommand).
+Agents using the same system account share the default configuration and store. An Agent launcher pins the config path used when it was installed. For a non-default configuration, use the same `META_MEMORY_CONFIG` value (or `meta-memory --config <path> install-agent <agent>`) to install or reinstall every Agent launcher, then use those regenerated launchers.
 
 ## Everyday operations
 
@@ -470,19 +499,20 @@ Agents using the same system account share the default configuration and store. 
 | Import source evidence | `meta-memory import notes.md --project auto` |
 | Create a consistent backup | `meta-memory backup` |
 
-For a custom integration, use the real turn lifecycle:
+For a custom integration, use the real turn lifecycle. `before` durably records the user request before retrieval, so use its returned `turn_id` and save the completed answer before sending that exact draft to the user:
 
 ```bash
-meta-memory before --project auto --session stable-session-id --query-file request.txt
+meta-memory before --project auto --session auto --query-file request.txt
 # Use only hot_context and context from the JSON response as memory context.
-meta-memory after --project auto --session stable-session-id \
-  --user-file request.txt --assistant-file response.txt
+meta-memory after --turn <turn-id> --assistant-file response.txt
 meta-memory maintain
 ```
 
-`after` records the two messages and queues work; it does not perform heavy consolidation inline. Run `maintain` manually when scheduling is disabled.
+`after` records the assistant reply and queues work; it does not perform heavy consolidation inline. Repeating the same turn id and reply is safe. Temporary completion failures are spooled and replayed by `maintain`. The old `after --session --user-file` form remains as a warned compatibility path.
 
-`--project auto` uses the Git root (or current directory), a saved directory binding, then the directory name. Bind a directory with:
+Agents share user preferences and structured project memory, but archived transcript/history results are isolated by originating Agent—even when a host reuses the same session id. Tool-backed project evidence is shown as `Agent-observed`; it is traceable operational evidence, not a user statement.
+
+`--project auto` uses the Git root (or current directory), then a saved directory binding. Unbound Git repositories use a stable `origin` remote fingerprint, so a normal clone can recall the same project after a portable restore even when its checkout directory has a different name. Other directories use a basename plus path fingerprint to avoid same-name collisions. Bind a directory with:
 
 ```bash
 meta-memory project set my-project
@@ -494,13 +524,13 @@ Use `--cwd /path/to/project` when executing from another directory.
 
 `import` accepts Markdown, text, JSON/JSONL, CSV, YAML, and HTML files. Imported material remains source evidence; it is not automatically promoted to a user fact.
 
-To correct a retrieved Claim, copy its `id` from `search`:
+To correct a retrieved Claim, copy the `id` only from a result whose `page_role` is `claim`. `resource:<...>` and `dream:<...>` results are evidence/digests, not correctable Claims:
 
 ```bash
 meta-memory correct --memory <claim-id> --content "The project now uses PostgreSQL; SQLite was historical."
 ```
 
-This records correction evidence and stages a review proposal. It deliberately does not overwrite the old Claim in place. The public CLI does not yet provide proposal list/approval commands, so retain the returned proposal details.
+This records correction evidence, makes the replacement Claim readable immediately, and preserves the old Claim as corrected or superseded rather than overwriting it in place. Keep the returned `new_claim_id` for auditing.
 
 Dream is an auditable inferred report, not a fact overwrite. Run `meta-memory dream` and open the path in its `report` field.
 
@@ -513,7 +543,7 @@ meta-memory backup --output "$HOME/meta-memory-backup.zip"
 meta-memory restore "$HOME/meta-memory-backup.zip" --destination "$HOME/.meta-memory-restored"
 ```
 
-Backups are ZIP files and include the store only. Save `~/.meta-memory/config.toml` separately if you need its configuration and directory-to-project bindings on another machine. Restore to an empty directory unless you have explicitly confirmed that `--force` is safe.
+Current portable backups are verified ZIP files containing `manifest.json`, `checksums.sha256`, `config.toml`, and the complete store. Restore validates the archive and SQLite snapshot, writes the archived configuration to the active config path, and repoints its storage path to `--destination`. Legacy store-only archives remain restorable for compatibility, but do not carry the configuration/project mapping. Restore to an empty directory unless you have explicitly confirmed that `--force` is safe; then run `meta-memory doctor`, `meta-memory status`, and `meta-memory schedule install` if this machine needs local schedules.
 
 Do not copy a live SQLite database/WAL directly or synchronize it through OneDrive, Dropbox, or iCloud. SQLite mode is designed for one central machine with moderate concurrent writes, not distributed multi-writer or multi-tenant deployments.
 

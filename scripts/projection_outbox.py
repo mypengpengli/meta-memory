@@ -73,6 +73,25 @@ def renew_lease(root: Path, item_id: int, worker_id: str, *, lease_seconds: int 
     conn.commit(); conn.close(); return bool(changed)
 
 
+def recover_stuck_outbox(root: Path, *, timeout_seconds: int = 600) -> int:
+    """Return expired running projections to the pending queue."""
+    now = utc_now()
+    conn = open_db(root)
+    try:
+        changed = conn.execute(
+            """
+            UPDATE projection_outbox
+            SET status='pending',lease_owner=NULL,leased_until=NULL,next_retry_at=?,last_error=COALESCE(last_error, 'lease_recovered')
+            WHERE status='running' AND (leased_until<? OR leased_until IS NULL)
+            """,
+            (now, now),
+        ).rowcount
+        conn.commit()
+        return int(changed)
+    finally:
+        conn.close()
+
+
 def _complete(root: Path, item_id: int, worker_id: str) -> None:
     conn = open_db(root)
     conn.execute("UPDATE projection_outbox SET status='completed', completed_at=?, last_error=NULL, lease_owner=NULL, leased_until=NULL WHERE id=? AND status='running' AND lease_owner=?", (utc_now(), item_id, worker_id))

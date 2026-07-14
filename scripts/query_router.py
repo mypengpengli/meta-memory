@@ -12,9 +12,11 @@ from _common import emit
 def route_query(query: str) -> dict[str, object]:
     text = (query or "").casefold()
     exact = re.findall(r"(?:[a-z]+[a-z0-9_.:/-]+|\b\d{3,}\b)", text)
-    result = {"query_type": "open_ended", "needs_hot_memory": False, "needs_deep_memory": True, "needs_session_search": False, "needs_historical_facts": False, "needs_procedure": False, "valid_at": None, "entity_hints": [], "exact_tokens": exact[:12]}
+    result = {"query_type": "open_ended", "needs_hot_memory": False, "needs_deep_memory": True, "needs_raw_evidence": False, "needs_session_search": False, "needs_historical_facts": False, "needs_procedure": False, "needs_dream_digest": True, "valid_at": None, "entity_hints": [], "exact_tokens": exact[:12]}
     if re.search(r"上次|之前.*(?:讨论|聊天)|we (?:last|previously) (?:discussed|said)", text):
         result.update(query_type="past_conversation", needs_session_search=True, needs_deep_memory=False)
+    elif re.search(r"证据|原话|来源|具体什么时候|原始记录|为什么这么记|evidence|source|verbatim|when did", text):
+        result.update(query_type="source_evidence", needs_raw_evidence=True, needs_session_search=True)
     elif re.search(r"去年|去年|历史|当时|previously|last year|at that time", text):
         result.update(query_type="historical_fact", needs_historical_facts=True)
     elif re.search(r"偏好|喜欢.*回答|prefer|preference", text):

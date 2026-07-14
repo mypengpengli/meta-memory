@@ -45,20 +45,21 @@ def _eligible_claims(root: Path, subject_id: str, *, profile_id: str, workspace_
     scope_sql, scope_params = visibility_sql(identity_from(profile_id=profile_id, workspace_id=workspace_id, agent_id=agent_id), alias="c")
     rows = conn.execute("""SELECT c.id, c.memory_kind, c.domain, c.topic, c.title, c.content, c.predicate,
         c.confidence, c.importance, c.sensitivity, c.valid_from, c.valid_to, c.durability, c.confirmed_utility,
-        (SELECT COUNT(*) FROM claim_sources cs WHERE cs.claim_id=c.id) FROM claims c
+        c.verification_state, (SELECT COUNT(*) FROM claim_sources cs WHERE cs.claim_id=c.id) FROM claims c
         WHERE c.subject_id=? AND """ + scope_sql + """ AND c.status='active' AND c.prompt_eligible=1 AND c.security_state IN ('clean','reviewed_safe')
           AND c.verification_state NOT IN ('unverified','disputed','invalid')
           AND (c.valid_from IS NULL OR c.valid_from='' OR c.valid_from<=?)
           AND (c.valid_to IS NULL OR c.valid_to='' OR c.valid_to>?) AND (c.replaced_by IS NULL OR c.replaced_by='')""", (subject_id, *scope_params, utc_now(), utc_now())).fetchall()
     conn.close()
-    keys = ["id","memory_kind","domain","topic","title","content","predicate","confidence","importance","sensitivity","valid_from","valid_to","durability","confirmed_utility","sources"]
+    keys = ["id","memory_kind","domain","topic","title","content","predicate","confidence","importance","sensitivity","valid_from","valid_to","durability","confirmed_utility","verification_state","sources"]
     return [dict(zip(keys, row)) for row in rows if int(row[-1] or 0)]
 
 
 def _render(title: str, items: list[dict[str, object]], budget: int) -> tuple[str, list[str]]:
     lines, ids = [f"# {title}", "", "Generated projection; edit claims, never this file."], []
     for item in items:
-        line = f"- {sanitize_for_context(str(item['content']).strip())}  <!-- claim:{item['id']} -->"
+        provenance = " [Agent-observed]" if str(item.get("verification_state") or "").strip().casefold().replace("-", "_") == "agent_observed" else ""
+        line = f"- {sanitize_for_context(str(item['content']).strip())}{provenance}  <!-- claim:{item['id']} -->"
         if len("\n".join(lines + [line])) + 1 > budget: continue
         lines.append(line); ids.append(str(item["id"]))
     if not ids: lines.append("- No eligible memory is currently available.")

@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from _common import DEFAULT_STORE_HELP, emit, open_db, store_root
+from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root
 from config import get
 from security_scan import scan_memory_content, security_state
 
@@ -42,6 +42,34 @@ def source_ids(action: dict[str, object]) -> list[int]:
     return list(dict.fromkeys(result))
 
 
+def _semantic_key(action: dict[str, object], subject_id: str) -> str:
+    visibility = str(action.get("visibility_scope") or "global")
+    parts: list[object] = [
+        str(action.get("profile_id") or "default"),
+        str(action.get("workspace_id") or "global"),
+        subject_id,
+        visibility,
+    ]
+    if visibility == "agent":
+        parts.append(str(action.get("owner_agent_id") or ""))
+    parts.extend(
+        [
+            str(action.get("predicate") or "states"),
+            str(action.get("subject_text") or "user"),
+            str(action.get("object_text") or str(action.get("content") or "")[:240]),
+            action.get("qualifiers") or {},
+        ]
+    )
+    return sha256_text(
+        json.dumps(
+            parts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
     conn = open_db(root)
     errors: list[dict[str, object]] = []
@@ -64,6 +92,7 @@ def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
         if not subject_id:
             errors.append({"index": index, "code": "subject", "message": "A subject_id is required."})
         ids = source_ids(action)
+        source_types: set[str] = set()
         if action_name != "IGNORE" and not ids:
             errors.append({"index": index, "code": "sources", "message": "Non-IGNORE actions require source_event_ids."})
         if ids:
@@ -73,8 +102,29 @@ def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
                 errors.append({"index": index, "code": "sources_missing", "message": "One or more source events do not exist."})
             if any(str(row[1]) != subject_id for row in found):
                 errors.append({"index": index, "code": "cross_subject_source", "message": "Sources must belong to the action subject."})
+            source_types = {str(row[2] or "").casefold() for row in found}
             if str(action.get("memory_kind", "")) == "profile" and all(str(row[2]) == "conversation-assistant" for row in found):
                 errors.append({"index": index, "code": "assistant_profile", "message": "Assistant-only evidence cannot modify a profile."})
+        tool_backed = str(action.get("source_type") or "").casefold() in {"agent-observation", "tool-result"} or bool(source_types & {"agent-observation", "tool-result"})
+        if tool_backed:
+            if str(action.get("memory_kind") or "").casefold() == "profile":
+                errors.append({"index": index, "code": "agent_profile", "message": "Agent or tool evidence cannot create or modify a user profile."})
+            if action_name in {"REFINE", "CORRECT", "SUPERSEDE"}:
+                errors.append({"index": index, "code": "agent_mutation", "message": "Agent or tool evidence cannot rewrite an existing claim."})
+            if action_name == "CREATE":
+                existing = conn.execute(
+                    "SELECT memory_kind FROM claims WHERE profile_id=? AND workspace_id=? AND subject_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=? AND semantic_key=? AND status='active'",
+                    (
+                        str(action.get("profile_id") or "default"),
+                        str(action.get("workspace_id") or "global"),
+                        subject_id,
+                        str(action.get("visibility_scope") or "global"),
+                        str(action.get("owner_agent_id") or "") if str(action.get("visibility_scope") or "global") == "agent" else "",
+                        _semantic_key(action, subject_id),
+                    ),
+                ).fetchone()
+                if existing and str(existing[0]) == "profile":
+                    errors.append({"index": index, "code": "agent_profile_collision", "message": "Agent or tool evidence cannot corroborate an existing user profile."})
         requested_path = str(action.get("target_path", ""))
         if requested_path:
             candidate = Path(requested_path).expanduser().resolve()
@@ -87,11 +137,27 @@ def validate_plan(root, plan: dict[str, object]) -> dict[str, object]:
             if not target_id:
                 errors.append({"index": index, "code": "target", "message": f"{action_name} requires target_claim_id."})
             else:
-                row = conn.execute("SELECT subject_id FROM claims WHERE id=?", (target_id,)).fetchone()
+                row = conn.execute("SELECT subject_id,memory_kind,profile_id,workspace_id,visibility_scope,owner_agent_id FROM claims WHERE id=?", (target_id,)).fetchone()
                 if row is None:
                     errors.append({"index": index, "code": "target_missing", "message": "Target claim does not exist."})
                 elif str(row[0]) != subject_id:
                     errors.append({"index": index, "code": "cross_subject_target", "message": "Target claim belongs to another subject."})
+                elif tool_backed and str(row[1]) == "profile":
+                    errors.append({"index": index, "code": "agent_profile_target", "message": "Agent or tool evidence cannot alter or corroborate a user profile."})
+                else:
+                    target_scope = (str(row[2]), str(row[3]), str(row[4]), str(row[5] or ""))
+                    action_scope = (
+                        str(action.get("profile_id") or row[2]),
+                        str(action.get("workspace_id") or row[3]),
+                        str(action.get("visibility_scope") or row[4]),
+                        str(action.get("owner_agent_id") or row[5] or ""),
+                    )
+                    if target_scope != action_scope:
+                        errors.append({"index": index, "code": "target_scope", "message": "Target claim scope must match the action scope."})
+                    if str(row[4]) == "agent" and str(row[5] or "") != str(action.get("origin_agent_id") or ""):
+                        errors.append({"index": index, "code": "agent_private_target", "message": "Only the owning Agent may modify an agent-private claim."})
+        if action_name == "REFINE" and bool(action.get("auto_promote")) and not bool(action.get("refine_safe")):
+            errors.append({"index": index, "code": "unsafe_auto_refine", "message": "Automatic REFINE requires deterministic additive refinement evidence."})
         if action_name in {"CORRECT", "SUPERSEDE"} and len(ids) < 2 and bool(get("consolidation.require_two_sources_for_correct")):
             errors.append({"index": index, "code": "weak_temporal_change", "message": "CORRECT and SUPERSEDE require at least two evidence events."})
         kind = str(action.get("memory_kind", "candidate"))

@@ -92,6 +92,88 @@ def fetch_claim(conn, claim_id: str) -> dict[str, object]:
     return claim
 
 
+def semantic_key_for(
+    *,
+    profile_id: str,
+    workspace_id: str,
+    subject_id: str,
+    visibility_scope: str,
+    predicate: str,
+    subject_text: str,
+    object_text: str,
+    qualifiers: object,
+    owner_agent_id: str = "",
+) -> str:
+    """Use the historical scoped hash format so existing claims stay mergeable."""
+    parts: list[object] = [profile_id, workspace_id, subject_id, visibility_scope]
+    if visibility_scope == "agent":
+        parts.append(owner_agent_id)
+    parts.extend([predicate, subject_text, object_text, qualifiers])
+    return sha256_text(
+        json.dumps(
+            parts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _legacy_agent_semantic_key(
+    *,
+    profile_id: str,
+    workspace_id: str,
+    subject_id: str,
+    visibility_scope: str,
+    predicate: str,
+    subject_text: str,
+    object_text: str,
+    qualifiers: object,
+) -> str:
+    """Read the pre-018 private key once so upgrades do not duplicate it."""
+    return sha256_text(
+        json.dumps(
+            [profile_id, workspace_id, subject_id, visibility_scope, predicate, subject_text, object_text, qualifiers],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def mark_runtime_dirty(conn, claim: dict[str, object]) -> None:
+    """Invalidate only derived views affected by a changed claim."""
+    profile = str(claim.get("profile_id") or "default")
+    workspace = str(claim.get("workspace_id") or "global")
+    subject = str(claim.get("subject_id") or "")
+    if not subject:
+        return
+    visibility = str(claim.get("visibility_scope") or "workspace")
+    agent = str(claim.get("owner_agent_id") or claim.get("origin_agent_id") or "") if visibility == "agent" else ""
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO workspace_runtime_state(
+            profile_id,workspace_id,subject_id,agent_id,hot_dirty,dream_dirty,
+            claim_generation,hot_generation,dream_generation,updated_at
+        ) VALUES(?, ?, ?, ?, 1, 1, 1, 0, 0, ?)
+        ON CONFLICT(profile_id,workspace_id,subject_id,agent_id) DO UPDATE SET
+            hot_dirty=1,dream_dirty=1,claim_generation=claim_generation+1,
+            updated_at=excluded.updated_at
+        """,
+        (profile, workspace, subject, agent, now),
+    )
+    if workspace == "global" or visibility == "global":
+        conn.execute(
+            """
+            UPDATE workspace_runtime_state
+            SET hot_dirty=1,dream_dirty=1,claim_generation=claim_generation+1,updated_at=?
+            WHERE profile_id=? AND subject_id=? AND agent_id=''
+            """,
+            (now, profile, subject),
+        )
+
+
 def all_sources(conn, claim_id: str) -> list[int]:
     return [int(row[0]) for row in conn.execute("SELECT raw_event_id FROM claim_sources WHERE claim_id=? ORDER BY raw_event_id", (claim_id,))]
 
@@ -99,6 +181,76 @@ def all_sources(conn, claim_id: str) -> list[int]:
 def link_sources(conn, claim_id: str, ids: list[int]) -> None:
     for event_id in ids:
         conn.execute("INSERT OR IGNORE INTO claim_sources(claim_id, raw_event_id, source_role) VALUES(?, ?, 'supports')", (claim_id, event_id))
+
+
+def _tool_backed_action(conn, action: dict[str, object]) -> bool:
+    if str(action.get("source_type") or "").casefold() in {"agent-observation", "tool-result"}:
+        return True
+    ids = action_sources(action)
+    if not ids:
+        return False
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(f"SELECT source_type FROM raw_events WHERE id IN ({placeholders})", ids).fetchall()
+    return any(str(row[0] or "").casefold() in {"agent-observation", "tool-result"} for row in rows)
+
+
+def _assert_agent_tool_bounds(conn, action: dict[str, object], name: str) -> None:
+    if not _tool_backed_action(conn, action):
+        return
+    if str(action.get("memory_kind") or "").casefold() == "profile":
+        raise ValueError("Agent or tool evidence cannot create or modify a user profile.")
+    if name in {"REFINE", "CORRECT", "SUPERSEDE"}:
+        raise ValueError("Agent or tool evidence cannot rewrite an existing claim.")
+    target_id = str(action.get("target_claim_id") or "")
+    if target_id:
+        target = conn.execute("SELECT memory_kind FROM claims WHERE id=?", (target_id,)).fetchone()
+        if target and str(target[0]) == "profile":
+            raise ValueError("Agent or tool evidence cannot alter or corroborate a user profile.")
+
+
+def _assert_target_scope(conn, action: dict[str, object], name: str) -> None:
+    if name not in {"CORROBORATE", "REFINE", "CORRECT", "SUPERSEDE"}:
+        return
+    target_id = str(action.get("target_claim_id") or "")
+    if not target_id:
+        return
+    row = conn.execute(
+        "SELECT profile_id,workspace_id,visibility_scope,owner_agent_id FROM claims WHERE id=?",
+        (target_id,),
+    ).fetchone()
+    if not row:
+        return
+    target_scope = tuple(str(value or "") for value in row)
+    action_scope = (
+        str(action.get("profile_id") or row[0]),
+        str(action.get("workspace_id") or row[1]),
+        str(action.get("visibility_scope") or row[2]),
+        str(action.get("owner_agent_id") or row[3] or ""),
+    )
+    if target_scope != action_scope:
+        raise ValueError("Target claim scope must match the action scope.")
+    if str(row[2]) == "agent" and str(row[3] or "") != str(action.get("origin_agent_id") or ""):
+        raise ValueError("Only the owning Agent may modify an agent-private claim.")
+
+
+def _normal_text(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _safe_refine_action(claim: dict[str, object], action: dict[str, object]) -> bool:
+    """Defence in depth for a plan marked as automatic additive REFINE."""
+    if not bool(action.get("refine_safe")):
+        return False
+    for key in ("predicate", "subject_text", "object_text"):
+        value = str(action.get(key) or "")
+        if value and _normal_text(value) != _normal_text(claim.get(key)):
+            return False
+    old_content, new_content = _normal_text(claim.get("content")), _normal_text(action.get("content") or claim.get("content"))
+    if not old_content or old_content not in new_content:
+        return False
+    incoming = action.get("qualifiers") if isinstance(action.get("qualifiers"), dict) else {}
+    current = claim.get("qualifiers") if isinstance(claim.get("qualifiers"), dict) else {}
+    return all(key not in current or current[key] == value for key, value in incoming.items())
 
 
 def save_claim_file(root: Path, conn, claim: dict[str, object], source_ids: list[int], reason: str) -> tuple[Path, str | None]:
@@ -129,13 +281,46 @@ def create_claim(conn, root: Path, action: dict[str, object], *, replacement_of:
     # every runtime write now supplies an explicit workspace/agent scope.
     visibility = validate_visibility(str(action.get("visibility_scope") or "global"), owner)
     claim = {"id": claim_id, "subject_id": action["subject_id"], "subject_name": action.get("subject_name", "Unknown"), "memory_kind": action.get("memory_kind", "candidate"), "domain": action.get("domain", "general"), "topic": action.get("topic", "memory"), "title": action.get("title", action.get("topic", "Memory claim")), "content": content, "status": "active" if action.get("memory_kind") != "candidate" else "candidate", "verification_state": action.get("verification_state", "unverified"), "confidence": float(action.get("confidence", 0.3)), "importance": float(action.get("importance", 0.3)), "durability": float(action.get("durability", 0.5)), "sensitivity": action.get("sensitivity", "normal"), "valid_from": action.get("valid_from") or utc_now(), "valid_to": action.get("valid_to", ""), "observed_at": action.get("observed_at") or utc_now(), "support_count": len(ids), "memory_path": "", "predicate": action.get("predicate", "states"), "subject_text": action.get("subject_text", "user"), "object_text": action.get("object_text", content[:240]), "qualifiers": action.get("qualifiers", {}), "confirmed_utility": 0.0, "replaced_by": "", "corrected_by": "", "supersedes": replacement_of, "security_state": state, "prompt_eligible": eligible, "profile_id":profile_id, "workspace_id":workspace_id, "visibility_scope":visibility, "owner_agent_id":owner, "origin_agent_id":agent}
-    claim["semantic_key"] = sha256_text(json.dumps([profile_id, workspace_id, claim["subject_id"], visibility, claim["predicate"], claim["subject_text"], claim["object_text"], claim["qualifiers"]], ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    claim["semantic_key"] = semantic_key_for(
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        subject_id=str(claim["subject_id"]),
+        visibility_scope=visibility,
+        predicate=str(claim["predicate"]),
+        subject_text=str(claim["subject_text"]),
+        object_text=str(claim["object_text"]),
+        qualifiers=claim["qualifiers"],
+        owner_agent_id=owner,
+    )
     # A second writer may construct an equivalent plan while the first writer
     # is committing.  The semantic unique key is the final guard; treat this
     # path as corroboration instead of failing or creating a duplicate claim.
-    existing = conn.execute("SELECT id FROM claims WHERE semantic_key=? AND status='active'", (claim["semantic_key"],)).fetchone()
+    existing = conn.execute(
+        "SELECT id,memory_kind FROM claims WHERE profile_id=? AND workspace_id=? AND subject_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=? AND semantic_key=? AND status='active'",
+        (profile_id, workspace_id, str(claim["subject_id"]), visibility, owner, claim["semantic_key"]),
+    ).fetchone()
+    if not existing and visibility == "agent":
+        legacy_key = _legacy_agent_semantic_key(
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            subject_id=str(claim["subject_id"]),
+            visibility_scope=visibility,
+            predicate=str(claim["predicate"]),
+            subject_text=str(claim["subject_text"]),
+            object_text=str(claim["object_text"]),
+            qualifiers=claim["qualifiers"],
+        )
+        existing = conn.execute(
+            "SELECT id,memory_kind FROM claims WHERE profile_id=? AND workspace_id=? AND subject_id=? AND visibility_scope='agent' AND COALESCE(owner_agent_id,'')=? AND semantic_key=? AND status='active'",
+            (profile_id, workspace_id, str(claim["subject_id"]), owner, legacy_key),
+        ).fetchone()
+        if existing:
+            conn.execute("UPDATE claims SET semantic_key=? WHERE id=?", (claim["semantic_key"], str(existing[0])))
     if existing:
-        existing_id = str(existing[0]); link_sources(conn, existing_id, ids)
+        existing_id = str(existing[0])
+        if _tool_backed_action(conn, action) and str(existing[1]) == "profile":
+            raise ValueError("Agent or tool evidence cannot corroborate an existing user profile.")
+        link_sources(conn, existing_id, ids)
         current = fetch_claim(conn, existing_id); source_ids = all_sources(conn, existing_id)
         current["support_count"] = len(source_ids)
         conn.execute("UPDATE claims SET support_count=?, updated_at=? WHERE id=?", (len(source_ids), utc_now(), existing_id))
@@ -159,7 +344,20 @@ def queue_review(conn, action: dict[str, object], reason: str) -> str:
 def apply_action(root: Path, action: dict[str, object], policy: str, review_approved: bool) -> dict[str, object]:
     conn = open_db(root)
     name = str(action["action"]).upper()
-    must_review = name in HIGH_RISK or bool(action.get("requires_review")) or (name == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("origin", "")) == "background_review" and not bool(action.get("auto_promote")))
+    try:
+        _assert_agent_tool_bounds(conn, action, name)
+        _assert_target_scope(conn, action, name)
+    except Exception:
+        conn.close()
+        raise
+    explicit = bool(action.get("explicit_user_action"))
+    automatic_supersede = name == "SUPERSEDE" and bool(action.get("auto_promote"))
+    must_review = (
+        (name in HIGH_RISK and not explicit and not automatic_supersede)
+        or (name == "REFINE" and not explicit and not bool(action.get("refine_safe")))
+        or (bool(action.get("requires_review")) and not explicit)
+        or (name == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("origin", "")) == "background_review" and not bool(action.get("auto_promote")))
+    )
     if must_review and not review_approved:
         proposal_id = queue_review(conn, action, "high_risk_or_policy_review")
         conn.commit(); conn.close()
@@ -181,8 +379,31 @@ def apply_action(root: Path, action: dict[str, object], policy: str, review_appr
             claim = fetch_claim(conn, str(action["target_claim_id"])); link_sources(conn, str(claim["id"]), action_sources(action)); ids = all_sources(conn, str(claim["id"])); claim["support_count"], claim["confidence"], claim["observed_at"] = len(ids), min(1.0, max(float(claim["confidence"]), float(action.get("confidence", 0))) + 0.03), utc_now()
             conn.execute("UPDATE claims SET support_count=?, confidence=?, observed_at=?, updated_at=? WHERE id=?", (claim["support_count"], claim["confidence"], claim["observed_at"], utc_now(), claim["id"])); path, old = save_claim_file(root, conn, claim, ids, "corroborate"); backups.append((path, old)); result.update({"claim_id": claim["id"], "path": str(path)})
         elif name == "REFINE":
-            claim = fetch_claim(conn, str(action["target_claim_id"])); claim["content"] = str(action.get("content") or claim["content"]); claim["topic"] = str(action.get("topic") or claim["topic"]); claim["domain"] = str(action.get("domain") or claim["domain"]); claim["predicate"] = str(action.get("predicate") or claim["predicate"]); claim["object_text"] = str(action.get("object_text") or claim["object_text"]); claim["confidence"] = max(float(claim["confidence"]), float(action.get("confidence", 0))); link_sources(conn, str(claim["id"]), action_sources(action)); ids = all_sources(conn, str(claim["id"])); claim["support_count"] = len(ids)
-            conn.execute("UPDATE claims SET content=?, content_hash=?, topic=?, domain=?, predicate=?, object_text=?, confidence=?, support_count=?, observed_at=?, updated_at=? WHERE id=?", (claim["content"], sha256_text(str(claim["content"])), claim["topic"], claim["domain"], claim["predicate"], claim["object_text"], claim["confidence"], len(ids), utc_now(), utc_now(), claim["id"])); path, old = save_claim_file(root, conn, claim, ids, "refine"); backups.append((path, old)); result.update({"claim_id": claim["id"], "path": str(path)})
+            claim = fetch_claim(conn, str(action["target_claim_id"]))
+            if bool(action.get("refine_safe")) and not _safe_refine_action(claim, action):
+                raise ValueError("Automatic REFINE is not a strictly additive qualifier update.")
+            incoming_qualifiers = action.get("qualifiers") if isinstance(action.get("qualifiers"), dict) else {}
+            qualifiers = dict(claim["qualifiers"])
+            qualifiers.update(incoming_qualifiers)
+            claim["content"] = str(action.get("content") or claim["content"])
+            claim["topic"] = str(action.get("topic") or claim["topic"])
+            claim["domain"] = str(action.get("domain") or claim["domain"])
+            claim["predicate"] = str(action.get("predicate") or claim["predicate"])
+            claim["subject_text"] = str(action.get("subject_text") or claim["subject_text"])
+            claim["object_text"] = str(action.get("object_text") or claim["object_text"])
+            claim["qualifiers"] = qualifiers
+            claim["valid_from"] = str(action.get("valid_from") or claim["valid_from"])
+            claim["valid_to"] = str(action.get("valid_to") or claim["valid_to"])
+            claim["durability"] = max(float(claim["durability"]), float(action.get("durability") or 0))
+            claim["confidence"] = max(float(claim["confidence"]), float(action.get("confidence", 0)))
+            link_sources(conn, str(claim["id"]), action_sources(action)); ids = all_sources(conn, str(claim["id"])); claim["support_count"] = len(ids)
+            semantic_key = semantic_key_for(profile_id=str(claim["profile_id"]), workspace_id=str(claim["workspace_id"]), subject_id=str(claim["subject_id"]), visibility_scope=str(claim["visibility_scope"]), predicate=str(claim["predicate"]), subject_text=str(claim["subject_text"]), object_text=str(claim["object_text"]), qualifiers=claim["qualifiers"], owner_agent_id=str(claim.get("owner_agent_id") or ""))
+            collision = conn.execute("SELECT id FROM claims WHERE profile_id=? AND workspace_id=? AND subject_id=? AND visibility_scope=? AND COALESCE(owner_agent_id,'')=? AND semantic_key=? AND status='active' AND id!=?", (claim["profile_id"], claim["workspace_id"], claim["subject_id"], claim["visibility_scope"], claim.get("owner_agent_id") or "", semantic_key, claim["id"])).fetchone()
+            if collision:
+                merged_id = str(collision[0]); link_sources(conn, merged_id, ids); merged = fetch_claim(conn, merged_id); merged_ids = all_sources(conn, merged_id); merged["support_count"] = len(merged_ids); conn.execute("UPDATE claims SET support_count=?, updated_at=? WHERE id=?", (len(merged_ids), utc_now(), merged_id)); path, old = save_claim_file(root, conn, merged, merged_ids, "semantic_refine_merge"); backups.append((path, old)); result.update({"claim_id": merged_id, "path": str(path), "merged_from": claim["id"]})
+            else:
+                claim["semantic_key"] = semantic_key
+                conn.execute("UPDATE claims SET content=?, content_hash=?, topic=?, domain=?, predicate=?, subject_text=?, object_text=?, qualifiers_json=?, valid_from=?, valid_to=?, durability=?, semantic_key=?, confidence=?, support_count=?, observed_at=?, updated_at=? WHERE id=?", (claim["content"], sha256_text(str(claim["content"])), claim["topic"], claim["domain"], claim["predicate"], claim["subject_text"], claim["object_text"], json.dumps(claim["qualifiers"], ensure_ascii=False), claim["valid_from"], claim["valid_to"], claim["durability"], semantic_key, claim["confidence"], len(ids), utc_now(), utc_now(), claim["id"])); path, old = save_claim_file(root, conn, claim, ids, "refine"); backups.append((path, old)); result.update({"claim_id": claim["id"], "path": str(path)})
         elif name in HIGH_RISK:
             old_claim = fetch_claim(conn, str(action["target_claim_id"])); replacement = dict(action); replacement.setdefault("memory_kind", old_claim["memory_kind"]); replacement.setdefault("domain", old_claim["domain"]); replacement.setdefault("topic", old_claim["topic"]); replacement.setdefault("title", old_claim["title"]); replacement.setdefault("verification_state", "verified")
             new_id, path, old = create_claim(conn, root, replacement, replacement_of=str(old_claim["id"]), edge_type="corrects" if name == "CORRECT" else "supersedes"); backups.append((path, old))
@@ -196,6 +417,10 @@ def apply_action(root: Path, action: dict[str, object], policy: str, review_appr
         if action.get("unit_id"):
             conn.execute("UPDATE memory_units SET status='consolidated', updated_at=? WHERE id=?", (utc_now(), action["unit_id"]))
         if result.get("claim_id"):
+            mark_runtime_dirty(conn, action)
+            if result.get("replaces"):
+                old_scope = fetch_claim(conn, str(result["replaces"]))
+                mark_runtime_dirty(conn, old_scope)
             from projection_outbox import enqueue_projection
             dirty_claim_ids = [str(result["claim_id"])]
             if result.get("replaces"):

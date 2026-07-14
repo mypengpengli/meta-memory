@@ -22,13 +22,6 @@ def _agent(value: str) -> str:
     return value.strip() or "generic-agent"
 
 
-def _session(value: str) -> str:
-    session_id = value.strip()
-    if not session_id or session_id.casefold() == "auto":
-        raise ValueError("A concrete session id is required until automatic session resolution is enabled.")
-    return session_id
-
-
 def _identity_matches(
     row,
     *,
@@ -92,6 +85,8 @@ def _context_args(
         out_file=None,
         hot_snapshot_policy="frozen",
         include_embeddings=config.embeddings,
+        search_depth=config.search_depth,
+        no_chunks=False,
     )
 
 
@@ -133,10 +128,17 @@ def begin_turn(
     from ingest_raw_event import insert_raw_event_with_conn
     from memory_runtime import prepare_context
     from session_archive import ensure_session
+    from .session_manager import resolve_session
 
     project = resolve_project(config, project_name, cwd)
-    session_id = _session(requested_session)
     stable_agent = _agent(agent_id)
+    session_resolution = resolve_session(
+        config,
+        requested=requested_session or "auto",
+        agent_id=stable_agent,
+        project=project,
+    )
+    session_id = session_resolution.session_id
     turn_uid = requested_turn_uid.strip() or str(uuid.uuid4())
     request_hash = _hash(query)
     root = Path(config.store)
@@ -173,6 +175,7 @@ def begin_turn(
                 session_id=session_id,
                 profile_id=config.profile_id,
                 workspace_id=project.workspace_id,
+                origin_agent_id=stable_agent,
                 shared_mode=True,
                 conn=conn,
             )
@@ -239,7 +242,7 @@ def begin_turn(
             "status": "degraded",
             "turn_id": turn_uid,
             "session_id": session_id,
-            "session_source": "explicit",
+            "session_source": session_resolution.source,
             "project": project.project_id,
             "project_root": str(project.root),
             "agent_id": stable_agent,
@@ -257,7 +260,7 @@ def begin_turn(
         "status": "ok",
         "turn_id": turn_uid,
         "session_id": session_id,
-        "session_source": "explicit",
+        "session_source": session_resolution.source,
         "project": project.project_id,
         "project_root": str(project.root),
         "agent_id": stable_agent,
@@ -272,7 +275,7 @@ def begin_turn(
     }
 
 
-def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str) -> dict[str, Any]:
+def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agent_id: str = "") -> dict[str, Any]:
     """Atomically save the assistant response and enqueue downstream work."""
     if not turn_uid.strip():
         raise ValueError("A turn id is required.")
@@ -299,6 +302,8 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str) -> d
         ).fetchone()
         if not row:
             raise ValueError("Turn not found.")
+        if agent_id and str(row[4] or "") != _agent(agent_id):
+            raise ValueError("Turn belongs to a different Agent.")
         if str(row[9]) == "abandoned":
             raise ValueError("Cannot complete an abandoned turn.")
         if str(row[9]) == "completed":

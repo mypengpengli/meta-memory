@@ -243,6 +243,7 @@ def insert_raw_event_with_conn(
             timestamp=event_time,
             profile_id=profile_id,
             workspace_id=workspace_id,
+            origin_agent_id=origin_agent_id,
             shared_mode=shared_mode,
             conn=conn,
         )

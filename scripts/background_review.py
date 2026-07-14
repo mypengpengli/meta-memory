@@ -111,7 +111,9 @@ def _finish(root, uid: str, *, status: str, plan: dict[str,object] | None=None, 
     conn.commit();conn.close()
 
 
-def run_pending(root, *, max_jobs: int=10, policy: str="conservative", apply_low_risk: bool=False, worker_id: str="") -> dict[str,object]:
+def run_pending(root, *, max_jobs: int=10, policy: str="conservative", apply_low_risk: bool=False, memory_mode: str="", worker_id: str="") -> dict[str,object]:
+    from meta_memory.memory_policy import decide_action, normalize_mode
+    mode = normalize_mode(memory_mode or ("automatic" if apply_low_risk else "manual"))
     worker_id=worker_id or f"worker:{uuid.uuid4()}"; results=[]
     for _ in range(max(0,max_jobs)):
         job=_claim_job(root,worker_id)
@@ -124,17 +126,25 @@ def run_pending(root, *, max_jobs: int=10, policy: str="conservative", apply_low
             units=extract_units(root,subject_id=str(subject_id),card_ids=card_ids,event_start_id=int(start or 0) or None,event_end_id=int(end or 0) or None,limit=max(1,len(card_ids) or 1),profile_id=str(profile_id),workspace_id=str(workspace_id),origin_agent_id=str(origin_agent_id),owner_agent_id=str(origin_agent_id))
             renew_lease(root,str(uid),worker_id)
             unit_ids=[int(item["unit_id"]) for item in units["created"] if item.get("unit_id")]
-            plan=build_plan(root,str(subject_id),policy=policy,unit_ids=unit_ids,limit=max(1,len(unit_ids) or 1),profile_id=str(profile_id),workspace_id=str(workspace_id),origin_agent_id=str(origin_agent_id))
+            # Explicit unit ids are already scoped by the review job.  Do not
+            # re-filter them to the job workspace: extraction may have safely
+            # promoted a user-wide response preference to the global scope.
+            plan=build_plan(root,str(subject_id),policy=policy,unit_ids=unit_ids,limit=max(1,len(unit_ids) or 1),profile_id=str(profile_id),workspace_id=None,origin_agent_id=str(origin_agent_id))
             for action in plan["actions"]:
-                action.update({"origin":"background_review","session_id":str(session_id),"profile_id":str(profile_id),"workspace_id":str(workspace_id),"origin_agent_id":str(origin_agent_id)})
-                # Automatic memory is deliberately narrow: only a verified,
-                # normal-sensitivity CREATE without a conflict can bypass the
-                # review queue. Source events are user-only because the
-                # extractor excludes assistant content by default.
-                if apply_low_risk and str(action.get("action")) == "CREATE" and str(action.get("verification_state")) == "verified" and str(action.get("sensitivity")) == "normal" and not bool(action.get("requires_review")):
+                action.update({"origin":"background_review","session_id":str(session_id)})
+                action.setdefault("profile_id", str(profile_id)); action.setdefault("workspace_id", str(workspace_id)); action.setdefault("origin_agent_id", str(origin_agent_id))
+                decision = decide_action(action, memory_mode=mode)
+                action["memory_policy"] = decision
+                if decision == "auto_apply":
                     action["auto_promote"] = True
-            outcome=apply_plan(root,plan,skip_index=True) if apply_low_risk and plan["actions"] else {"status":"shadow","actions":plan["actions"]}
-            status="applied" if apply_low_risk and outcome.get("status")=="ok" else "staged" if plan["actions"] else "planned"; _finish(root,str(uid),status=status,plan=plan);results.append({"job_id":uid,"status":status,"card_ids":card_ids,"unit_ids":unit_ids,"outcome":outcome})
+                    action["requires_review"] = False
+                elif decision == "ignore":
+                    action["action"] = "IGNORE"
+                    action["requires_review"] = False
+                else:
+                    action["requires_review"] = True
+            outcome=apply_plan(root,plan,skip_index=True) if plan["actions"] else {"status":"shadow","actions":[]}
+            status="applied" if outcome.get("status")=="ok" and any(item.get("status")=="applied" for item in outcome.get("results",[])) else "staged" if plan["actions"] else "planned"; _finish(root,str(uid),status=status,plan=plan);results.append({"job_id":uid,"status":status,"memory_mode":mode,"card_ids":card_ids,"unit_ids":unit_ids,"outcome":outcome})
         except Exception as exc:
             _finish(root,str(uid),status="pending",error=str(exc),retry=True);results.append({"job_id":uid,"status":"retrying","error":str(exc)})
     return {"status":"ok","worker_id":worker_id,"results":results}

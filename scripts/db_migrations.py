@@ -145,8 +145,20 @@ def run_migrations(conn: sqlite3.Connection) -> dict[str, object]:
             )
         except Exception:
             conn.rollback()
+            # Another process may have acquired the SQLite migration lock
+            # after this connection took its initial ``applied`` snapshot and
+            # completed the exact same migration first.  Treat that specific
+            # race as success; any missing/different checksum remains a real
+            # migration error and is never hidden.
+            completed_elsewhere = conn.execute(
+                "SELECT checksum FROM schema_migrations WHERE version=?", (version,)
+            ).fetchone()
+            if completed_elsewhere and str(completed_elsewhere[0]) == digest:
+                applied[version] = digest
+                continue
             raise
         completed.append(version)
+        applied[version] = digest
     for table, columns in LEGACY_COLUMNS.items():
         ensure_columns(conn, table, columns)
     ensure_legacy_indexes(conn)

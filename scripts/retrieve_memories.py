@@ -91,6 +91,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-id", default="", help="Agent identity for agent-private memory")
     parser.add_argument("--valid-at", help="Retrieve facts valid at this ISO timestamp; defaults to now")
     parser.add_argument("--no-chunks", action="store_true", help="Disable chunk-level BM25 recall")
+    parser.add_argument(
+        "--include-resources",
+        action="store_true",
+        help="Include matched imported source evidence. Resource text is never prompt context by default.",
+    )
+    parser.add_argument(
+        "--include-inferred-dreams",
+        "--deep",
+        dest="include_inferred_dreams",
+        action="store_true",
+        help="Explicit deep/admin inspection: include non-prompt inferred Dream nodes in search results.",
+    )
     parser.add_argument("--include-embeddings", action="store_true", help="Fuse optional external embedding results when available")
     parser.add_argument("--embedding-model", default="external")
     parser.add_argument("--rrf-k", type=int, default=60, help="Reciprocal-rank-fusion constant")
@@ -550,6 +562,298 @@ def record_retrieval(conn, selected: list[dict[str, object]], query: str, filter
     conn.commit()
 
 
+def dream_candidates(
+    conn,
+    *,
+    query: str,
+    terms: list[str],
+    filters: dict[str, object],
+    enabled: bool = True,
+    include_inferred: bool = False,
+) -> list[dict[str, object]]:
+    """Adapt Dream nodes to candidates without widening normal prompt recall.
+
+    Inferred nodes are administrative inspection material.  They are returned
+    only when the caller deliberately selects the deep route and remain
+    ``prompt_eligible=0`` even there, so a result cannot become prompt context
+    merely by being forwarded to a renderer.
+    """
+    if not enabled or not terms:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT dream_uid,title,content,source_claim_ids,confidence,inference_level,status,updated_at,prompt_eligible
+            FROM dream_nodes
+            WHERE profile_id=? AND subject_id=? AND workspace_id IN (?, 'global')
+              AND (
+                  (prompt_eligible=1 AND inference_level='extractive' AND status IN ('active','confirmed'))
+                  OR (?=1 AND inference_level='inferred' AND status IN ('inferred','active','confirmed'))
+              )
+            ORDER BY updated_at DESC LIMIT 80
+            """,
+            (
+                str(filters.get("profile_id") or "default"),
+                str(filters.get("subject_id") or ""),
+                str(filters.get("workspace_id") or "default"),
+                int(bool(include_inferred)),
+            ),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        title, content = str(row[1]), str(row[2])
+        inference_level = str(row[5] or "extractive").casefold()
+        inferred = inference_level != "extractive"
+        haystack = f"{title}\n{content}".casefold()
+        hits = sum(1 for term in terms if term.casefold() in haystack)
+        if not hits:
+            continue
+        score = round((hits / max(1, len(terms))) * 0.45, 4)
+        uid = str(row[0])
+        candidates.append(
+            {
+                "path": f"dream:{uid}",
+                "memory_id": f"dream:{uid}",
+                "title": title,
+                "subject_id": str(filters.get("subject_id") or ""),
+                "subject_name": "",
+                "memory_kind": "dream",
+                "page_role": "dream-inference" if inferred else "dream-digest",
+                "canonical": 0,
+                "domain": "dream",
+                "topic": "dream",
+                "tags": "",
+                "summary": content,
+                "confidence": float(row[4] or 0.0),
+                "importance": 0.25,
+                "status": str(row[6]),
+                "source": ",".join(parse_json_list(str(row[3] or "[]"))),
+                "start_at": "",
+                "end_at": "",
+                "related_people": "",
+                "related_events": "",
+                "related_topics": "",
+                "related_sources": str(row[3] or "[]"),
+                "supersedes": "",
+                "replaced_by": "",
+                "valid_from": "",
+                "valid_to": "",
+                "verification_state": "inferred" if inferred else "extractive",
+                "security_state": "clean",
+                "prompt_eligible": 0 if inferred else int(row[8] or 0),
+                "inference_level": inference_level,
+                "admin_only": inferred,
+                "source_claim_ids": parse_json_list(str(row[3] or "[]")),
+                "mtime": 0.0,
+                "hit_count": 0,
+                "score_confidence": float(row[4] or 0.0),
+                "rank_score": 0.0,
+                "last_hit_at": str(row[7] or ""),
+                "field_score": score,
+                "query_score": score,
+                "fts_score": 0.0,
+                "chunk_score": 0.0,
+                "embedding_score": 0.0,
+                "entity_score": 0.0,
+                "graph_score": 0.0,
+                "association_score": 0.0,
+                "lifecycle_score": 0.0,
+                "rrf_score": 0.0,
+                "total_score": score,
+                "best_chunk": {"content": content},
+                "reasons": ["dream/inferred", "admin/deep"] if inferred else ["dream/extractive"],
+            }
+        )
+    return candidates
+
+
+def _resource_excerpt(content: str, terms: list[str], *, limit: int = 720) -> str:
+    """Return a bounded, human-readable resource excerpt around the first hit.
+
+    Imported files may be much larger than a normal memory card.  Search
+    results deliberately expose only the relevant bounded evidence chunk;
+    callers that need the original can follow the returned source metadata.
+    """
+    text = str(content or "").strip()
+    if len(text) <= limit:
+        return text
+    lowered = text.casefold()
+    match_at = min(
+        (position for term in terms if term and (position := lowered.find(term.casefold())) >= 0),
+        default=0,
+    )
+    start = max(0, match_at - min(180, limit // 4))
+    end = min(len(text), start + limit)
+    if end - start < limit and start:
+        start = max(0, end - limit)
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{text[start:end].strip()}{suffix}"
+
+
+def resource_candidates(
+    conn,
+    *,
+    query: str,
+    terms: list[str],
+    filters: dict[str, object],
+    enabled: bool = False,
+    limit: int = 80,
+) -> list[dict[str, object]]:
+    """Find source-evidence chunks without treating them as memories.
+
+    ``resource_chunks`` intentionally has no dependency on the document
+    projection, because a file is evidence rather than a claim.  The query is
+    scoped to the active user and workspace and uses a bounded SQLite LIKE
+    scan.  This keeps the feature available on SQLite builds without FTS5 and
+    avoids pulling resource text into normal prompt retrieval.
+    """
+    if not enabled or not terms:
+        return []
+
+    profile_id = str(filters.get("profile_id") or "default")
+    workspace_id = str(filters.get("workspace_id") or "default")
+    subject_id = str(filters.get("subject_id") or "")
+    if not subject_id:
+        return []
+
+    # Limit the number of SQL predicates and result rows.  Matching happens in
+    # SQL before the limit, so large imported files remain searchable end to
+    # end rather than only across their first few chunks.
+    searchable_terms = [term.casefold() for term in terms if len(term.strip()) >= 2][:18]
+    if not searchable_terms:
+        return []
+    predicates: list[str] = []
+    params: list[object] = [profile_id, workspace_id, subject_id]
+    for term in searchable_terms:
+        predicates.append("LOWER(rc.content) LIKE ?")
+        params.append(f"%{term}%")
+    # A filename can be useful evidence even when the selected chunk does not
+    # repeat its filename.  It remains explicitly marked as resource evidence.
+    for term in searchable_terms[:6]:
+        predicates.append("LOWER(ri.source_name) LIKE ?")
+        params.append(f"%{term}%")
+    params.append(max(1, min(int(limit), 200)))
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                ri.resource_uid, ri.source_path, ri.source_name, ri.source_type,
+                ri.content_hash, ri.byte_size, ri.modified_at, ri.encoding,
+                ri.raw_event_id, ri.card_path,
+                rc.chunk_uid, rc.chunk_index, rc.content, rc.content_hash,
+                rc.start_offset, rc.end_offset
+            FROM resource_imports AS ri
+            JOIN resource_chunks AS rc ON rc.resource_uid = ri.resource_uid
+            WHERE ri.profile_id=? AND ri.workspace_id=? AND ri.subject_id=?
+              AND ({' OR '.join(predicates)})
+            ORDER BY ri.updated_at DESC, rc.chunk_index ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Stores created before the resource migration continue to retrieve
+        # ordinary memories normally; source evidence simply is not present.
+        return []
+
+    # Return the strongest matching chunk per resource.  This prevents a long
+    # source file from crowding all ordinary memory results while preserving a
+    # stable source-level result that can be inspected by the user.
+    best_by_resource: dict[str, dict[str, object]] = {}
+    normalized_query = normalize_text(query)
+    for row in rows:
+        (
+            resource_uid, source_path, source_name, source_type, content_hash,
+            byte_size, modified_at, encoding, raw_event_id, card_path,
+            chunk_uid, chunk_index, content, chunk_hash, start_offset, end_offset,
+        ) = row
+        content_text = str(content or "")
+        haystack = f"{source_name}\n{content_text}".casefold()
+        matched = [term for term in searchable_terms if term in haystack]
+        if not matched:
+            continue
+        # Favor exact phrases but keep resource evidence below a directly
+        # verified structured claim with an equally good match.
+        coverage = len(set(matched)) / max(1, len(set(searchable_terms)))
+        score = round(0.7 + coverage * 1.4 + (0.8 if normalized_query and normalized_query in haystack else 0.0), 4)
+        uid = str(resource_uid)
+        candidate = {
+            "path": f"resource:{uid}#chunk-{int(chunk_index)}",
+            "memory_id": f"resource:{uid}",
+            "title": f"Resource: {source_name}",
+            "subject_id": subject_id,
+            "subject_name": "",
+            "memory_kind": "resource",
+            "page_role": "resource-evidence",
+            "canonical": 0,
+            "domain": "resource",
+            "topic": str(source_type or "resource"),
+            "tags": "",
+            "summary": _resource_excerpt(content_text, searchable_terms),
+            "confidence": 0.0,
+            "importance": 0.0,
+            "status": "evidence",
+            "source": str(source_path or ""),
+            "start_at": "",
+            "end_at": "",
+            "related_people": "",
+            "related_events": "",
+            "related_topics": "",
+            "related_sources": json.dumps([str(source_path or "")], ensure_ascii=False),
+            "supersedes": "",
+            "replaced_by": "",
+            "valid_from": "",
+            "valid_to": "",
+            "verification_state": "resource",
+            "security_state": "unreviewed_resource",
+            "prompt_eligible": 0,
+            "mtime": float(modified_at or 0.0),
+            "hit_count": 0,
+            "score_confidence": 0.0,
+            "rank_score": 0.0,
+            "last_hit_at": "",
+            "field_score": score,
+            "query_score": score,
+            "fts_score": 0.0,
+            "chunk_score": score,
+            "embedding_score": 0.0,
+            "entity_score": 0.0,
+            "graph_score": 0.0,
+            "association_score": 0.0,
+            "lifecycle_score": 0.0,
+            "rrf_score": 0.0,
+            "total_score": score,
+            "best_chunk": {
+                "chunk_uid": str(chunk_uid),
+                "chunk_index": int(chunk_index),
+                "content": _resource_excerpt(content_text, searchable_terms),
+                "start_offset": int(start_offset or 0),
+                "end_offset": int(end_offset or 0),
+                "content_hash": str(chunk_hash or ""),
+            },
+            "resource": {
+                "resource_uid": uid,
+                "source_path": str(source_path or ""),
+                "source_name": str(source_name or ""),
+                "source_type": str(source_type or ""),
+                "content_hash": str(content_hash or ""),
+                "byte_size": int(byte_size or 0),
+                "modified_at": float(modified_at or 0.0),
+                "encoding": str(encoding or ""),
+                "raw_event_id": int(raw_event_id or 0),
+                "card_path": str(card_path or ""),
+            },
+            "reasons": ["resource/source-evidence", f"chunk:{int(chunk_index)}", f"terms:{len(set(matched))}"],
+        }
+        previous = best_by_resource.get(uid)
+        if previous is None or float(candidate["query_score"]) > float(previous["query_score"]):
+            best_by_resource[uid] = candidate
+    return list(best_by_resource.values())
+
+
 def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str, object]:
     query = query if query is not None else read_query(args)
     root = store_root(args.store)
@@ -723,6 +1027,26 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
         )
         row["reasons"] = list(row.get("reasons", []))[:6]
 
+    items.extend(
+        dream_candidates(
+            conn,
+            query=query,
+            terms=terms,
+            filters=filters,
+            enabled=bool(getattr(args, "include_dreams", True)),
+            include_inferred=bool(getattr(args, "include_inferred_dreams", False)),
+        )
+    )
+    items.extend(
+        resource_candidates(
+            conn,
+            query=query,
+            terms=terms,
+            filters=filters,
+            enabled=bool(getattr(args, "include_resources", False)),
+            limit=max(args.candidate_pool, args.top_k * 4),
+        )
+    )
     items.sort(key=lambda item: (float(item["total_score"]), float(item["query_score"])), reverse=True)
     relevant_items = [
         item
@@ -775,6 +1099,11 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
                     "domain": row["domain"],
                     "topic": row["topic"],
                     "summary": row["summary"],
+                    "verification_state": row.get("verification_state", "unverified"),
+                    "prompt_eligible": bool(row.get("prompt_eligible", 1)),
+                    "inference_level": row.get("inference_level", ""),
+                    "admin_only": bool(row.get("admin_only", False)),
+                    "source_claim_ids": list(row.get("source_claim_ids", [])),
                     "importance": row["importance"],
                     "score": row["total_score"],
                     "query_score": row["query_score"],
@@ -786,6 +1115,7 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
                     "lifecycle_score": row["lifecycle_score"],
                     "best_chunk": row["best_chunk"],
                     "reasons": row["reasons"],
+                    "resource": row.get("resource"),
                 }
                 for row in selected
             ],
