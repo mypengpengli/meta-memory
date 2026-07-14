@@ -764,6 +764,9 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
             "returned": len(selected),
             "selected": [
                 {
+                    # Public callers need a stable identifier to submit
+                    # source-backed corrections through the public CLI.
+                    "id": row["memory_id"],
                     "path": row["path"],
                     "title": row["title"],
                     "memory_kind": row["memory_kind"],

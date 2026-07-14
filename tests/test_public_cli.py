@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from meta_memory.backup import backup_store, restore_store
+from meta_memory.cli import _emit
 from meta_memory.config import AppConfig, load_config, save_config
 from meta_memory.dream import run_dream
 from meta_memory.maintenance import maintain
@@ -43,6 +44,7 @@ class PublicCliRuntimeTests(unittest.TestCase):
         self.assertEqual(maintenance["status"], "ok")
         recalled = search(self.config, query="SQLite", project_name="auto", start=self.temp.name)
         self.assertEqual(len(recalled["results"]), 1)
+        self.assertTrue(recalled["results"][0]["id"])
 
         dream = run_dream(self.config)
         self.assertTrue(dream["inferred"])
@@ -62,6 +64,12 @@ class PublicCliRuntimeTests(unittest.TestCase):
         encoding_error = UnicodeEncodeError("cp1252", "→", 0, 1, "undefined")
         with patch("builtins.print", side_effect=[encoding_error, None]) as printed:
             emit({"relation": "→"})
+        self.assertIn("\\u2192", printed.call_args_list[1].args[0])
+
+    def test_public_cli_emit_falls_back_to_ascii_for_legacy_windows_console(self) -> None:
+        encoding_error = UnicodeEncodeError("cp1252", "→", 0, 1, "undefined")
+        with patch("builtins.print", side_effect=[encoding_error, None]) as printed:
+            _emit({"relation": "→"})
         self.assertIn("\\u2192", printed.call_args_list[1].args[0])
 
 

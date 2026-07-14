@@ -22,7 +22,14 @@ AGENTS = ["claude-code", "codex", "openclaw", "custom", "all"]
 
 
 def _emit(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+    text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Older Windows consoles can inherit a non-UTF-8 code page.  A
+        # successful command must still return valid JSON rather than fail
+        # while displaying a recalled Chinese or other Unicode value.
+        print(json.dumps(value, ensure_ascii=True, indent=2, default=str))
 
 
 def _yn(value: str) -> bool:
