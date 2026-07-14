@@ -69,6 +69,7 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="meta-memory", description="Shared local long-term memory for AI agents.")
     parser.add_argument("--config", help="Configuration path; defaults to ~/.meta-memory/config.toml")
+    parser.add_argument("--agent-id", default="", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
 
     setup = commands.add_parser("setup", help="Initialize a store and optionally install tasks and Agent skills")
@@ -84,10 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     project_set.add_argument("name"); project_set.add_argument("--cwd")
 
     before_cmd = commands.add_parser("before", help="Load bounded relevant context before answering")
-    before_cmd.add_argument("--project", default="auto"); before_cmd.add_argument("--session", required=True); before_cmd.add_argument("--query"); before_cmd.add_argument("--query-file"); before_cmd.add_argument("--cwd")
+    before_cmd.add_argument("--project", default="auto"); before_cmd.add_argument("--session", default="auto"); before_cmd.add_argument("--turn", default=""); before_cmd.add_argument("--query"); before_cmd.add_argument("--query-file"); before_cmd.add_argument("--cwd")
 
     after_cmd = commands.add_parser("after", help="Save one user/assistant turn after answering")
-    after_cmd.add_argument("--project", default="auto"); after_cmd.add_argument("--session", required=True); after_cmd.add_argument("--user"); after_cmd.add_argument("--user-file"); after_cmd.add_argument("--assistant"); after_cmd.add_argument("--assistant-file"); after_cmd.add_argument("--cwd")
+    after_cmd.add_argument("--turn", default=""); after_cmd.add_argument("--project", default="auto"); after_cmd.add_argument("--session", default=""); after_cmd.add_argument("--user"); after_cmd.add_argument("--user-file"); after_cmd.add_argument("--assistant"); after_cmd.add_argument("--assistant-file"); after_cmd.add_argument("--cwd")
 
     remember_cmd = commands.add_parser("remember", help="Explicitly save a sourced memory")
     remember_cmd.add_argument("--project", default="auto"); remember_cmd.add_argument("--session", default=""); remember_cmd.add_argument("--title", default=""); remember_cmd.add_argument("--content"); remember_cmd.add_argument("--content-file"); remember_cmd.add_argument("--cwd")
@@ -123,8 +124,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "project":
         context = bind_project(config, args.name, args.cwd); save_config(config)
         return {"status": "ok", "project": context.project_id, "root": str(context.root), "config": str(config.path)}
-    if args.command == "before": return before(config, query=read_text(args.query, args.query_file), session=args.session, project_name=args.project, start=args.cwd)
-    if args.command == "after": return after(config, user_text=read_text(args.user, args.user_file), assistant_text=read_text(args.assistant, args.assistant_file), session=args.session, project_name=args.project, start=args.cwd)
+    if args.command == "before": return before(config, query=read_text(args.query, args.query_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, turn_uid=args.turn)
+    if args.command == "after": return after(config, turn_uid=args.turn, user_text=read_text(args.user, args.user_file), assistant_text=read_text(args.assistant, args.assistant_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id)
     if args.command == "remember": return remember(config, content=read_text(args.content, args.content_file), title=args.title, session=args.session, project_name=args.project, start=args.cwd)
     if args.command == "correct": return correct(config, memory_id=args.memory, content=read_text(args.content, args.content_file))
     if args.command == "search": return search(config, query=args.query, project_name=args.project, start=args.cwd, limit=args.limit)

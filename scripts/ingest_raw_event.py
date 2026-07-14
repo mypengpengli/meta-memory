@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 from _common import DEFAULT_STORE_HELP, emit, open_db, sha256_text, store_root
@@ -24,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visibility-scope", choices=["global", "workspace", "agent"], default="workspace")
     parser.add_argument("--event-uid", default="")
     parser.add_argument("--idempotency-key", default="")
+    parser.add_argument("--turn-uid", default="")
+    parser.add_argument("--message-role", default="")
+    parser.add_argument("--message-sequence", type=int)
     parser.add_argument("--shared-mode", action="store_true", help="Reject an empty session id in shared deployments")
     parser.add_argument("--source-type", default="conversation", help="Source type such as conversation, note, log")
     parser.add_argument("--source-ref", default="", help="Optional source reference or external id")
@@ -62,7 +66,63 @@ def read_content(args: argparse.Namespace, payload: dict[str, object]) -> str:
     return str(payload.get("content", "")).strip()
 
 
-def insert_raw_event(
+def _duplicate_result(duplicate, *, subject_id: str, content_hash: str) -> dict[str, object]:
+    return {
+        "status": "ok",
+        "inserted": False,
+        "duplicate_of": {
+            "id": int(duplicate[0]),
+            "created_at": duplicate[1],
+            "processed_state": duplicate[2],
+        },
+        "raw_event_id": int(duplicate[0]),
+        "subject_id": subject_id,
+        "content_hash": content_hash,
+    }
+
+
+def _find_duplicate(
+    conn,
+    *,
+    subject_id: str,
+    session_id: str,
+    source_type: str,
+    source_ref: str,
+    content_hash: str,
+    profile_id: str,
+    workspace_id: str,
+    origin_agent_id: str,
+    idempotency_key: str,
+    allow_duplicate: bool,
+):
+    """Choose exactly one deduplication strategy."""
+    if allow_duplicate:
+        return None
+    if idempotency_key:
+        return conn.execute(
+            "SELECT id, created_at, processed_state FROM raw_events "
+            "WHERE profile_id=? AND workspace_id=? AND origin_agent_id=? AND idempotency_key=? LIMIT 1",
+            (profile_id, workspace_id, origin_agent_id, idempotency_key),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT id, created_at, processed_state
+        FROM raw_events
+        WHERE subject_id=? AND profile_id=? AND workspace_id=?
+          AND content_hash=?
+          AND COALESCE(session_id, '')=?
+          AND COALESCE(source_ref, '')=?
+          AND COALESCE(source_type, '')=?
+          AND COALESCE(origin_agent_id, '')=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (subject_id, profile_id, workspace_id, content_hash, session_id, source_ref, source_type, origin_agent_id),
+    ).fetchone()
+
+
+def insert_raw_event_with_conn(
+    conn,
     root: Path,
     *,
     subject_id: str,
@@ -81,79 +141,98 @@ def insert_raw_event(
     visibility_scope: str = "workspace",
     event_uid: str = "",
     idempotency_key: str = "",
+    turn_uid: str = "",
+    message_role: str = "",
+    message_sequence: int | None = None,
     shared_mode: bool = False,
 ) -> dict[str, object]:
-    conn = open_db(root)
+    """Insert one raw event into a caller-owned transaction.
+
+    The helper never commits or closes the connection.  Turn creation can
+    therefore persist the turn row and its user evidence atomically.
+    """
+    if not content.strip():
+        raise ValueError("Raw event content must not be empty.")
     visibility_scope = validate_visibility(visibility_scope, origin_agent_id if visibility_scope == "agent" else "")
     content_hash = sha256_text(content)
-
-    duplicate = None
-    if not allow_duplicate:
-        if idempotency_key:
-            duplicate = conn.execute(
-                "SELECT id, created_at, processed_state FROM raw_events WHERE profile_id=? AND workspace_id=? AND origin_agent_id=? AND idempotency_key=? LIMIT 1",
-                (profile_id, workspace_id, origin_agent_id, idempotency_key),
-            ).fetchone()
-        duplicate = conn.execute(
-            """
-            SELECT id, created_at, processed_state
-            FROM raw_events
-            WHERE subject_id = ? AND profile_id=? AND workspace_id=?
-              AND content_hash = ?
-              AND COALESCE(session_id, '') = ?
-              AND COALESCE(source_ref, '') = ?
-              AND COALESCE(source_type, '') = ?
-              AND COALESCE(origin_agent_id, '') = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (subject_id, profile_id, workspace_id, content_hash, session_id, source_ref, source_type, origin_agent_id),
-        ).fetchone() if duplicate is None else duplicate
-
-    if duplicate:
-        conn.close()
-        return {
-            "status": "ok",
-            "inserted": False,
-            "duplicate_of": {
-                "id": duplicate[0],
-                "created_at": duplicate[1],
-                "processed_state": duplicate[2],
-            },
-            "subject_id": subject_id,
-            "content_hash": content_hash,
-        }
-
-    cursor = conn.execute(
-        """
-        INSERT INTO raw_events(
-            subject_id, subject_name, session_id, source_type, source_ref,
-            content, content_hash, topic_hint, domain_hint, event_time, processed_state,
-            profile_id, workspace_id, origin_agent_id, visibility_scope, event_uid, idempotency_key
-        )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            subject_id,
-            subject_name,
-            session_id,
-            source_type,
-            source_ref,
-            content,
-            content_hash,
-            topic_hint,
-            domain_hint,
-            event_time,
-            profile_id, workspace_id, origin_agent_id, visibility_scope, event_uid or None, idempotency_key or None,
-        ),
+    duplicate = _find_duplicate(
+        conn,
+        subject_id=subject_id,
+        session_id=session_id,
+        source_type=source_type,
+        source_ref=source_ref,
+        content_hash=content_hash,
+        profile_id=profile_id,
+        workspace_id=workspace_id,
+        origin_agent_id=origin_agent_id,
+        idempotency_key=idempotency_key,
+        allow_duplicate=allow_duplicate,
     )
+    if duplicate:
+        return _duplicate_result(duplicate, subject_id=subject_id, content_hash=content_hash)
+
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO raw_events(
+                subject_id, subject_name, session_id, source_type, source_ref,
+                content, content_hash, topic_hint, domain_hint, event_time, processed_state,
+                profile_id, workspace_id, origin_agent_id, visibility_scope, event_uid,
+                idempotency_key, turn_uid, message_role, message_sequence
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                subject_id,
+                subject_name,
+                session_id,
+                source_type,
+                source_ref,
+                content,
+                content_hash,
+                topic_hint,
+                domain_hint,
+                event_time,
+                profile_id,
+                workspace_id,
+                origin_agent_id,
+                visibility_scope,
+                event_uid or None,
+                idempotency_key or None,
+                turn_uid or None,
+                message_role or None,
+                message_sequence,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        duplicate = _find_duplicate(
+            conn,
+            subject_id=subject_id,
+            session_id=session_id,
+            source_type=source_type,
+            source_ref=source_ref,
+            content_hash=content_hash,
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            origin_agent_id=origin_agent_id,
+            idempotency_key=idempotency_key,
+            allow_duplicate=False,
+        )
+        if duplicate:
+            return _duplicate_result(duplicate, subject_id=subject_id, content_hash=content_hash)
+        raise
+
     event_id = int(cursor.lastrowid)
     try:
-        conn.execute("INSERT INTO raw_events_fts(raw_event_id, content, topic_hint, domain_hint) VALUES(?, ?, ?, ?)", (event_id, content, topic_hint, domain_hint))
+        conn.execute(
+            "INSERT INTO raw_events_fts(raw_event_id, content, topic_hint, domain_hint) VALUES(?, ?, ?, ?)",
+            (event_id, content, topic_hint, domain_hint),
+        )
     except Exception:
         pass
     try:
         from session_archive import record_session_message
+
         record_session_message(
             root,
             subject_id=subject_id,
@@ -168,11 +247,7 @@ def insert_raw_event(
             conn=conn,
         )
     except Exception as exc:
-        # Raw evidence remains authoritative, but make projection failures
-        # observable instead of silently paying the same failure every turn.
         LOGGER.warning("Session archive projection failed for raw_event=%s: %s", event_id, exc)
-    conn.commit()
-    conn.close()
 
     return {
         "status": "ok",
@@ -184,7 +259,23 @@ def insert_raw_event(
         "content_hash": content_hash,
         "topic_hint": topic_hint,
         "domain_hint": domain_hint,
+        "turn_uid": turn_uid,
+        "message_role": message_role,
     }
+
+
+def insert_raw_event(root: Path, **kwargs) -> dict[str, object]:
+    """Compatibility wrapper that owns the SQLite transaction."""
+    conn = open_db(root)
+    try:
+        result = insert_raw_event_with_conn(conn, root, **kwargs)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def main() -> None:
@@ -209,6 +300,13 @@ def main() -> None:
     visibility_scope = str(arg_or_payload(args, payload, "visibility_scope", "workspace"))
     event_uid = str(arg_or_payload(args, payload, "event_uid", ""))
     idempotency_key = str(arg_or_payload(args, payload, "idempotency_key", ""))
+    turn_uid = str(arg_or_payload(args, payload, "turn_uid", ""))
+    message_role = str(arg_or_payload(args, payload, "message_role", ""))
+    sequence_value = arg_or_payload(args, payload, "message_sequence", None)
+    try:
+        message_sequence = int(sequence_value) if sequence_value not in (None, "") else None
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("message_sequence must be an integer.") from exc
 
     root = store_root(args.store)
     emit(
@@ -228,6 +326,7 @@ def main() -> None:
             workspace_id=workspace_id,
             origin_agent_id=origin_agent_id, visibility_scope=visibility_scope,
             event_uid=event_uid, idempotency_key=idempotency_key,
+            turn_uid=turn_uid, message_role=message_role, message_sequence=message_sequence,
             shared_mode=bool(getattr(args, "shared_mode", False)),
         )
     )

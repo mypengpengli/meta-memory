@@ -18,9 +18,14 @@ def read_text(value: str | None = None, path: str | Path | None = None) -> str:
     return str(value or "").strip()
 
 
-def origin_agent_id() -> str:
-    """Keep an audit trail without turning agent identity into a user setting."""
-    return os.environ.get("META_MEMORY_AGENT_ID", "meta-memory").strip() or "meta-memory"
+def origin_agent_id(explicit: str | None = None) -> str:
+    """Resolve provenance consistently for every public runtime operation.
+
+    A launcher may pass an explicit identity, while direct invocations can use
+    ``META_MEMORY_AGENT_ID``.  The generic fallback intentionally avoids
+    pretending that the memory service itself authored the event.
+    """
+    return str(explicit or "").strip() or os.environ.get("META_MEMORY_AGENT_ID", "").strip() or "generic-agent"
 
 
 def _base(config: AppConfig, project: ProjectContext, session: str, *, agent_id: str = "") -> dict[str, Any]:
@@ -47,90 +52,75 @@ def _remember_visibility(content: str) -> str:
     return "global" if kind == "profile" else "workspace"
 
 
-def before(config: AppConfig, *, query: str, session: str, project_name: str = "auto", start: str | Path | None = None) -> dict[str, Any]:
-    if not session.strip():
-        raise ValueError("--session is required so concurrent agents never mix conversations.")
-    if not query.strip():
-        raise ValueError("A request is required via --query or --query-file.")
+def before(
+    config: AppConfig,
+    *,
+    query: str,
+    session: str = "auto",
+    project_name: str = "auto",
+    start: str | Path | None = None,
+    agent_id: str = "",
+    turn_uid: str = "",
+) -> dict[str, Any]:
+    """Durably begin a turn before asking the retrieval layer for context."""
     bootstrap()
-    from memory_runtime import prepare_context
+    from .turn_service import begin_turn
 
-    project = resolve_project(config, project_name, start)
-    base = _base(config, project, session, agent_id="")
-    # Display names may change over time; retrieval must be keyed by the
-    # stable user id rather than hiding legacy claims named "Unknown".
-    base["subject_name"] = ""
-    args = argparse.Namespace(
-        **base,
-        query=query, query_file=None, topic_hint="", domain_hint="", source_ref="",
-        event_time="", skip_record_query=True, allow_duplicate=False,
-        skip_heartbeat=True, heartbeat_policy="conservative",
-        heartbeat_interval_minutes=config.maintenance_interval_minutes,
-        heartbeat_min_pending=3, heartbeat_max_events=20,
-        top_k=config.top_k, candidate_pool=max(config.top_k * 4, 24),
-        expand_hops=1, include_candidates=False, no_basics=False, raw_limit=3,
-        skip_raw_evidence=False, context_token_budget=1800, context_out_file=None,
-        out_file=None, hot_snapshot_policy="frozen",
+    return begin_turn(
+        config,
+        query=query,
+        project_name=project_name,
+        requested_session=session,
+        agent_id=origin_agent_id(agent_id),
+        cwd=start,
+        requested_turn_uid=turn_uid,
     )
-    result = prepare_context(args)
-    return {
-        "status": "ok",
-        "hot_context": result["static_hot_context"],
-        "context": result["context_markdown"],
-        "session_id": session,
-        "project": project.project_id,
-        "project_root": str(project.root),
-        "query_route": result["query_route"],
-        "hot_memory_snapshot_hash": result["hot_memory_snapshot_hash"],
-    }
 
 
 def after(
     config: AppConfig,
     *,
-    user_text: str,
     assistant_text: str,
-    session: str,
+    turn_uid: str = "",
+    user_text: str = "",
+    session: str = "",
     project_name: str = "auto",
     start: str | Path | None = None,
+    agent_id: str = "",
 ) -> dict[str, Any]:
-    """Append a whole turn and enqueue work; never consolidate inline."""
-    if not session.strip():
-        raise ValueError("--session is required so concurrent agents never mix conversations.")
-    if not user_text.strip() or not assistant_text.strip():
-        raise ValueError("Both --user-file/--user and --assistant-file/--assistant are required.")
+    """Complete a durable turn, with one-release compatibility for old calls."""
+    if not assistant_text.strip():
+        raise ValueError("Assistant content is required via --assistant or --assistant-file.")
     bootstrap()
-    from background_review import enqueue_review
-    from ingest_raw_event import insert_raw_event
+    from .turn_service import begin_turn, complete_turn
 
-    project = resolve_project(config, project_name, start)
-    base = _base(config, project, session, agent_id=origin_agent_id())
-    event_identity = {
-        "subject_id": config.subject_id, "subject_name": config.user_name,
-        "session_id": session, "profile_id": config.profile_id,
-        "workspace_id": project.workspace_id, "origin_agent_id": origin_agent_id(),
-        "visibility_scope": "workspace", "shared_mode": True,
-    }
-    user_event = insert_raw_event(
-        Path(base["store"]), **event_identity,
-        source_type="conversation-user", content=user_text, source_ref="", topic_hint="", domain_hint="", event_time="",
+    if turn_uid.strip():
+        return complete_turn(config, turn_uid=turn_uid, assistant_text=assistant_text)
+    if not user_text.strip() or not session.strip():
+        raise ValueError("--turn is required, or provide the legacy --session and --user/--user-file arguments.")
+
+    # Keep integrations on the old after contract working while ensuring they
+    # receive the same durable, idempotent Turn semantics as new integrations.
+    started = begin_turn(
+        config,
+        query=user_text,
+        project_name=project_name,
+        requested_session=session,
+        agent_id=origin_agent_id(agent_id),
+        cwd=start,
     )
-    assistant_event = insert_raw_event(
-        Path(base["store"]), **event_identity,
-        source_type="conversation-assistant", content=assistant_text, source_ref="", topic_hint="", domain_hint="", event_time="",
+    completed = complete_turn(config, turn_uid=str(started["turn_id"]), assistant_text=assistant_text)
+    completed.update(
+        {
+            "warning": "legacy_after_arguments",
+            "session_id": str(started["session_id"]),
+            "project": str(started["project"]),
+            "user_event": {"inserted": not bool(started.get("idempotent")), "raw_event_id": started.get("user_event_id")},
+            "assistant_event": {"inserted": not bool(completed.get("idempotent")), "raw_event_id": completed.get("assistant_event_id")},
+            "review": {"job_id": completed.get("review_job_id"), "status": "pending" if completed.get("queued") else "not_scheduled"},
+        }
     )
-    inserted = [int(item["raw_event_id"]) for item in (user_event, assistant_event) if item.get("inserted")]
-    queued: dict[str, Any]
-    if inserted:
-        queued = enqueue_review(
-            Path(base["store"]), subject_id=config.subject_id, session_id=session,
-            event_start_id=min(inserted), event_end_id=max(inserted), trigger_type="turn_end",
-            profile_id=config.profile_id, workspace_id=project.workspace_id,
-            origin_agent_id=origin_agent_id(),
-        )
-    else:
-        queued = {"status": "not_scheduled", "reason": "duplicate_turn"}
-    return {"status": "ok", "session_id": session, "project": project.project_id, "user_event": user_event, "assistant_event": assistant_event, "review": queued}
+    return completed
 
 
 def remember(

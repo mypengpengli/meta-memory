@@ -16,20 +16,63 @@ from consolidate_memories import build_plan
 from extract_memory_units import extract_units
 
 
-def enqueue_review(root, *, subject_id: str, session_id: str, event_start_id: int, event_end_id: int, trigger_type: str, profile_id: str = "default", workspace_id: str = "default", origin_agent_id: str = "") -> dict[str, object]:
-    """Keep one pending tail per identity/session instead of overlapping jobs."""
-    conn=open_db(root)
-    pending=conn.execute("SELECT job_uid,event_start_id,event_end_id FROM review_jobs WHERE subject_id=? AND session_id=? AND profile_id=? AND workspace_id=? AND origin_agent_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1",(subject_id,session_id,profile_id,workspace_id,origin_agent_id)).fetchone()
-    if pending:
-        start=min(int(pending[1] or event_start_id), event_start_id) if int(pending[1] or 0) else event_start_id
-        end=max(int(pending[2] or 0), event_end_id)
-        key=f"{subject_id}:{profile_id}:{workspace_id}:{origin_agent_id}:{session_id}:{start}:{end}:{trigger_type}:v3"
-        conn.execute("UPDATE review_jobs SET event_start_id=?,event_end_id=?,job_key=?,trigger_type=? WHERE job_uid=?",(start,end,key,trigger_type,pending[0]))
-        conn.commit();conn.close();return {"job_id":str(pending[0]),"status":"pending","deduplicated":True,"merged_tail":True}
-    key=f"{subject_id}:{profile_id}:{workspace_id}:{origin_agent_id}:{session_id}:{event_start_id}:{event_end_id}:{trigger_type}:v3"
-    existing=conn.execute("SELECT job_uid,status FROM review_jobs WHERE job_key=?",(key,)).fetchone()
-    if existing: conn.close(); return {"job_id":str(existing[0]),"status":str(existing[1]),"deduplicated":True}
-    uid=str(uuid.uuid4()); conn.execute("INSERT INTO review_jobs(job_uid,job_key,subject_id,session_id,event_start_id,event_end_id,trigger_type,profile_id,workspace_id,origin_agent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",(uid,key,subject_id,session_id,event_start_id,event_end_id,trigger_type,profile_id,workspace_id,origin_agent_id)); conn.commit(); conn.close(); return {"job_id":uid,"status":"pending","deduplicated":False}
+def enqueue_review(
+    root,
+    *,
+    subject_id: str,
+    session_id: str,
+    event_start_id: int,
+    event_end_id: int,
+    trigger_type: str,
+    profile_id: str = "default",
+    workspace_id: str = "default",
+    origin_agent_id: str = "",
+    conn=None,
+) -> dict[str, object]:
+    """Keep one pending tail per identity/session instead of overlapping jobs.
+
+    Supplying a connection lets a caller make event insertion, turn completion,
+    and review-job creation one SQLite transaction.  The compatibility path
+    still owns its own connection and commits exactly as before.
+    """
+    own_connection = conn is None
+    conn = conn or open_db(root)
+    try:
+        pending = conn.execute(
+            "SELECT job_uid,event_start_id,event_end_id FROM review_jobs "
+            "WHERE subject_id=? AND session_id=? AND profile_id=? AND workspace_id=? "
+            "AND origin_agent_id=? AND status='pending' ORDER BY created_at DESC LIMIT 1",
+            (subject_id, session_id, profile_id, workspace_id, origin_agent_id),
+        ).fetchone()
+        if pending:
+            start = min(int(pending[1] or event_start_id), event_start_id) if int(pending[1] or 0) else event_start_id
+            end = max(int(pending[2] or 0), event_end_id)
+            key = f"{subject_id}:{profile_id}:{workspace_id}:{origin_agent_id}:{session_id}:{start}:{end}:{trigger_type}:v3"
+            conn.execute(
+                "UPDATE review_jobs SET event_start_id=?,event_end_id=?,job_key=?,trigger_type=? WHERE job_uid=?",
+                (start, end, key, trigger_type, pending[0]),
+            )
+            if own_connection:
+                conn.commit()
+            return {"job_id": str(pending[0]), "status": "pending", "deduplicated": True, "merged_tail": True}
+
+        key = f"{subject_id}:{profile_id}:{workspace_id}:{origin_agent_id}:{session_id}:{event_start_id}:{event_end_id}:{trigger_type}:v3"
+        existing = conn.execute("SELECT job_uid,status FROM review_jobs WHERE job_key=?", (key,)).fetchone()
+        if existing:
+            return {"job_id": str(existing[0]), "status": str(existing[1]), "deduplicated": True}
+
+        uid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO review_jobs(job_uid,job_key,subject_id,session_id,event_start_id,event_end_id,trigger_type,profile_id,workspace_id,origin_agent_id) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (uid, key, subject_id, session_id, event_start_id, event_end_id, trigger_type, profile_id, workspace_id, origin_agent_id),
+        )
+        if own_connection:
+            conn.commit()
+        return {"job_id": uid, "status": "pending", "deduplicated": False}
+    finally:
+        if own_connection:
+            conn.close()
 
 
 def recover_stuck_jobs(root, *, timeout_minutes: int = 10) -> int:
