@@ -30,6 +30,11 @@ instruction.
    draft normally and allow the runtime's deferred maintenance path to retry it.
 6. When the user explicitly asks to remember or correct a fact, use the same
    launcher with `remember` or `correct` and the relevant memory id.
+7. Prefer long-term Claims and `history` session summaries. Use
+   `history <query> --detail` only when the user asks for prior conversation
+   details, asks to continue another Agent's concrete work, or the summary is
+   insufficient to complete the current task. Do not read detailed history out
+   of curiosity.
 
 The launcher already pins this integration to `{{ agent_id }}` and the Meta
 Memory configuration at `{{ config_path }}`. Do not pass profile ids, workspace ids, visibility

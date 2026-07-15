@@ -106,13 +106,18 @@ class V25BoundaryTests(unittest.TestCase):
         self.assertNotIn("claude-only-session-token", claude["context"])
         after(self.config, turn_uid="claude-turn", assistant_text="Claude reply.", agent_id="claude-code")
 
+        cards = build_cards(self.config.store, subject_id=self.subject, profile_id=self.profile, workspace_id="project:shared", force=True)
+        self.assertEqual({str(item["origin_agent_id"]) for item in cards["cards"]}, {"codex", "claude-code"})
+
         codex_history = history(self.config, query="codex-only-session-token", project_name="shared", start=self.root, agent_id="codex")
         claude_history = history(self.config, query="codex-only-session-token", project_name="shared", start=self.root, agent_id="claude-code")
         self.assertEqual(len(codex_history["sessions"]), 1)
-        self.assertEqual(claude_history["sessions"], [])
+        self.assertEqual(len(claude_history["sessions"]), 1)
+        self.assertEqual(claude_history["sessions"][0]["origin_agent_id"], "codex")
 
-        cards = build_cards(self.config.store, subject_id=self.subject, profile_id=self.profile, workspace_id="project:shared", force=True)
-        self.assertEqual({str(item["origin_agent_id"]) for item in cards["cards"]}, {"codex", "claude-code"})
+        self.config.history_scope = "agent"
+        isolated = history(self.config, query="codex-only-session-token", project_name="shared", start=self.root, agent_id="claude-code")
+        self.assertEqual(isolated["sessions"], [])
 
     def test_other_agent_cannot_complete_a_turn(self) -> None:
         before(

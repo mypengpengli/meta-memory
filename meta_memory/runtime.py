@@ -338,18 +338,37 @@ def history(
     project_name: str = "auto",
     start: str | Path | None = None,
     agent_id: str = "",
+    detail: bool = False,
 ) -> dict[str, Any]:
     bootstrap()
-    from session_search import discovery
+    from session_search import discover_session_summaries, read_session_detail
 
     project = resolve_project(config, project_name, start)
-    result = discovery(
+    scope = str(getattr(config, "history_scope", "workspace-summary") or "workspace-summary")
+    reader_agent = origin_agent_id(agent_id)
+    result = discover_session_summaries(
         Path(config.store),
         subject_id=config.subject_id,
         query=query,
         limit=8,
         profile_id=config.profile_id,
         workspace_id=project.workspace_id,
-        agent_id=origin_agent_id(agent_id),
+        agent_id=reader_agent if scope == "agent" else "",
     )
-    return {"status": "ok", "project": project.project_id, **result}
+    response = {"status": "ok", "project": project.project_id, "history_scope": scope, **result}
+    if detail:
+        if not bool(getattr(config, "history_allow_detail", True)):
+            raise ValueError("History detail is disabled by configuration.")
+        response["mode"] = "detail"
+        response["details"] = read_session_detail(
+            Path(config.store),
+            summaries=list(result["sessions"]),
+            subject_id=config.subject_id,
+            workspace_id=project.workspace_id,
+            profile_id=config.profile_id,
+            max_sessions=int(getattr(config, "history_detail_max_sessions", 3)),
+            max_turns=int(getattr(config, "history_detail_max_turns", 8)),
+            max_chars=int(getattr(config, "history_detail_max_chars", 12000)),
+            tool_summary_max_chars=int(getattr(config, "history_tool_summary_max_chars", 1200)),
+        )
+    return response

@@ -13,6 +13,7 @@ from runtime_identity import add_identity_args
 
 
 QUESTION = re.compile(r"(?:[?？]\s*$|^(?:why|what|how|can you|could you|请问|为什么|怎么|如何|是否|能不能|可不可以))", re.I)
+SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|bearer\s+|(?:api[_-]?key|token|cookie|password|secret)\s*[:=]\s*)[^\s,;]+")
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,17 +44,30 @@ def session_key(session_id: str) -> str:
     return session_id.strip() or "__default__"
 
 
-def event_summary(events: list[dict[str, object]]) -> tuple[str, list[str]]:
+def _safe_excerpt(value: str, limit: int) -> str:
+    text = SECRET.sub(r"\1[redacted]", " ".join(value.split()))
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def event_summary(events: list[dict[str, object]]) -> tuple[str, list[str], str]:
     lines: list[str] = []
     questions: list[str] = []
+    tools: list[str] = []
     for event in events:
-        content = sentence(str(event["content"]))
+        source = str(event["source_type"] or "").replace("_", "-").casefold()
+        if "resource" in source or "agent-observation" in source or "subagent" in source:
+            continue
+        content = sentence(_safe_excerpt(str(event["content"]), 420))
         if not content:
             continue
-        lines.append(f"- [raw_event:{event['id']}] {event['source_type']}: {content}")
-        if str(event["source_type"]) == "conversation-user" and QUESTION.search(content):
+        if "tool" in source:
+            tools.append(f"- tool result: {_safe_excerpt(content, 240)}")
+            continue
+        role = "User" if source == "conversation-user" else "Assistant" if source == "conversation-assistant" else "Event"
+        lines.append(f"- {role} summary: {content}")
+        if source == "conversation-user" and QUESTION.search(content):
             questions.append(content)
-    return "\n".join(lines), questions[:8]
+    return "\n".join(lines)[-6000:], questions[:8], "\n".join(tools)[-1200:]
 
 
 def build_cards(
@@ -72,7 +86,8 @@ def build_cards(
     origin_agent_id: str | None = None,
 ) -> dict[str, object]:
     conn = open_db(root)
-    clauses = ["processed_state IN ('pending', 'sessionized')"]
+    completed_turn = "(turn_uid IS NULL OR EXISTS (SELECT 1 FROM turns AS t WHERE t.turn_uid=raw_events.turn_uid AND t.status='completed'))"
+    clauses = ["processed_state IN ('pending', 'sessionized')", completed_turn]
     params: list[object] = []
     if subject_id:
         clauses.append("subject_id = ?")
@@ -112,7 +127,7 @@ def build_cards(
         sess = str(raw_session or "")
         key = session_key(sess)
         card = conn.execute(
-            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?",
+            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id, tool_summary FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?",
             (sid, key, raw_profile, raw_workspace, raw_agent),
         ).fetchone()
         last_event_id = int(card[1] or 0) if card else 0
@@ -123,6 +138,7 @@ def build_cards(
             WHERE subject_id = ? AND COALESCE(session_id, '') = ?
               AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?
               AND id > ? AND processed_state IN ('pending', 'sessionized')
+              AND (turn_uid IS NULL OR EXISTS (SELECT 1 FROM turns AS t WHERE t.turn_uid=raw_events.turn_uid AND t.status='completed'))
             """ + (" AND id <= ?" if event_end_id is not None else "") + " ORDER BY id ASC LIMIT ?",
             (sid, sess, raw_profile, raw_workspace, raw_agent, max(last_event_id, (event_start_id or 0) - 1), *((event_end_id,) if event_end_id is not None else ()), max_events),
         ).fetchall()
@@ -133,34 +149,43 @@ def build_cards(
         if not events or (len(events) < min_events and not force):
             results.append({"subject_id": sid, "session_id": sess, "created": False, "reason": "threshold_not_reached" if events else "no_new_events", "event_count": len(events)})
             continue
-        addition, questions = event_summary(events)
+        addition, questions, tool_addition = event_summary(events)
         old_ids = json.loads(card[2] or "[]") if card else []
         old_questions = json.loads(card[4] or "[]") if card else []
         old_summary = str(card[3] or "") if card else ""
+        old_tool_summary = str(card[7] or "") if card else ""
         # The normalized relation is authoritative.  Keep this legacy JSON
         # field bounded so a long-running conversation does not grow one row
         # without limit, while preserving a compact recent audit preview.
         ids = (old_ids + [event["id"] for event in events if event["id"] not in old_ids])[-200:]
-        summary = "\n".join(part for part in [old_summary, addition] if part).strip()[-12000:]
+        summary = "\n".join(part for part in [old_summary, addition] if part).strip()[-6000:]
+        tool_summary = "\n".join(part for part in [old_tool_summary, tool_addition] if part).strip()[-1200:]
         open_questions = list(dict.fromkeys(old_questions + questions))[:12]
+        completed = conn.execute(
+            "SELECT COUNT(*),MAX(completed_at) FROM turns WHERE subject_id=? AND profile_id=? AND workspace_id=? AND origin_agent_id=? AND external_session_id=? AND status='completed'",
+            (sid, raw_profile, raw_workspace, raw_agent, sess),
+        ).fetchone()
+        completed_count = int(completed[0] or 0)
+        last_completed_at = str(completed[1] or "")
         if not dry_run:
             if card:
                 card_id = int(card[0])
                 conn.execute(
                     """
-                    UPDATE session_cards SET event_end_id=?, last_event_id=?, source_event_ids=?, summary=?, open_questions=?,
-                    needs_extraction=1, version=?, updated_at=? WHERE id=?
+                    UPDATE session_cards SET event_end_id=?, last_event_id=?, source_event_ids=?, summary=?, tool_summary=?, open_questions=?,
+                    completed_turn_count=?, last_completed_turn_at=?, summary_visibility='workspace', detail_visibility='workspace',
+                    summary_generation=summary_generation+1, summary_dirty=0, needs_extraction=1, version=?, updated_at=? WHERE id=?
                     """,
-                    (events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, json.dumps(open_questions, ensure_ascii=False), int(card[5] or 1) + 1, now, card_id),
+                    (events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), completed_count, last_completed_at or None, int(card[5] or 1) + 1, now, card_id),
                 )
             else:
                 cursor = conn.execute(
                     """
                     INSERT INTO session_cards(subject_id, subject_name, session_id, profile_id, workspace_id, origin_agent_id, event_start_id, event_end_id, last_event_id,
-                    source_event_ids, summary, open_questions, state, needs_extraction, version, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, 1, ?)
+                    source_event_ids, summary, tool_summary, open_questions, completed_turn_count, last_completed_turn_at, summary_visibility, detail_visibility, summary_generation, summary_dirty, state, needs_extraction, version, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'workspace', 'workspace', 1, 0, 'active', 1, 1, ?)
                     """,
-                    (sid, str(raw_name or "Unknown"), key, raw_profile, raw_workspace, raw_agent or origin_agent_id or "", events[0]["id"], events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, json.dumps(open_questions, ensure_ascii=False), now),
+                    (sid, str(raw_name or "Unknown"), key, raw_profile, raw_workspace, raw_agent or origin_agent_id or "", events[0]["id"], events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), completed_count, last_completed_at or None, now),
                 )
                 card_id = int(cursor.lastrowid)
             placeholders = ", ".join("?" for _ in events)

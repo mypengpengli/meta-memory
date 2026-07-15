@@ -520,6 +520,12 @@ def _apply_restored_config(config: "AppConfig", restored: "AppConfig") -> str:
     config.dream_scan_days = restored.dream_scan_days
     config.dream_provider = restored.dream_provider
     config.dream_command = restored.dream_command
+    config.history_scope = restored.history_scope
+    config.history_allow_detail = restored.history_allow_detail
+    config.history_detail_max_sessions = restored.history_detail_max_sessions
+    config.history_detail_max_turns = restored.history_detail_max_turns
+    config.history_detail_max_chars = restored.history_detail_max_chars
+    config.history_tool_summary_max_chars = restored.history_tool_summary_max_chars
     config.session_auto_expire_hours = restored.session_auto_expire_hours
     config.top_k = restored.top_k
     config.embeddings = restored.embeddings

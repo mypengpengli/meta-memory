@@ -38,6 +38,12 @@ class AppConfig:
     dream_scan_days: int = 7
     dream_provider: str = "deterministic"
     dream_command: str = ""
+    history_scope: str = "workspace-summary"
+    history_allow_detail: bool = True
+    history_detail_max_sessions: int = 3
+    history_detail_max_turns: int = 8
+    history_detail_max_chars: int = 12000
+    history_tool_summary_max_chars: int = 1200
     session_auto_expire_hours: int = 8
     top_k: int = 8
     embeddings: bool = False
@@ -88,6 +94,11 @@ def normalize_search_depth(value: Any) -> str:
     return depth if depth in {"light", "normal", "deep", "auto"} else "auto"
 
 
+def normalize_history_scope(value: Any) -> str:
+    scope = str(value or "").strip().casefold()
+    return scope if scope in {"agent", "workspace-summary"} else "workspace-summary"
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     config_path = Path(path).expanduser() if path else default_config_path()
     if not config_path.exists():
@@ -118,6 +129,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         dream_scan_days=max(1, int(_value(data, "dream", "scan_days", 7))),
         dream_provider=str(_value(data, "dream", "provider", "deterministic")).strip().casefold() or "deterministic",
         dream_command=str(_value(data, "dream", "command", "")),
+        history_scope=normalize_history_scope(_value(data, "history", "scope", "workspace-summary")),
+        history_allow_detail=_bool(_value(data, "history", "allow_detail", True), True),
+        history_detail_max_sessions=max(1, int(_value(data, "history", "detail_max_sessions", 3))),
+        history_detail_max_turns=max(1, int(_value(data, "history", "detail_max_turns", 8))),
+        history_detail_max_chars=max(256, int(_value(data, "history", "detail_max_chars", 12000))),
+        history_tool_summary_max_chars=max(120, int(_value(data, "history", "tool_summary_max_chars", 1200))),
         session_auto_expire_hours=max(1, int(_value(data, "session", "auto_expire_hours", 8))),
         top_k=max(1, int(_value(data, "retrieval", "top_k", 8))),
         embeddings=_bool(_value(data, "retrieval", "embeddings", False), False),
@@ -141,6 +158,7 @@ def save_config(config: AppConfig) -> Path:
         "[session]", f"auto_expire_hours = {max(1, int(config.session_auto_expire_hours))}", "",
         "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", "",
         "[dream]", f"enabled = {str(config.dream_enabled).lower()}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {config.dream_scan_days}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
+        "[history]", f"scope = {_quote(normalize_history_scope(config.history_scope))}", f"allow_detail = {str(config.history_allow_detail).lower()}", f"detail_max_sessions = {max(1, int(config.history_detail_max_sessions))}", f"detail_max_turns = {max(1, int(config.history_detail_max_turns))}", f"detail_max_chars = {max(256, int(config.history_detail_max_chars))}", f"tool_summary_max_chars = {max(120, int(config.history_tool_summary_max_chars))}", "",
         "[retrieval]", f"top_k = {config.top_k}", f"embeddings = {str(config.embeddings).lower()}", "",
         "[advanced]", f"http_api = {str(config.http_api).lower()}", f"agent_private_memory = {str(config.agent_private_memory).lower()}", "",
         "[projects]",

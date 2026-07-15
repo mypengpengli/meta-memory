@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_cmd = commands.add_parser("search", help="Search current user/project memory")
     search_cmd.add_argument("query"); search_cmd.add_argument("--project", default="auto"); search_cmd.add_argument("--limit", type=int); search_cmd.add_argument("--cwd")
     history_cmd = commands.add_parser("history", help="Search prior session messages")
-    history_cmd.add_argument("query"); history_cmd.add_argument("--project", default="auto"); history_cmd.add_argument("--cwd")
+    history_cmd.add_argument("query"); history_cmd.add_argument("--project", default="auto"); history_cmd.add_argument("--cwd"); history_cmd.add_argument("--detail", action="store_true")
 
     session_cmd = commands.add_parser("session", help="Inspect, rotate, or close the local automatic session")
     session_commands = session_cmd.add_subparsers(dest="session_command", required=True)
@@ -167,7 +167,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "remember": return remember(config, content=read_text(args.content, args.content_file), title=args.title, session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, scope=args.scope, source_kind=args.source_kind, source_ref=args.source_ref)
     if args.command == "correct": return correct(config, memory_id=args.memory, content=read_text(args.content, args.content_file), agent_id=args.agent_id)
     if args.command == "search": return search(config, query=args.query, project_name=args.project, start=args.cwd, limit=args.limit, agent_id=args.agent_id)
-    if args.command == "history": return history(config, query=args.query, project_name=args.project, start=args.cwd, agent_id=args.agent_id)
+    if args.command == "history": return history(config, query=args.query, project_name=args.project, start=args.cwd, agent_id=args.agent_id, detail=args.detail)
     if args.command == "session":
         from .session_manager import close_session as close_cached_session, new_session, resolve_session
         project = resolve_project(config, args.project, args.cwd)
