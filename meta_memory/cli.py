@@ -13,6 +13,47 @@ from .config import AppConfig, load_config, save_config, slug
 AGENTS = ["claude-code", "codex", "openclaw", "custom", "all"]
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep command help readable and make meaningful defaults visible."""
+
+    def _get_help_string(self, action: argparse.Action) -> str | None:
+        text = action.help
+        default = action.default
+        if (
+            text
+            and "%(default)" not in text
+            and default is not None
+            and default is not False
+            and default is not argparse.SUPPRESS
+            and bool(action.option_strings)
+        ):
+            return f"{text} (default: %(default)s)"
+        return text
+
+
+def _set_help(parser: argparse.ArgumentParser, *, description: str, examples: str = "") -> None:
+    parser.description = description
+    parser.epilog = examples or None
+
+
+def _polish_help(parser: argparse.ArgumentParser) -> None:
+    """Apply the same help formatting to every nested command parser."""
+    parser.formatter_class = _HelpFormatter
+    for action in parser._actions:
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for child in {id(item): item for item in choices.values()}.values():
+                _polish_help(child)
+
+
+def _rename_subcommand_help(action: Any, labels: dict[str, str]) -> None:
+    """Replace terse argparse labels without changing command compatibility."""
+    for choice in getattr(action, "_choices_actions", []):
+        command = str(getattr(choice, "dest", ""))
+        if command in labels:
+            choice.help = labels[command]
+
+
 def _emit(value: Any, *, output_format: str = "json") -> None:
     if output_format == "auto":
         output_format = "text" if sys.stdout.isatty() else "json"
@@ -94,19 +135,46 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="meta-memory", description="Shared local long-term memory for AI agents.")
-    parser.add_argument("--config", help="Configuration path; defaults to ~/.meta-memory/config.toml")
+    parser = argparse.ArgumentParser(
+        prog="meta-memory",
+        usage="meta-memory [GLOBAL OPTION] COMMAND [OPTION]",
+        description="A local, durable memory runtime for AI agents. Start with setup, then use overview as your home screen.",
+        epilog="""Start here:
+  meta-memory setup --agents codex
+  meta-memory overview
+
+Everyday tasks:
+  meta-memory remember --content "A fact worth keeping"
+  meta-memory search "keyword"
+  meta-memory inbox list
+
+Discover a command:
+  meta-memory COMMAND --help
+  meta-memory memory --help
+""",
+        formatter_class=_HelpFormatter,
+    )
+    parser.add_argument("--config", help="Configuration file path")
     parser.add_argument("--agent-id", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--format", choices=["auto", "json", "text"], default="auto", help="Output format (default: text in a terminal, JSON when piped).")
+    parser.add_argument("--format", choices=["auto", "json", "text"], default="auto", help="Output format; auto is text in a terminal and JSON when piped")
     parser.add_argument("--json", dest="output_format_json", action="store_true", help="Force machine-readable JSON output.")
     from . import __version__
     parser.add_argument("--version", action="version", version=__version__)
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", required=True, title="Commands by task", description="Choose the command that matches what you want to do. Run `meta-memory COMMAND --help` for examples and arguments.", metavar="COMMAND")
 
     setup = commands.add_parser("setup", help="Initialize a store and optionally install tasks and Agent skills")
-    setup.add_argument("--name"); setup.add_argument("--store"); setup.add_argument("--maintenance", choices=["yes", "no"]); setup.add_argument("--dream", choices=["yes", "no"])
-    setup.add_argument("--agents", nargs="*", choices=AGENTS); setup.add_argument("--skill-dir"); setup.add_argument("--agent-id"); setup.add_argument("--no-schedule", action="store_true"); setup.add_argument("--non-interactive", action="store_true")
-    setup_host = setup.add_mutually_exclusive_group(); setup_host.add_argument("--host-file"); setup_host.add_argument("--no-host-file", action="store_true")
+    setup.add_argument("--name", help="Name stored in the local profile")
+    setup.add_argument("--store", help="Directory for the local memory store")
+    setup.add_argument("--maintenance", choices=["yes", "no"], help="Enable the incremental background heartbeat")
+    setup.add_argument("--dream", choices=["yes", "no"], help="Enable the daily deep Dream report")
+    setup.add_argument("--agents", nargs="*", choices=AGENTS, help="Agents to connect now, for example: codex claude-code")
+    setup.add_argument("--skill-dir", help="Skill directory for a custom Agent")
+    setup.add_argument("--agent-id", help="Stable id for a custom Agent")
+    setup.add_argument("--no-schedule", action="store_true", help="Save setup without installing background tasks")
+    setup.add_argument("--non-interactive", action="store_true", help="Use defaults instead of prompts")
+    setup_host = setup.add_mutually_exclusive_group()
+    setup_host.add_argument("--host-file", help="Host instruction file for a custom Agent")
+    setup_host.add_argument("--no-host-file", action="store_true", help="Do not modify a host instruction file")
 
     install = commands.add_parser("install-agent", help="Install the Meta Memory Skill for one or more Agents")
     install.add_argument("agent", nargs="*", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir"); install.add_argument("--agent-id")
@@ -183,9 +251,11 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--project", default="auto"); child.add_argument("--session", default="auto"); child.add_argument("--cwd")
 
     overview_cmd = commands.add_parser("overview", help="Show one-screen readiness and next action")
-    overview_cmd.add_argument("--project", default="auto"); overview_cmd.add_argument("--cwd")
+    overview_cmd.add_argument("--project", default="auto", help="Project name, or auto for the current directory")
+    overview_cmd.add_argument("--cwd", help="Directory used to resolve the project")
     status_cmd = commands.add_parser("status", help="Show local store status plus an operational overview")
-    status_cmd.add_argument("--project", default="auto"); status_cmd.add_argument("--cwd")
+    status_cmd.add_argument("--project", default="auto", help="Project name, or auto for the current directory")
+    status_cmd.add_argument("--cwd", help="Directory used to resolve the project")
     commands.add_parser("doctor", help="Run a non-mutating health check")
     agent_cmd = commands.add_parser("agent", help="Inspect or verify a local Agent integration")
     agent_commands = agent_cmd.add_subparsers(dest="agent_command", required=True)
@@ -269,6 +339,138 @@ def build_parser() -> argparse.ArgumentParser:
     resource_remove_cmd.add_argument("resource_id"); resource_remove_cmd.add_argument("--project", default="auto"); resource_remove_cmd.add_argument("--cwd"); resource_remove_cmd.add_argument("--all-projects", action="store_true")
     resource_export_cmd = resource_commands.add_parser("export", help="Export resource metadata as JSON or Markdown")
     resource_export_cmd.add_argument("--project", default="auto"); resource_export_cmd.add_argument("--cwd"); resource_export_cmd.add_argument("--output"); resource_export_cmd.add_argument("--format", choices=["json", "markdown"], default="json"); resource_export_cmd.add_argument("--all-projects", action="store_true")
+    _rename_subcommand_help(commands, {
+        "setup": "First-time setup: save config, connect Agents, and install schedules",
+        "install-agent": "Connect an Agent after setup or install one explicitly",
+        "overview": "Start here: one-screen readiness, activity, and next actions",
+        "status": "Detailed machine-readable status plus the overview dashboard",
+        "doctor": "Read-only health check for the local store",
+        "remember": "Save one explicit fact or preference now",
+        "search": "Find relevant durable memory in the current project",
+        "memory": "Browse, correct, archive, forget, or export durable Claims",
+        "inbox": "Review automatic memory proposals and Claim feedback",
+        "history": "Find completed session summaries and continue prior work",
+        "project": "See or change the project boundary used for memory",
+        "import": "Index local notes or documents as source evidence",
+        "resource": "Browse and refresh imported source evidence",
+        "agent": "Check, repair, or refresh Agent integrations",
+        "dream": "Run or inspect background memory consolidation",
+        "schedule": "Install, inspect, or remove local background tasks",
+        "turn": "Inspect or recover durable conversation turns",
+        "recovery": "Replay deferred completions after an interruption",
+        "session": "Inspect, rotate, or close a local automatic session",
+        "config": "Read or update supported runtime settings",
+        "maintain": "Run one periodic maintenance cycle now",
+        "backup": "Create a portable, consistent backup",
+        "restore": "Restore a portable backup into a local store",
+        "correct": "Correct a Claim immediately while preserving history",
+    })
+    _rename_subcommand_help(project_commands, {
+        "set": "Bind this directory to a memorable project name",
+        "current": "Show the project resolved for this directory",
+        "list": "List saved directory-to-project bindings",
+        "rename": "Rename a project and migrate its local scope",
+        "unbind": "Remove a directory binding without deleting memory",
+        "stats": "Show memory and session counts for one project",
+    })
+    _rename_subcommand_help(memory_commands, {
+        "list": "List Claims with optional status and kind filters",
+        "recent": "Show recently updated active Claims",
+        "show": "Show a Claim with sources, versions, and feedback",
+        "search": "Search Claims and indexed evidence",
+        "correct": "Correct a Claim without losing its history",
+        "feedback": "Mark a Claim as helpful, outdated, or incorrect",
+        "archive": "Stop recalling a Claim while retaining its history",
+        "forget": "Remove a Claim from active and derived memory",
+        "export": "Export Claims as JSON or Markdown",
+    })
+    _rename_subcommand_help(inbox_commands, {
+        "list": "List pending proposals or feedback requiring a decision",
+        "show": "Inspect one proposal before deciding",
+        "approve": "Apply an approved memory proposal",
+        "reject": "Reject a proposal with an optional note",
+        "feedback": "Record whether a recalled Claim was useful or wrong",
+    })
+    _rename_subcommand_help(agent_commands, {
+        "status": "Show Agent integration and recent runtime activity",
+        "verify": "Verify one installed launcher and shared runtime",
+        "sync": "Regenerate installed integrations from this version",
+        "repair": "Alias for sync",
+        "uninstall": "Remove one managed Agent integration",
+        "upgrade-status": "Find stale Skills or launchers after an upgrade",
+    })
+    _rename_subcommand_help(dream_commands, {
+        "heartbeat": "Run lightweight incremental consolidation now",
+        "deep": "Run or preview the daily inferred synthesis",
+        "status": "Show heartbeat and deep-synthesis state",
+        "list": "List recent deep Dream runs",
+        "show": "Show one Dream run or the latest report",
+        "archive": "Archive reports from one Dream run",
+    })
+    _rename_subcommand_help(schedule_commands, {
+        "install": "Install enabled platform-native background tasks",
+        "status": "Show whether expected background tasks are installed",
+        "remove": "Remove only Meta Memory background tasks",
+        "run-maintain": "Run the heartbeat launcher now",
+        "run-dream": "Run the deep Dream launcher now",
+    })
+
+    _set_help(setup, description="Create or save the local configuration, optionally install Agent Skills, and install enabled schedules.", examples="""Examples:
+  meta-memory setup --agents codex
+  meta-memory setup --name Ada --agents codex claude-code
+  meta-memory setup --non-interactive --no-schedule
+""")
+    _set_help(overview_cmd, description="Show the current project, setup readiness, memory queue, recent activity, and exact next commands.", examples="""Examples:
+  meta-memory overview
+  meta-memory overview --project my-project
+  meta-memory --json overview
+""")
+    _set_help(memory_cmd, description="Manage durable Claims. Use `memory show` before correcting, archiving, or forgetting a Claim.", examples="""Examples:
+  meta-memory memory recent
+  meta-memory memory search "release process"
+  meta-memory memory show <claim-id>
+""")
+    _set_help(inbox_cmd, description="Automatic memory changes stay reviewable. Inspect a proposal before approving or rejecting it.", examples="""Examples:
+  meta-memory inbox list
+  meta-memory inbox show <proposal-id>
+  meta-memory inbox approve <proposal-id>
+""")
+    _set_help(project, description="A project is the memory boundary for the current directory. `auto` uses the Git root when available.", examples="""Examples:
+  meta-memory project current
+  meta-memory project set my-project
+  meta-memory project stats
+""")
+    _set_help(agent_cmd, description="Inspect installed Agent Skills and launchers. Run sync after moving the repository or upgrading Meta Memory.", examples="""Examples:
+  meta-memory agent status --all --verbose
+  meta-memory agent upgrade-status --all
+  meta-memory agent sync --all
+""")
+    _set_help(dream, description="Dream consolidates completed work. Heartbeat is lightweight; deep synthesis is an auditable report and supports preview.", examples="""Examples:
+  meta-memory dream heartbeat
+  meta-memory dream deep --scan-days 7 --dry-run
+  meta-memory dream status
+""")
+    _set_help(schedule, description="Install only Meta Memory's enabled background tasks. Do not use it to manage unrelated system jobs.", examples="""Examples:
+  meta-memory schedule install
+  meta-memory schedule status
+  meta-memory schedule run-maintain
+""")
+    _set_help(turn_cmd, description="Turns protect the before/after lifecycle used by Agent integrations. Use recovery after an interruption.", examples="""Examples:
+  meta-memory turn list --unfinished
+  meta-memory turn touch <turn-id>
+  meta-memory turn reopen <turn-id>
+""")
+    _set_help(resource_cmd, description="Imported files remain source evidence. They are searchable but are not automatically promoted to durable user facts.", examples="""Examples:
+  meta-memory resource list
+  meta-memory resource show <resource-id>
+  meta-memory resource refresh <resource-id>
+""")
+    _set_help(history_cmd, description="Search completed session summaries first; use detail only when a concrete prior task needs more context.", examples="""Examples:
+  meta-memory history recent
+  meta-memory history "deployment"
+  meta-memory history show <session-id>
+""")
+    _polish_help(parser)
     return parser
 
 
