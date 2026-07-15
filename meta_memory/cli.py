@@ -62,7 +62,14 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
     from _common import ensure_store_ready
     from doctor import doctor
     initialized = ensure_store_ready(config.store)
-    installed = install_agents(agents, config=config, custom_skill_dir=args.skill_dir) if agents else []
+    installed = install_agents(
+        agents,
+        config=config,
+        custom_skill_dir=args.skill_dir,
+        custom_agent_id=args.agent_id,
+        custom_host_file=args.host_file,
+        no_host_file=args.no_host_file,
+    ) if agents else []
     scheduling = install_schedule(config) if (config.maintenance_enabled or config.dream_enabled) and not args.no_schedule else {"status": "skipped", "reason": "not selected"}
     return {"status": "ok", "config": str(config.path), "store": initialized, "agents": installed, "schedule": scheduling, "doctor": doctor(config.store)}
 
@@ -75,10 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup = commands.add_parser("setup", help="Initialize a store and optionally install tasks and Agent skills")
     setup.add_argument("--name"); setup.add_argument("--store"); setup.add_argument("--maintenance", choices=["yes", "no"]); setup.add_argument("--dream", choices=["yes", "no"])
-    setup.add_argument("--agents", nargs="+", choices=AGENTS); setup.add_argument("--skill-dir"); setup.add_argument("--no-schedule", action="store_true"); setup.add_argument("--non-interactive", action="store_true")
+    setup.add_argument("--agents", nargs="+", choices=AGENTS); setup.add_argument("--skill-dir"); setup.add_argument("--agent-id"); setup.add_argument("--no-schedule", action="store_true"); setup.add_argument("--non-interactive", action="store_true")
+    setup_host = setup.add_mutually_exclusive_group(); setup_host.add_argument("--host-file"); setup_host.add_argument("--no-host-file", action="store_true")
 
     install = commands.add_parser("install-agent", help="Install the Meta Memory Skill for one Agent")
-    install.add_argument("agent", nargs="?", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir")
+    install.add_argument("agent", nargs="?", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir"); install.add_argument("--agent-id")
+    install_host = install.add_mutually_exclusive_group(); install_host.add_argument("--host-file"); install_host.add_argument("--no-host-file", action="store_true")
 
     project = commands.add_parser("project", help="Bind the current directory to a project")
     project_commands = project.add_subparsers(dest="project_command", required=True)
@@ -139,7 +148,17 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         agents = ["all"] if args.all else ([args.agent] if args.agent else [])
         if not agents:
             raise ValueError("Provide an agent name or --all.")
-        return {"status": "ok", "installed": install_agents(agents, config=config, custom_skill_dir=args.skill_dir)}
+        return {
+            "status": "ok",
+            "installed": install_agents(
+                agents,
+                config=config,
+                custom_skill_dir=args.skill_dir,
+                custom_agent_id=args.agent_id,
+                custom_host_file=args.host_file,
+                no_host_file=args.no_host_file,
+            ),
+        }
     if args.command == "project":
         context = bind_project(config, args.name, args.cwd); save_config(config)
         return {"status": "ok", "project": context.project_id, "root": str(context.root), "config": str(config.path)}

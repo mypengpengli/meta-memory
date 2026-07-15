@@ -167,6 +167,9 @@ def install_agent(
     *,
     config: AppConfig | None = None,
     custom_skill_dir: str | Path | None = None,
+    custom_agent_id: str | None = None,
+    custom_host_file: str | Path | None = None,
+    no_host_file: bool = False,
     home: str | Path | None = None,
     python_executable: str | Path | None = None,
     verify: bool = True,
@@ -175,9 +178,25 @@ def install_agent(
 
     app_config = config or load_config()
     name = str(agent or "").strip().casefold()
-    spec = get_agent_spec(name, home=home, custom_skill_dir=custom_skill_dir)
+    if name != "custom" and (custom_agent_id or custom_host_file or no_host_file):
+        raise ValueError("--agent-id, --host-file and --no-host-file are only valid for install-agent custom.")
+    spec = get_agent_spec(
+        name,
+        home=home,
+        custom_skill_dir=custom_skill_dir,
+        custom_agent_id=custom_agent_id,
+        custom_host_file=custom_host_file,
+        no_host_file=no_host_file,
+    )
     warnings: list[str] = []
-    detected = detect_agent(name, home=home, custom_skill_dir=custom_skill_dir)
+    detected = detect_agent(
+        name,
+        home=home,
+        custom_skill_dir=custom_skill_dir,
+        custom_agent_id=custom_agent_id,
+        custom_host_file=custom_host_file,
+        no_host_file=no_host_file,
+    )
     if not detected:
         warnings.append(f"Host '{name}' was not detected; installed because it was explicitly requested.")
     config_visible = _ensure_config(app_config, warnings)
@@ -206,6 +225,9 @@ def install_agent(
     return {
         "status": "ok",
         "agent": spec.agent_id,
+        "agent_id": spec.agent_id,
+        "display_name": spec.display_name,
+        "integration_type": spec.integration_type,
         "agent_detected": detected,
         "skill_installed": skill_file.is_file(),
         "host_instruction_installed": host_installed,
@@ -213,11 +235,14 @@ def install_agent(
         "cli_visible": cli_visible,
         "config_visible": config_visible,
         "memory_status": memory_status,
+        "launcher_verified": cli_visible,
         "warnings": warnings,
         # Retain the old result keys for callers that only displayed paths.
         "skill": str(skill_file),
         "host_instruction": str(spec.host_instruction_file) if spec.host_instruction_file else None,
         "launcher": str(launcher),
+        "shared_config": str(Path(app_config.path).expanduser().resolve()),
+        "shared_store": str(Path(app_config.store).expanduser().resolve()),
     }
 
 
@@ -226,6 +251,9 @@ def install_agents(
     *,
     config: AppConfig | None = None,
     custom_skill_dir: str | Path | None = None,
+    custom_agent_id: str | None = None,
+    custom_host_file: str | Path | None = None,
+    no_host_file: bool = False,
     home: str | Path | None = None,
     python_executable: str | Path | None = None,
     verify: bool = True,
@@ -246,6 +274,9 @@ def install_agents(
             agent,
             config=config,
             custom_skill_dir=custom_skill_dir,
+            custom_agent_id=custom_agent_id,
+            custom_host_file=custom_host_file,
+            no_host_file=no_host_file,
             home=home,
             python_executable=python_executable,
             verify=verify,
