@@ -114,6 +114,7 @@ def _pending_work(config: AppConfig) -> dict[str, int]:
             "summary_scopes": int(conn.execute("SELECT COUNT(*) FROM session_cards WHERE profile_id=? AND summary_dirty=1", (config.profile_id,)).fetchone()[0]),
             "hot_scopes": int(conn.execute("SELECT COUNT(*) FROM workspace_runtime_state WHERE profile_id=? AND hot_dirty=1", (config.profile_id,)).fetchone()[0]),
             "dream_scopes": int(conn.execute("SELECT COUNT(*) FROM workspace_runtime_state WHERE profile_id=? AND dream_dirty=1", (config.profile_id,)).fetchone()[0]),
+            "expired_turns": int(conn.execute("SELECT COUNT(*) FROM turns WHERE profile_id=? AND status='started' AND julianday(started_at)<=julianday('now', ?)", (config.profile_id, f"-{max(1, int(config.turns_abandon_after_minutes))} minutes")).fetchone()[0]),
         }
     finally:
         conn.close()
@@ -167,6 +168,8 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
     from doctor import doctor
     from projection_outbox import process_projection_outbox, recover_stuck_outbox
     from .spool import replay_spool
+    from .runtime_audit import cleanup_error_log
+    from .turn_recovery import recover_expired_turns
 
     root = Path(config.store)
     initialized = ensure_store_ready(root)
@@ -187,6 +190,8 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
             return {"status": "idle", "dirty_scopes": sum(heartbeat_work.values()), "processed_turns": 0, "updated_claims": 0, "updated_sessions": 0, "new_snapshots": 0, "work": work_before}
         spool = replay_spool(config, limit=max(20, job_limit * 2))
         renew(root, lease)
+        turn_recovery = recover_expired_turns(config, limit=job_limit)
+        renew(root, lease)
         recovered_review = recover_stuck_jobs(root)
         recovered_projections = recover_stuck_outbox(root)
         review = run_pending(root, max_jobs=job_limit, policy="balanced", memory_mode=config.memory_mode)
@@ -198,6 +203,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
         renew(root, lease)
         hot = _refresh_dirty_hot(config, max_scopes=scope_limit)
         snapshot_gc = garbage_collect_snapshots(root)
+        error_log_cleanup = cleanup_error_log(config)
         health = doctor(root, mode="quick")
         _record_maintenance(config)
         processed_turns = sum(1 for item in review.get("results", []) if str(item.get("status")) in {"applied", "staged", "planned"})
@@ -213,6 +219,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
             "updated_sessions": updated_sessions,
             "new_snapshots": new_snapshots,
             "spool": spool,
+            "turn_recovery": turn_recovery,
             "recovered_review_jobs": recovered_review,
             "recovered_projections": recovered_projections,
             "review": review,
@@ -221,6 +228,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
             "projections": projections,
             "hot_memory": hot,
             "snapshot_gc": snapshot_gc,
+            "error_log_cleanup": error_log_cleanup,
             "health": health,
         }
         _record_heartbeat_state(config, status="ok", work=work_before, processed_turns=processed_turns, updated_claims=updated_claims, updated_sessions=updated_sessions, new_snapshots=new_snapshots)

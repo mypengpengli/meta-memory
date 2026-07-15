@@ -130,7 +130,12 @@ meta-memory install-agent all
 自定义 Agent 需要明确它的 skills 根目录：
 
 ```bash
-meta-memory install-agent custom --skill-dir /path/to/agent/skills
+meta-memory install-agent custom --agent-id hermes \
+  --skill-dir ~/.hermes/skills --host-file ~/.hermes/AGENTS.md
+
+# 没有宿主说明文件、但支持 Skills 的 Agent 也可以接入。
+meta-memory install-agent custom --agent-id my-agent \
+  --skill-dir ~/.my-agent/skills --no-host-file
 ```
 
 | Agent | 写入的位置 |
@@ -478,10 +483,21 @@ meta-memory install-agent all
 For a custom agent:
 
 ```bash
-meta-memory install-agent custom --skill-dir /path/to/agent/skills
+meta-memory install-agent custom --agent-id hermes \
+  --skill-dir ~/.hermes/skills --host-file ~/.hermes/AGENTS.md
+meta-memory install-agent custom --agent-id my-agent \
+  --skill-dir ~/.my-agent/skills --no-host-file
 ```
 
 The installer writes a `SKILL.md`, a small host-instruction block, and an Agent-specific launcher that pins the Python executable, config path, and agent id. `install-agent all` installs only detected built-in hosts; explicitly name a host to install it even when detection is unavailable. Check `cli_visible`, `config_visible`, and `memory_status` in the JSON result, then restart the Agent session.
+
+Use lowercase `agent-id` values of 1–64 characters from `a-z`, `0-9`, `.`, `_`, and `-`; reserved/built-in impersonating names are rejected. To check an integration later without signing in to the host Agent:
+
+```bash
+meta-memory agent status --verbose
+meta-memory agent status --all
+meta-memory agent verify hermes
+```
 
 Agents using the same system account share the default configuration and store. An Agent launcher pins the config path used when it was installed. For a non-default configuration, use the same `META_MEMORY_CONFIG` value (or `meta-memory --config <path> install-agent <agent>`) to install or reinstall every Agent launcher, then use those regenerated launchers.
 
@@ -491,11 +507,14 @@ Agents using the same system account share the default configuration and store. 
 | --- | --- |
 | Save an explicit, sourced memory | `meta-memory remember --project auto --content "…"` |
 | Search structured memory | `meta-memory search --project auto "keyword"` |
-| Search past messages | `meta-memory history --project auto "keyword"` |
+| Search completed session summaries | `meta-memory history --project auto "keyword"` |
+| Read bounded completed-history detail when necessary | `meta-memory history --project auto "keyword" --detail` |
 | Inspect store and queued work | `meta-memory status` |
 | Run a health check | `meta-memory doctor` |
 | Process queued turns | `meta-memory maintain --max-jobs 20` |
-| Create an inferred Dream report | `meta-memory dream --scan-days 7` |
+| Consolidate newly completed work now | `meta-memory dream heartbeat` |
+| Run daily deep synthesis now | `meta-memory dream deep --scan-days 7` |
+| Inspect Dream scheduling/state | `meta-memory dream status` |
 | Import source evidence | `meta-memory import notes.md --project auto` |
 | Create a consistent backup | `meta-memory backup` |
 
@@ -510,7 +529,9 @@ meta-memory maintain
 
 `after` records the assistant reply and queues work; it does not perform heavy consolidation inline. Repeating the same turn id and reply is safe. Temporary completion failures are spooled and replayed by `maintain`. The old `after --session --user-file` form remains as a warned compatibility path.
 
-Agents share user preferences and structured project memory, but archived transcript/history results are isolated by originating Agent—even when a host reuses the same session id. Tool-backed project evidence is shown as `Agent-observed`; it is traceable operational evidence, not a user statement.
+The normal `history` query shares only completed, filtered session summaries within the same profile/workspace/subject; use `--detail` only to continue concrete prior work or when the summary is insufficient. Started Turns and assistant drafts are never shared, and a Turn may only be completed by the Agent that created it. Tool-backed project evidence is shown as `Agent-observed`; it is traceable operational evidence, not a user statement.
+
+`before` can return an advisory `unfinished_previous_turn` warning after the configured five-minute threshold. Continue the current answer; the heartbeat first replays any matching spool entry and only marks an unrecoverable Turn `abandoned` after the configured 60-minute threshold. A `project_identity_mismatch` warning never merges projects automatically—check the directory binding with `meta-memory project set` instead.
 
 `--project auto` uses the Git root (or current directory), then a saved directory binding. Unbound Git repositories use a stable `origin` remote fingerprint, so a normal clone can recall the same project after a portable restore even when its checkout directory has a different name. Other directories use a basename plus path fingerprint to avoid same-name collisions. Bind a directory with:
 
@@ -532,7 +553,17 @@ meta-memory correct --memory <claim-id> --content "The project now uses PostgreS
 
 This records correction evidence, makes the replacement Claim readable immediately, and preserves the old Claim as corrected or superseded rather than overwriting it in place. Keep the returned `new_claim_id` for auditing.
 
-Dream is an auditable inferred report, not a fact overwrite. Run `meta-memory dream` and open the path in its `report` field.
+Dream has a lightweight heartbeat (every 10 minutes by default) and a daily deep synthesis. The heartbeat replays spool work, processes completed Turns, updates Claims/session summaries/Hot Memory, and returns `idle` without a full scan when nothing is dirty. The deep phase is an auditable inferred report, not a fact overwrite:
+
+```bash
+meta-memory dream heartbeat
+meta-memory dream deep --scan-days 7
+meta-memory dream status
+meta-memory config set dream.heartbeat_interval_minutes 10
+meta-memory schedule install
+```
+
+Valid heartbeat intervals are 1–10080 minutes. Changing one requires `schedule install` to refresh the local scheduler.
 
 ## Data, backup, and limits
 

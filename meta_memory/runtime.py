@@ -92,6 +92,17 @@ def after(
 ) -> dict[str, Any]:
     """Complete a durable turn, with one-release compatibility for old calls."""
     if not assistant_text.strip():
+        if turn_uid.strip():
+            stable_agent = origin_agent_id(agent_id)
+            try:
+                from .runtime_audit import record_turn_error
+
+                record_turn_error(
+                    config, agent_id=stable_agent, turn_uid=turn_uid, phase="after",
+                    error_code="assistant_body_missing", error_message="assistant content was empty",
+                )
+            except Exception:
+                pass
         raise ValueError("Assistant content is required via --assistant or --assistant-file.")
     bootstrap()
     from .turn_service import begin_turn, complete_turn
@@ -101,12 +112,25 @@ def after(
             explicit_agent = str(agent_id or "").strip() or os.environ.get("META_MEMORY_AGENT_ID", "").strip()
             stable_agent = origin_agent_id(explicit_agent)
             return complete_turn(config, turn_uid=turn_uid, assistant_text=assistant_text, agent_id=stable_agent if explicit_agent else "")
-        except ValueError:
+        except ValueError as exc:
+            from .runtime_audit import record_turn_error
+
+            text = str(exc).casefold()
+            code = "wrong_turn_owner" if "different agent" in text else "turn_not_found" if "not found" in text else "response_hash_conflict" if "different assistant response" in text else "after_failed"
+            try:
+                record_turn_error(config, agent_id=stable_agent, turn_uid=turn_uid, phase="after", error_code=code, error_message=str(exc))
+            except Exception:
+                pass
             raise
         except (OSError, sqlite3.Error, RuntimeError) as exc:
             from .spool import spool_completion
+            from .runtime_audit import record_turn_error
 
             deferred = spool_completion(config, turn_uid=turn_uid, assistant_text=assistant_text, agent_id=stable_agent if explicit_agent else "", error=str(exc))
+            try:
+                record_turn_error(config, agent_id=stable_agent, turn_uid=turn_uid, phase="after", error_code="completion_spooled", error_message=str(exc))
+            except Exception:
+                pass
             return {**deferred, "warning": "assistant_response_spooled_for_retry"}
     if not user_text.strip() or not session.strip():
         raise ValueError("--turn is required, or provide the legacy --session and --user/--user-file arguments.")
@@ -196,6 +220,12 @@ def remember(
     )
     result = remember_memory(args)
     result["project"] = project.project_id
+    if result.get("status") == "ok":
+        from .runtime_audit import record_write
+        try:
+            record_write(config, agent_id=stable_agent, workspace_id=project.workspace_id)
+        except Exception:
+            pass
     return result
 
 

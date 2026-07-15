@@ -162,6 +162,29 @@ def _ensure_config(config: AppConfig, warnings: list[str]) -> bool:
     return path.is_file()
 
 
+def _agent_registry_path(config: AppConfig, agent_id: str) -> Path:
+    return Path(config.path).expanduser().resolve().parent / "agents" / f"{agent_id}.json"
+
+
+def _write_agent_registry(config: AppConfig, *, spec, launcher: Path, skill_file: Path) -> Path:
+    """Persist only installation metadata needed by local status/verify."""
+
+    path = _agent_registry_path(config, spec.agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "agent_id": spec.agent_id,
+        "display_name": spec.display_name,
+        "integration_type": spec.integration_type,
+        "skill": str(skill_file),
+        "host_instruction": str(spec.host_instruction_file) if spec.host_instruction_file else None,
+        "launcher": str(launcher),
+        "config": str(Path(config.path).expanduser().resolve()),
+        "store": str(Path(config.store).expanduser().resolve()),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def install_agent(
     agent: str,
     *,
@@ -211,6 +234,7 @@ def install_agent(
     skill_file.write_text(_render_template("skill.md.template", **values), encoding="utf-8")
     if spec.host_instruction_file is not None:
         _upsert_block(spec.host_instruction_file, _render_template("host-instruction.md.template", **values))
+    registry = _write_agent_registry(app_config, spec=spec, launcher=launcher, skill_file=skill_file)
 
     launcher_created = launcher.is_file()
     cli_visible, memory_status = False, "not_checked"
@@ -243,6 +267,7 @@ def install_agent(
         "launcher": str(launcher),
         "shared_config": str(Path(app_config.path).expanduser().resolve()),
         "shared_store": str(Path(app_config.store).expanduser().resolve()),
+        "registry": str(registry),
     }
 
 

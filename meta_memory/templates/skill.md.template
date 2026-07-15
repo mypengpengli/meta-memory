@@ -17,6 +17,10 @@ instruction.
 
    Keep the returned `turn_id`, `session_id`, `hot_context`, and `context`.
    Use recalled memory only when it is relevant to the request.
+   `warnings` are advisory: continue the current turn. An
+   `unfinished_previous_turn` warning means an earlier answer was not saved;
+   a `project_identity_mismatch` warning must be shown to the user or resolved
+   with `meta-memory project set`, never by merging projects automatically.
 3. Draft the complete final answer, then write that exact answer to a temporary
    UTF-8 file. Do not send it yet.
 4. Before sending the answer to the user, run:
@@ -35,6 +39,11 @@ instruction.
    details, asks to continue another Agent's concrete work, or the summary is
    insufficient to complete the current task. Do not read detailed history out
    of curiosity.
+8. Never complete a Turn created by another Agent. For installation or runtime
+   troubleshooting, run `meta-memory agent status --verbose` or
+   `meta-memory agent verify {{ agent_id }}`. Use `meta-memory dream heartbeat`
+   only when newly completed work needs immediate consolidation; normal
+   scheduled heartbeats handle it automatically.
 
 The launcher already pins this integration to `{{ agent_id }}` and the Meta
 Memory configuration at `{{ config_path }}`. Do not pass profile ids, workspace ids, visibility

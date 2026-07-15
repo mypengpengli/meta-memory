@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,7 @@ def begin_turn(
     """
     if not query.strip():
         raise ValueError("A request is required via --query or --query-file.")
+    started_clock = time.perf_counter()
     bootstrap()
     from _common import open_db, utc_now
     from ingest_raw_event import insert_raw_event_with_conn
@@ -184,8 +186,8 @@ def begin_turn(
                 INSERT INTO turns(
                     turn_uid,profile_id,workspace_id,subject_id,origin_agent_id,
                     external_session_id,internal_session_id,request_hash,status,
-                    context_status,started_at,updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'started', 'pending', ?, ?)
+                    context_status,client_type,client_id,started_at,updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'started', 'pending', 'agent', ?, ?, ?)
                 """,
                 (
                     turn_uid,
@@ -196,6 +198,7 @@ def begin_turn(
                     session_id,
                     internal_session_id,
                     request_hash,
+                    stable_agent,
                     utc_now(),
                     utc_now(),
                 ),
@@ -232,12 +235,36 @@ def begin_turn(
     finally:
         conn.close()
 
+    from .runtime_audit import project_identity_warnings, record_before
+    from .turn_recovery import unfinished_warnings
+
+    # Observability is advisory: an audit problem must never block the
+    # durable request or force the host Agent to stop answering.
+    try:
+        runtime_warnings = project_identity_warnings(config, agent_id=stable_agent, project=project)
+    except Exception:
+        runtime_warnings = []
+    try:
+        recovery_warnings = unfinished_warnings(
+            config, agent_id=stable_agent, workspace_id=project.workspace_id, exclude_turn_uid=turn_uid,
+        )
+    except Exception:
+        recovery_warnings = []
+
     try:
         prepared = prepare_context(
             _context_args(config, project, session_id=session_id, agent_id=stable_agent, query=query)
         )
     except Exception as exc:
         _update_context_status(root, turn_uid, status="degraded", error=str(exc))
+        try:
+            record_before(
+                config, agent_id=stable_agent, project=project, session_id=session_id, turn_uid=turn_uid,
+                retrieval_count=0, retrieval_duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                degraded=True, error_code="retrieval_failed", error_message=str(exc),
+            )
+        except Exception:
+            pass
         return {
             "status": "degraded",
             "turn_id": turn_uid,
@@ -249,13 +276,22 @@ def begin_turn(
             "hot_context": "",
             "context": "",
             "query_route": {},
-            "warnings": ["Memory retrieval failed; continue without recalled memory."],
+            "warnings": ["Memory retrieval failed; continue without recalled memory.", *runtime_warnings, *recovery_warnings],
             "idempotent": not created,
             "user_event_id": user_event_id,
             "internal_session_id": internal_session_id,
         }
 
     _update_context_status(root, turn_uid, status="ready")
+    retrieval_count = len(list(prepared.get("retrieved", {}).get("selected", [])))
+    try:
+        record_before(
+            config, agent_id=stable_agent, project=project, session_id=session_id, turn_uid=turn_uid,
+            retrieval_count=retrieval_count, retrieval_duration_ms=int((time.perf_counter() - started_clock) * 1000),
+        )
+    except Exception:
+        pass
+    warnings = [*runtime_warnings, *recovery_warnings]
     return {
         "status": "ok",
         "turn_id": turn_uid,
@@ -268,7 +304,7 @@ def begin_turn(
         "context": prepared["context_markdown"],
         "query_route": prepared["query_route"],
         "hot_memory_snapshot_hash": prepared["hot_memory_snapshot_hash"],
-        "warnings": [],
+        "warnings": warnings,
         "idempotent": not created,
         "user_event_id": user_event_id,
         "internal_session_id": internal_session_id,
@@ -310,6 +346,14 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             if str(row[10] or "") != response_hash:
                 raise ValueError("Turn is already completed with a different assistant response.")
             conn.commit()
+            from .runtime_audit import record_after
+            try:
+                record_after(
+                    config, agent_id=str(row[4] or "generic-agent"), workspace_id=str(row[2]),
+                    session_id=str(row[5]), turn_uid=str(row[0]), idempotent=True,
+                )
+            except Exception:
+                pass
             return {
                 "status": "ok",
                 "turn_id": str(row[0]),
@@ -374,6 +418,14 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             (utc_now(), str(row[3]), str(row[1]), str(row[2]), str(row[5]), str(row[4] or "")),
         )
         conn.commit()
+        from .runtime_audit import record_after
+        try:
+            record_after(
+                config, agent_id=str(row[4] or "generic-agent"), workspace_id=str(row[2]),
+                session_id=str(row[5]), turn_uid=turn_uid,
+            )
+        except Exception:
+            pass
         return {
             "status": "ok",
             "turn_id": turn_uid,

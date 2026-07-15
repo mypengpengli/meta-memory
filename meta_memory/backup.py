@@ -533,6 +533,8 @@ def _apply_restored_config(config: "AppConfig", restored: "AppConfig") -> str:
     config.history_detail_max_turns = restored.history_detail_max_turns
     config.history_detail_max_chars = restored.history_detail_max_chars
     config.history_tool_summary_max_chars = restored.history_tool_summary_max_chars
+    config.turns_unfinished_warning_minutes = restored.turns_unfinished_warning_minutes
+    config.turns_abandon_after_minutes = restored.turns_abandon_after_minutes
     config.session_auto_expire_hours = restored.session_auto_expire_hours
     config.top_k = restored.top_k
     config.embeddings = restored.embeddings

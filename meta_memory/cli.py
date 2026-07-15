@@ -121,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("status", help="Show local store status")
     commands.add_parser("doctor", help="Run a non-mutating health check")
+    agent_cmd = commands.add_parser("agent", help="Inspect or verify a local Agent integration")
+    agent_commands = agent_cmd.add_subparsers(dest="agent_command", required=True)
+    agent_status_cmd = agent_commands.add_parser("status", help="Show current Agent runtime status")
+    agent_status_cmd.add_argument("--all", action="store_true"); agent_status_cmd.add_argument("--project", default="auto"); agent_status_cmd.add_argument("--cwd"); agent_status_cmd.add_argument("--verbose", action="store_true")
+    agent_verify_cmd = agent_commands.add_parser("verify", help="Verify one installed Agent launcher and shared runtime")
+    agent_verify_cmd.add_argument("agent_id"); agent_verify_cmd.add_argument("--project", default="auto"); agent_verify_cmd.add_argument("--cwd")
     config_cmd = commands.add_parser("config", help="Read or update supported local runtime configuration")
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_get = config_commands.add_parser("get", help="Read one supported configuration key"); config_get.add_argument("key")
@@ -195,6 +201,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return {"status": "ok", "project": project.project_id, "agent_id": agent, "session": None if value is None else {"id": value.session_id, "source": value.source, "reused": value.reused}}
     if args.command == "status": return status(config)
     if args.command == "doctor": return status(config)["health"]
+    if args.command == "agent":
+        from .agent_status import agent_status, verify_agent
+        if args.agent_command == "verify":
+            return verify_agent(config, agent_id=args.agent_id, project_name=args.project, start=args.cwd)
+        return agent_status(config, agent_id=origin_agent_id(args.agent_id), all_agents=args.all, project_name=args.project, start=args.cwd, verbose=args.verbose)
     if args.command == "config":
         from .config_commands import get_config_value, set_config_value
         return get_config_value(config, args.key) if args.config_command == "get" else set_config_value(config, args.key, args.value)

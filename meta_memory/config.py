@@ -51,6 +51,8 @@ class AppConfig:
     history_detail_max_turns: int = 8
     history_detail_max_chars: int = 12000
     history_tool_summary_max_chars: int = 1200
+    turns_unfinished_warning_minutes: int = 5
+    turns_abandon_after_minutes: int = 60
     session_auto_expire_hours: int = 8
     top_k: int = 8
     embeddings: bool = False
@@ -163,6 +165,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         history_detail_max_turns=max(1, int(_value(data, "history", "detail_max_turns", 8))),
         history_detail_max_chars=max(256, int(_value(data, "history", "detail_max_chars", 12000))),
         history_tool_summary_max_chars=max(120, int(_value(data, "history", "tool_summary_max_chars", 1200))),
+        turns_unfinished_warning_minutes=max(1, int(_value(data, "turns", "unfinished_warning_minutes", 5))),
+        turns_abandon_after_minutes=max(1, int(_value(data, "turns", "abandon_after_minutes", 60))),
         session_auto_expire_hours=max(1, int(_value(data, "session", "auto_expire_hours", 8))),
         top_k=max(1, int(_value(data, "retrieval", "top_k", 8))),
         embeddings=_bool(_value(data, "retrieval", "embeddings", False), False),
@@ -178,6 +182,10 @@ def _quote(value: str) -> str:
 
 def save_config(config: AppConfig) -> Path:
     config.path.parent.mkdir(parents=True, exist_ok=True)
+    # ``dream_enabled`` is the public legacy switch; either it or the newer
+    # deep-specific switch can disable deep Dream.  Normal CLI setters keep
+    # both in sync, while this also preserves callers that set the old field.
+    deep_enabled = bool(config.dream_enabled and config.dream_deep_enabled)
     rows = [
         "# Meta Memory user configuration. Internal database scope fields stay hidden.",
         "[user]", f"name = {_quote(config.user_name)}", f"id = {_quote(config.user_id)}", "",
@@ -185,8 +193,9 @@ def save_config(config: AppConfig) -> Path:
         "[behavior]", f"memory_mode = {_quote(normalize_memory_mode(config.memory_mode))}", f"default_project = {_quote(config.default_project)}", f"search_depth = {_quote(normalize_search_depth(config.search_depth))}", "",
         "[session]", f"auto_expire_hours = {max(1, int(config.session_auto_expire_hours))}", "",
         "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", "",
-        "[dream]", f"enabled = {str(config.dream_deep_enabled).lower()}", f"heartbeat_enabled = {str(config.dream_heartbeat_enabled).lower()}", f"heartbeat_interval_minutes = {_interval(config.dream_heartbeat_interval_minutes, 10)}", f"heartbeat_max_scopes = {max(1, int(config.dream_heartbeat_max_scopes))}", f"heartbeat_max_jobs = {max(1, int(config.dream_heartbeat_max_jobs))}", f"deep_enabled = {str(config.dream_deep_enabled).lower()}", f"deep_schedule = {_quote(config.dream_deep_schedule)}", f"deep_scan_days = {max(1, int(config.dream_deep_scan_days))}", f"schedule = {_quote(config.dream_deep_schedule)}", f"scan_days = {max(1, int(config.dream_deep_scan_days))}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
+        "[dream]", f"enabled = {str(deep_enabled).lower()}", f"heartbeat_enabled = {str(config.dream_heartbeat_enabled).lower()}", f"heartbeat_interval_minutes = {_interval(config.dream_heartbeat_interval_minutes, 10)}", f"heartbeat_max_scopes = {max(1, int(config.dream_heartbeat_max_scopes))}", f"heartbeat_max_jobs = {max(1, int(config.dream_heartbeat_max_jobs))}", f"deep_enabled = {str(deep_enabled).lower()}", f"deep_schedule = {_quote(config.dream_deep_schedule)}", f"deep_scan_days = {max(1, int(config.dream_deep_scan_days))}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {max(1, int(config.dream_scan_days))}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
         "[history]", f"scope = {_quote(normalize_history_scope(config.history_scope))}", f"allow_detail = {str(config.history_allow_detail).lower()}", f"detail_max_sessions = {max(1, int(config.history_detail_max_sessions))}", f"detail_max_turns = {max(1, int(config.history_detail_max_turns))}", f"detail_max_chars = {max(256, int(config.history_detail_max_chars))}", f"tool_summary_max_chars = {max(120, int(config.history_tool_summary_max_chars))}", "",
+        "[turns]", f"unfinished_warning_minutes = {max(1, int(config.turns_unfinished_warning_minutes))}", f"abandon_after_minutes = {max(1, int(config.turns_abandon_after_minutes))}", "",
         "[retrieval]", f"top_k = {config.top_k}", f"embeddings = {str(config.embeddings).lower()}", "",
         "[advanced]", f"http_api = {str(config.http_api).lower()}", f"agent_private_memory = {str(config.agent_private_memory).lower()}", "",
         "[projects]",

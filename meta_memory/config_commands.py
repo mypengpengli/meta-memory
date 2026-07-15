@@ -44,6 +44,8 @@ _FIELDS: dict[str, tuple[str, Callable[[str], object]]] = {
     "history.detail_max_turns": ("history_detail_max_turns", _positive),
     "history.detail_max_chars": ("history_detail_max_chars", _positive),
     "history.tool_summary_max_chars": ("history_tool_summary_max_chars", _positive),
+    "turns.unfinished_warning_minutes": ("turns_unfinished_warning_minutes", _positive),
+    "turns.abandon_after_minutes": ("turns_abandon_after_minutes", _positive),
 }
 
 
