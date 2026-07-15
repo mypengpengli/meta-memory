@@ -14,6 +14,14 @@ from runtime_identity import add_identity_args
 
 QUESTION = re.compile(r"(?:[?？]\s*$|^(?:why|what|how|can you|could you|请问|为什么|怎么|如何|是否|能不能|可不可以))", re.I)
 SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|bearer\s+|(?:api[_-]?key|token|cookie|password|secret)\s*[:=]\s*)[^\s,;]+")
+ROLLING_STATE_VERSION = 1
+
+_GOAL = re.compile(r"(?:目标|计划|希望(?:系统|项目|这次)|要实现|需要实现|阶段目标|roadmap|goal|plan|want\s+to\s+(?:build|achieve)|need\s+to\s+(?:build|implement))", re.I)
+_NEXT = re.compile(r"(?:下一步|接下来|待办|todo|继续|需要(?:继续|处理|完成)|next\s+step|follow[-\s]?up|continue)", re.I)
+_COMPLETED = re.compile(r"(?:已(?:完成|实现|修复|提交|推送|合并)|完成(?:了)?|通过(?:了)?|测试通过|done|completed|implemented|fixed|passed|merged|committed|pushed)", re.I)
+_DECISION = re.compile(r"(?:决定|采用|选择|确定|改为|统一为|will\s+use|decided|chosen|adopt(?:ed)?|switch(?:ed)?\s+to)", re.I)
+_BLOCKER = re.compile(r"(?:阻塞|卡住|失败|报错|无法|问题是|待确认|未解决|blocked|stuck|failed|error|cannot|unresolved)", re.I)
+_ARTIFACT = re.compile(r"(?:\b[\w./\\-]+\.(?:py|md|json|toml|yml|yaml|sql)\b|\b[0-9a-f]{7,40}\b|commit|提交|报告|文档|文件|迁移|artifact|report|document|file|migration)", re.I)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +76,95 @@ def event_summary(events: list[dict[str, object]]) -> tuple[str, list[str], str]
         if source == "conversation-user" and QUESTION.search(content):
             questions.append(content)
     return "\n".join(lines)[-6000:], questions[:8], "\n".join(tools)[-1200:]
+
+
+def _state_list(value: object, *, limit: int = 12) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = _safe_excerpt(str(item or ""), 420)
+        if text and text not in result:
+            result.append(text)
+    return result[-limit:]
+
+
+def _rolling_state(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(str(value or "{}")) if not isinstance(value, dict) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = {}
+    parsed = parsed if isinstance(parsed, dict) else {}
+    return {
+        "schema_version": ROLLING_STATE_VERSION,
+        "goal": _safe_excerpt(str(parsed.get("goal") or ""), 420),
+        "completed": _state_list(parsed.get("completed")),
+        "decisions": _state_list(parsed.get("decisions")),
+        "artifacts": _state_list(parsed.get("artifacts")),
+        "blockers": _state_list(parsed.get("blockers")),
+        "next_steps": _state_list(parsed.get("next_steps")),
+        "open_questions": _state_list(parsed.get("open_questions"), limit=12),
+        "updated_at": str(parsed.get("updated_at") or ""),
+    }
+
+
+def build_rolling_state(
+    events: list[dict[str, object]],
+    *,
+    previous: object = None,
+    open_questions: list[str] | None = None,
+    updated_at: str = "",
+) -> dict[str, object]:
+    """Produce a bounded, deterministic continuation state for a session.
+
+    The historical ``summary`` column remains intact for old integrations;
+    this structure is the compact state surface for a future Agent to resume
+    work without treating a full transcript as prompt context.
+    """
+
+    state = _rolling_state(previous)
+    for event in events:
+        source = str(event.get("source_type") or "").replace("_", "-").casefold()
+        if "resource" in source or "agent-observation" in source or "subagent" in source or "tool" in source:
+            continue
+        text = _safe_excerpt(str(event.get("content") or ""), 420)
+        if not text:
+            continue
+        role = "user" if source == "conversation-user" else "assistant" if source == "conversation-assistant" else "event"
+        if role == "user":
+            if _GOAL.search(text):
+                state["goal"] = text
+            if _NEXT.search(text) or (not QUESTION.search(text) and len(text) >= 12):
+                state["next_steps"] = _state_list([*list(state["next_steps"]), f"User request: {text}"])
+        else:
+            if _COMPLETED.search(text):
+                state["completed"] = _state_list([*list(state["completed"]), text])
+            if _DECISION.search(text):
+                state["decisions"] = _state_list([*list(state["decisions"]), text])
+            if _BLOCKER.search(text):
+                state["blockers"] = _state_list([*list(state["blockers"]), text])
+            if _NEXT.search(text):
+                state["next_steps"] = _state_list([*list(state["next_steps"]), text])
+            if _ARTIFACT.search(text):
+                state["artifacts"] = _state_list([*list(state["artifacts"]), text])
+    state["open_questions"] = _state_list([*list(state["open_questions"]), *(open_questions or [])])
+    state["schema_version"] = ROLLING_STATE_VERSION
+    state["updated_at"] = updated_at or datetime.now(timezone.utc).isoformat()
+    return state
+
+
+def render_rolling_state(value: object) -> str:
+    """Render the structured state for human/legacy consumers without loss."""
+
+    state = _rolling_state(value)
+    lines: list[str] = []
+    if state["goal"]:
+        lines.append(f"Goal: {state['goal']}")
+    for key, label in (("completed", "Completed"), ("decisions", "Decisions"), ("artifacts", "Artifacts"), ("blockers", "Blockers"), ("next_steps", "Next steps"), ("open_questions", "Open questions")):
+        values = list(state[key])
+        if values:
+            lines.append(f"{label}: " + " | ".join(values))
+    return "\n".join(lines)
 
 
 def build_cards(
@@ -127,7 +224,7 @@ def build_cards(
         sess = str(raw_session or "")
         key = session_key(sess)
         card = conn.execute(
-            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id, tool_summary FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?",
+            "SELECT id, last_event_id, source_event_ids, summary, open_questions, version, last_extracted_event_id, tool_summary, rolling_state_json FROM session_cards WHERE subject_id = ? AND session_id = ? AND profile_id=? AND workspace_id=? AND COALESCE(origin_agent_id,'')=?",
             (sid, key, raw_profile, raw_workspace, raw_agent),
         ).fetchone()
         last_event_id = int(card[1] or 0) if card else 0
@@ -161,6 +258,12 @@ def build_cards(
         summary = "\n".join(part for part in [old_summary, addition] if part).strip()[-6000:]
         tool_summary = "\n".join(part for part in [old_tool_summary, tool_addition] if part).strip()[-1200:]
         open_questions = list(dict.fromkeys(old_questions + questions))[:12]
+        rolling_state = build_rolling_state(
+            events,
+            previous=card[8] if card else None,
+            open_questions=open_questions,
+            updated_at=now,
+        )
         completed = conn.execute(
             "SELECT COUNT(*),MAX(completed_at) FROM turns WHERE subject_id=? AND profile_id=? AND workspace_id=? AND origin_agent_id=? AND external_session_id=? AND status='completed'",
             (sid, raw_profile, raw_workspace, raw_agent, sess),
@@ -172,20 +275,20 @@ def build_cards(
                 card_id = int(card[0])
                 conn.execute(
                     """
-                    UPDATE session_cards SET event_end_id=?, last_event_id=?, source_event_ids=?, summary=?, tool_summary=?, open_questions=?,
+                    UPDATE session_cards SET event_end_id=?, last_event_id=?, source_event_ids=?, summary=?, tool_summary=?, open_questions=?, rolling_state_json=?, rolling_state_version=?,
                     completed_turn_count=?, last_completed_turn_at=?, summary_visibility='workspace', detail_visibility='workspace',
                     summary_generation=summary_generation+1, summary_dirty=0, needs_extraction=1, version=?, updated_at=? WHERE id=?
                     """,
-                    (events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), completed_count, last_completed_at or None, int(card[5] or 1) + 1, now, card_id),
+                    (events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), json.dumps(rolling_state, ensure_ascii=False), ROLLING_STATE_VERSION, completed_count, last_completed_at or None, int(card[5] or 1) + 1, now, card_id),
                 )
             else:
                 cursor = conn.execute(
                     """
                     INSERT INTO session_cards(subject_id, subject_name, session_id, profile_id, workspace_id, origin_agent_id, event_start_id, event_end_id, last_event_id,
-                    source_event_ids, summary, tool_summary, open_questions, completed_turn_count, last_completed_turn_at, summary_visibility, detail_visibility, summary_generation, summary_dirty, state, needs_extraction, version, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'workspace', 'workspace', 1, 0, 'active', 1, 1, ?)
+                    source_event_ids, summary, tool_summary, open_questions, rolling_state_json, rolling_state_version, completed_turn_count, last_completed_turn_at, summary_visibility, detail_visibility, summary_generation, summary_dirty, state, needs_extraction, version, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'workspace', 'workspace', 1, 0, 'active', 1, 1, ?)
                     """,
-                    (sid, str(raw_name or "Unknown"), key, raw_profile, raw_workspace, raw_agent or origin_agent_id or "", events[0]["id"], events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), completed_count, last_completed_at or None, now),
+                    (sid, str(raw_name or "Unknown"), key, raw_profile, raw_workspace, raw_agent or origin_agent_id or "", events[0]["id"], events[-1]["id"], events[-1]["id"], json.dumps(ids, ensure_ascii=False), summary, tool_summary, json.dumps(open_questions, ensure_ascii=False), json.dumps(rolling_state, ensure_ascii=False), ROLLING_STATE_VERSION, completed_count, last_completed_at or None, now),
                 )
                 card_id = int(cursor.lastrowid)
             placeholders = ", ".join("?" for _ in events)
@@ -194,7 +297,7 @@ def build_cards(
                 (card_id, now, *[event["id"] for event in events]),
             )
             conn.executemany("INSERT OR IGNORE INTO session_card_events(card_id, raw_event_id) VALUES(?, ?)", [(card_id, event["id"]) for event in events])
-        results.append({"subject_id": sid, "session_id": sess, "origin_agent_id": str(raw_agent or ""), "card_id": card_id if not dry_run else (int(card[0]) if card else None), "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions})
+        results.append({"subject_id": sid, "session_id": sess, "origin_agent_id": str(raw_agent or ""), "card_id": card_id if not dry_run else (int(card[0]) if card else None), "created": not bool(card), "event_count": len(events), "source_event_ids": [event["id"] for event in events], "open_questions": questions, "rolling_state": rolling_state})
     if not dry_run:
         conn.commit()
     conn.close()
@@ -244,19 +347,20 @@ def refresh_dirty_cards(
                 for row in rows
             ]
             summary, questions, tool_summary = event_summary(events)
+            rolling_state = build_rolling_state(events, open_questions=questions, updated_at=now)
             completed = conn.execute(
                 "SELECT COUNT(*),MAX(completed_at) FROM turns WHERE subject_id=? AND profile_id=? AND workspace_id=? AND origin_agent_id=? AND external_session_id=? AND status='completed'",
                 (sid, profile, workspace, agent, session_id),
             ).fetchone()
             conn.execute(
                 """
-                UPDATE session_cards SET source_event_ids=?,summary=?,tool_summary=?,open_questions=?,
+                UPDATE session_cards SET source_event_ids=?,summary=?,tool_summary=?,open_questions=?,rolling_state_json=?,rolling_state_version=?,
                     completed_turn_count=?,last_completed_turn_at=?,summary_visibility='workspace',detail_visibility='workspace',
                     summary_generation=summary_generation+1,summary_dirty=0,updated_at=? WHERE id=?
                 """,
                 (
                     json.dumps([event["id"] for event in events][-200:], ensure_ascii=False), summary, tool_summary,
-                    json.dumps(questions, ensure_ascii=False), int(completed[0] or 0), str(completed[1] or "") or None,
+                    json.dumps(questions, ensure_ascii=False), json.dumps(rolling_state, ensure_ascii=False), ROLLING_STATE_VERSION, int(completed[0] or 0), str(completed[1] or "") or None,
                     now, card_id,
                 ),
             )

@@ -16,6 +16,35 @@ def migration_files() -> list[Path]:
     return sorted(migrations_dir().glob("[0-9][0-9][0-9]_*.sql"))
 
 
+def expected_schema_version() -> str:
+    """Return the newest packaged migration without reading every script.
+
+    ``open_db`` is called by short-lived CLI processes on every turn.  The
+    former implementation recalculated every migration checksum and repaired
+    FTS on each new process.  A single version lookup is enough for the normal
+    path; the full checksum walk remains available whenever a migration is
+    actually needed or an operator explicitly invokes this module.
+    """
+
+    files = migration_files()
+    return files[-1].name.split("_", 1)[0] if files else ""
+
+
+def schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Cheap, non-mutating schema sentinel for ordinary database opens."""
+
+    expected = expected_schema_version()
+    if not expected:
+        return True
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=? LIMIT 1", (expected,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return bool(row)
+
+
 def checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -57,8 +86,112 @@ def missing_column_sql(conn: sqlite3.Connection, table: str, columns: dict[str, 
     return [f"ALTER TABLE {table} ADD COLUMN {name} {sql_type};" for name, sql_type in columns.items() if name not in existing]
 
 
-def ensure_optional_fts(conn: sqlite3.Connection) -> bool:
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1",
+            (name,),
+        ).fetchone()
+    )
+
+
+def _record_fts_state(conn: sqlite3.Connection, name: str, count: int) -> None:
+    if not _table_exists(conn, "fts_runtime_state"):
+        return
+    conn.execute(
+        """
+        INSERT INTO fts_runtime_state(index_name,source_count,refreshed_at)
+        VALUES(?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(index_name) DO UPDATE SET
+            source_count=excluded.source_count, refreshed_at=excluded.refreshed_at
+        """,
+        (name, int(count)),
+    )
+
+
+def _fts_state_exists(conn: sqlite3.Connection, name: str) -> bool:
+    if not _table_exists(conn, "fts_runtime_state"):
+        return False
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM fts_runtime_state WHERE index_name=? LIMIT 1", (name,)
+        ).fetchone()
+    )
+
+
+def _create_resource_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Keep imported source chunks searchable without importer-side work."""
+
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS resource_chunks_fts_ai
+        AFTER INSERT ON resource_chunks BEGIN
+            INSERT INTO resource_chunks_fts(rowid,chunk_uid,resource_uid,content)
+            VALUES(new.rowid,new.chunk_uid,new.resource_uid,new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS resource_chunks_fts_au
+        AFTER UPDATE OF chunk_uid,resource_uid,content ON resource_chunks BEGIN
+            DELETE FROM resource_chunks_fts WHERE rowid=old.rowid;
+            INSERT INTO resource_chunks_fts(rowid,chunk_uid,resource_uid,content)
+            VALUES(new.rowid,new.chunk_uid,new.resource_uid,new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS resource_chunks_fts_ad
+        AFTER DELETE ON resource_chunks BEGIN
+            DELETE FROM resource_chunks_fts WHERE rowid=old.rowid;
+        END;
+        """
+    )
+
+
+def _create_session_card_fts_triggers(conn: sqlite3.Connection) -> None:
+    """Keep compact cross-Agent session summaries FTS-searchable."""
+
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS session_cards_fts_ai
+        AFTER INSERT ON session_cards BEGIN
+            INSERT INTO session_cards_fts(
+                rowid,card_id,profile_id,workspace_id,subject_id,origin_agent_id,
+                summary,tool_summary,open_questions
+            ) VALUES(
+                new.id,new.id,new.profile_id,new.workspace_id,new.subject_id,
+                COALESCE(new.origin_agent_id,''),new.summary,new.tool_summary,
+                new.open_questions
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_cards_fts_au
+        AFTER UPDATE OF profile_id,workspace_id,subject_id,origin_agent_id,summary,tool_summary,open_questions
+        ON session_cards BEGIN
+            DELETE FROM session_cards_fts WHERE rowid=old.id;
+            INSERT INTO session_cards_fts(
+                rowid,card_id,profile_id,workspace_id,subject_id,origin_agent_id,
+                summary,tool_summary,open_questions
+            ) VALUES(
+                new.id,new.id,new.profile_id,new.workspace_id,new.subject_id,
+                COALESCE(new.origin_agent_id,''),new.summary,new.tool_summary,
+                new.open_questions
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_cards_fts_ad
+        AFTER DELETE ON session_cards BEGIN
+            DELETE FROM session_cards_fts WHERE rowid=old.id;
+        END;
+        """
+    )
+
+
+def ensure_optional_fts(conn: sqlite3.Connection, *, refresh: bool = False) -> bool:
+    """Create optional FTS indexes and rebuild them only when required.
+
+    A missing FTS5 extension is still non-fatal.  ``refresh`` is used when a
+    schema migration has just run (or by the explicit repair command); normal
+    application opens only create missing indexes and never perform whole-table
+    counts/rebuilds.
+    """
     try:
+        raw_exists = _table_exists(conn, "raw_events_fts")
+        resource_exists = _table_exists(conn, "resource_chunks_fts")
+        cards_exists = _table_exists(conn, "session_cards_fts")
         conn.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
@@ -83,10 +216,65 @@ def ensure_optional_fts(conn: sqlite3.Connection) -> bool:
             )
             """
         )
-        raw_count = int(conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0])
-        fts_count = int(conn.execute("SELECT COUNT(*) FROM raw_events_fts").fetchone()[0])
-        if raw_count and not fts_count:
-            conn.execute("INSERT INTO raw_events_fts(raw_event_id, content, topic_hint, domain_hint) SELECT id, content, topic_hint, domain_hint FROM raw_events")
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS resource_chunks_fts USING fts5(
+                chunk_uid UNINDEXED, resource_uid UNINDEXED, content
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_cards_fts USING fts5(
+                card_id UNINDEXED, profile_id UNINDEXED, workspace_id UNINDEXED,
+                subject_id UNINDEXED, origin_agent_id UNINDEXED, summary,
+                tool_summary, open_questions
+            )
+            """
+        )
+        _create_resource_fts_triggers(conn)
+        _create_session_card_fts_triggers(conn)
+
+        # Populate a newly-created index once.  The runtime state replaces the
+        # old raw/source COUNT(*) checks on every one-shot command.
+        if refresh or not raw_exists or not _fts_state_exists(conn, "raw_events"):
+            conn.execute("DELETE FROM raw_events_fts")
+            conn.execute(
+                "INSERT INTO raw_events_fts(raw_event_id,content,topic_hint,domain_hint) "
+                "SELECT id,content,topic_hint,domain_hint FROM raw_events"
+            )
+            _record_fts_state(
+                conn, "raw_events", int(conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0])
+            )
+        if refresh or not resource_exists or not _fts_state_exists(conn, "resource_chunks"):
+            conn.execute("DELETE FROM resource_chunks_fts")
+            conn.execute(
+                "INSERT INTO resource_chunks_fts(rowid,chunk_uid,resource_uid,content) "
+                "SELECT rowid,chunk_uid,resource_uid,content FROM resource_chunks"
+            )
+            _record_fts_state(
+                conn,
+                "resource_chunks",
+                int(conn.execute("SELECT COUNT(*) FROM resource_chunks").fetchone()[0]),
+            )
+        if refresh or not cards_exists or not _fts_state_exists(conn, "session_cards"):
+            conn.execute("DELETE FROM session_cards_fts")
+            conn.execute(
+                """
+                INSERT INTO session_cards_fts(
+                    rowid,card_id,profile_id,workspace_id,subject_id,origin_agent_id,
+                    summary,tool_summary,open_questions
+                )
+                SELECT id,id,profile_id,workspace_id,subject_id,
+                       COALESCE(origin_agent_id,''),summary,tool_summary,open_questions
+                FROM session_cards
+                """
+            )
+            _record_fts_state(
+                conn,
+                "session_cards",
+                int(conn.execute("SELECT COUNT(*) FROM session_cards").fetchone()[0]),
+            )
         return True
     except sqlite3.OperationalError:
         return False
@@ -107,7 +295,7 @@ def ensure_legacy_indexes(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-def run_migrations(conn: sqlite3.Connection) -> dict[str, object]:
+def run_migrations(conn: sqlite3.Connection, *, repair_fts: bool = False) -> dict[str, object]:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -162,7 +350,7 @@ def run_migrations(conn: sqlite3.Connection) -> dict[str, object]:
     for table, columns in LEGACY_COLUMNS.items():
         ensure_columns(conn, table, columns)
     ensure_legacy_indexes(conn)
-    fts_available = ensure_optional_fts(conn)
+    fts_available = ensure_optional_fts(conn, refresh=bool(completed) or repair_fts)
     conn.commit()
     return {"applied": completed, "fts_available": fts_available}
 
@@ -170,11 +358,12 @@ def run_migrations(conn: sqlite3.Connection) -> dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Apply Meta Memory database migrations.")
     parser.add_argument("--db", required=True, help="Path to the SQLite database")
+    parser.add_argument("--repair-fts", action="store_true", help="Explicitly rebuild optional FTS indexes")
     args = parser.parse_args()
     db = Path(args.db).expanduser().resolve()
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db)
-    result = run_migrations(conn)
+    result = run_migrations(conn, repair_fts=args.repair_fts)
     conn.close()
     print({"status": "ok", "db": str(db), **result})
 

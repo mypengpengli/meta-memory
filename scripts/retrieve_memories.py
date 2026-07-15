@@ -411,6 +411,198 @@ def chunk_scores(conn, terms: list[str], filters: dict[str, object], limit: int)
     return results
 
 
+def document_filter_clauses(
+    filters: dict[str, object], *, alias: str = "d", include_validity: bool = True
+) -> tuple[list[str], list[object]]:
+    """Return the common scope/lifecycle filter used by bounded recall.
+
+    Keeping the filtering in SQL is important: retrieval used to fetch every
+    visible document into Python just to score it.  Every candidate query now
+    shares this exact visibility contract before a bounded set is materialized.
+    """
+
+    clauses, params = scoped_subject_clauses(filters, alias=alias)
+    subject_name = str(filters.get("subject_name") or "")
+    domains = [str(item).casefold() for item in filters.get("domains", [])]
+    kinds = [str(item).casefold() for item in filters.get("memory_kinds", [])]
+    if subject_name:
+        clauses.append(f"LOWER({alias}.subject_name)=?")
+        params.append(subject_name.casefold())
+    if domains:
+        clauses.append(f"LOWER({alias}.domain) IN ({', '.join('?' for _ in domains)})")
+        params.extend(domains)
+    if kinds:
+        clauses.append(f"LOWER({alias}.memory_kind) IN ({', '.join('?' for _ in kinds)})")
+        params.extend(kinds)
+    if not bool(filters.get("include_candidates", False)):
+        clauses.append(f"LOWER({alias}.memory_kind)!='candidate'")
+    clauses.extend(
+        [
+            f"LOWER(COALESCE({alias}.status,'')) NOT IN ('superseded','corrected')",
+            f"COALESCE({alias}.security_state,'clean') NOT IN ('blocked','suspicious')",
+            f"COALESCE({alias}.prompt_eligible,1)=1",
+            f"(COALESCE({alias}.replaced_by,'')='' OR COALESCE({alias}.replaced_by,'')='[]')",
+        ]
+    )
+    if include_validity:
+        valid_at = str(filters.get("valid_at") or "")
+        if valid_at:
+            clauses.append(
+                f"(COALESCE({alias}.valid_to,{alias}.end_at,'')='' OR COALESCE({alias}.valid_to,{alias}.end_at)>?)"
+            )
+            params.append(valid_at)
+    return clauses, params
+
+
+def _matching_document_paths(
+    conn,
+    *,
+    query: str,
+    terms: list[str],
+    filters: dict[str, object],
+    limit: int,
+) -> set[str]:
+    """Bound deterministic lexical fallback when FTS is unavailable/sparse."""
+
+    searchable = [term.casefold() for term in terms if len(term.strip()) >= 2][:12]
+    if not searchable:
+        return set()
+    clauses, params = document_filter_clauses(filters)
+    predicates: list[str] = []
+    for term in searchable:
+        # Indexed FTS is the normal route.  This fallback intentionally stays
+        # in SQLite and capped so a build without FTS5 never expands into a
+        # Python full-table scoring pass.
+        needle = f"%{term}%"
+        predicates.append(
+            "(LOWER(COALESCE(d.title,'')) LIKE ? OR LOWER(COALESCE(d.summary,'')) LIKE ? "
+            "OR LOWER(COALESCE(d.topic,'')) LIKE ? OR LOWER(COALESCE(d.tags,'')) LIKE ? "
+            "OR LOWER(COALESCE(d.related_topics,'')) LIKE ? OR LOWER(COALESCE(d.related_people,'')) LIKE ?)"
+        )
+        params.extend([needle] * 6)
+    try:
+        rows = conn.execute(
+            "SELECT d.path FROM documents AS d WHERE "
+            + " AND ".join([*clauses, "(" + " OR ".join(predicates) + ")"])
+            + " ORDER BY d.canonical DESC, d.importance DESC, d.mtime DESC LIMIT ?",
+            (*params, max(1, limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row[0]) for row in rows if str(row[0] or "")}
+
+
+def _document_paths_for_memory_ids(
+    conn, memory_ids: set[str], filters: dict[str, object], *, limit: int
+) -> set[str]:
+    ids = [item for item in memory_ids if item]
+    if not ids:
+        return set()
+    clauses, params = document_filter_clauses(filters)
+    try:
+        rows = conn.execute(
+            "SELECT d.path FROM documents AS d WHERE "
+            + " AND ".join([*clauses, f"d.memory_id IN ({', '.join('?' for _ in ids)})"])
+            + " ORDER BY d.canonical DESC,d.importance DESC,d.mtime DESC LIMIT ?",
+            (*params, *ids, max(1, limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row[0]) for row in rows if str(row[0] or "")}
+
+
+def _memory_ids_for_paths(conn, paths: set[str], *, limit: int) -> set[str]:
+    selected = [item for item in paths if item]
+    if not selected:
+        return set()
+    try:
+        rows = conn.execute(
+            f"SELECT memory_id FROM documents WHERE path IN ({', '.join('?' for _ in selected)}) "
+            "AND COALESCE(memory_id,'')!='' LIMIT ?",
+            (*selected, max(1, limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row[0]) for row in rows if str(row[0] or "")}
+
+
+def bounded_document_candidates(
+    conn,
+    *,
+    query: str,
+    terms: list[str],
+    filters: dict[str, object],
+    fts_paths: set[str],
+    chunk_paths: set[str],
+    top_k: int,
+    candidate_pool: int,
+    expand_hops: int,
+) -> tuple[set[str], set[str]]:
+    """Build a small recall set before the expensive Python ranking phase.
+
+    The result always includes a few stable profile/state records, direct FTS
+    hits, deterministic lexical fallbacks, entity hits, and *bounded* one-hop
+    graph neighbours.  It deliberately returns ids separately so the final
+    document query can preserve scope filters even when a claim has multiple
+    projections.
+    """
+
+    requested_cap = int(filters.get("candidate_limit", 0) or 0)
+    cap = max(32, min(256, requested_cap or max(int(candidate_pool) * 3, int(top_k) * 10)))
+    paths: set[str] = set(fts_paths) | set(chunk_paths)
+    paths.update(
+        _matching_document_paths(
+            conn, query=query, terms=terms, filters=filters, limit=max(12, cap // 2)
+        )
+    )
+
+    clauses, params = document_filter_clauses(filters)
+    # Basics are deliberately selected in SQL, rather than relying on a full
+    # corpus scan followed by select_basics().
+    try:
+        basics = conn.execute(
+            "SELECT d.path FROM documents AS d WHERE "
+            + " AND ".join(
+                [*clauses, "LOWER(d.memory_kind) IN ('profile','state')"]
+            )
+            + " ORDER BY d.canonical DESC,d.importance DESC,d.mtime DESC LIMIT ?",
+            (*params, max(4, min(16, top_k * 2))),
+        ).fetchall()
+        paths.update(str(row[0]) for row in basics if str(row[0] or ""))
+    except sqlite3.OperationalError:
+        pass
+
+    # Entity and graph recall are queried on identifiers, never by loading the
+    # complete edge table.  Import lazily to preserve standalone script use.
+    from entity_resolution import graph_candidate_claim_ids, retrieval_seed_claim_ids
+
+    memory_ids = _memory_ids_for_paths(conn, paths, limit=cap)
+    entity_ids = retrieval_seed_claim_ids(
+        conn, terms, workspace_id=str(filters.get("workspace_id") or "default"), limit=cap // 2
+    )
+    memory_ids.update(entity_ids)
+    if expand_hops > 0:
+        memory_ids.update(
+            graph_candidate_claim_ids(conn, memory_ids, hops=min(1, max(0, int(expand_hops))), limit=cap // 2)
+        )
+    paths.update(_document_paths_for_memory_ids(conn, memory_ids, filters, limit=cap))
+
+    # A query with no lexical evidence should still receive a small current
+    # fallback, but never the entire document corpus.
+    if len(paths) < max(8, top_k):
+        try:
+            fallback = conn.execute(
+                "SELECT d.path FROM documents AS d WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY d.canonical DESC,d.importance DESC,d.mtime DESC LIMIT ?",
+                (*params, max(8, min(cap, top_k * 3))),
+            ).fetchall()
+            paths.update(str(row[0]) for row in fallback if str(row[0] or ""))
+        except sqlite3.OperationalError:
+            pass
+    return set(list(paths)[:cap]), set(list(memory_ids)[:cap])
+
+
 def embedding_scores(conn, query: str, filters: dict[str, object], model: str) -> dict[str, float]:
     vectors = embed([query])
     if not vectors or not vectors[0]:
@@ -705,10 +897,9 @@ def resource_candidates(
     """Find source-evidence chunks without treating them as memories.
 
     ``resource_chunks`` intentionally has no dependency on the document
-    projection, because a file is evidence rather than a claim.  The query is
-    scoped to the active user and workspace and uses a bounded SQLite LIKE
-    scan.  This keeps the feature available on SQLite builds without FTS5 and
-    avoids pulling resource text into normal prompt retrieval.
+    projection, because a file is evidence rather than a claim.  The normal
+    route is a scoped, bounded FTS query; builds without FTS5 retain a bounded
+    SQLite LIKE fallback.  Resource evidence is never normal prompt context.
     """
     if not enabled or not terms:
         return []
@@ -719,32 +910,55 @@ def resource_candidates(
     if not subject_id:
         return []
 
-    # Limit the number of SQL predicates and result rows.  Matching happens in
-    # SQL before the limit, so large imported files remain searchable end to
-    # end rather than only across their first few chunks.
     searchable_terms = [term.casefold() for term in terms if len(term.strip()) >= 2][:18]
     if not searchable_terms:
         return []
-    predicates: list[str] = []
-    params: list[object] = [profile_id, workspace_id, subject_id]
-    for term in searchable_terms:
-        predicates.append("LOWER(rc.content) LIKE ?")
-        params.append(f"%{term}%")
-    # A filename can be useful evidence even when the selected chunk does not
-    # repeat its filename.  It remains explicitly marked as resource evidence.
-    for term in searchable_terms[:6]:
-        predicates.append("LOWER(ri.source_name) LIKE ?")
-        params.append(f"%{term}%")
-    params.append(max(1, min(int(limit), 200)))
+    bounded_limit = max(1, min(int(limit), 200))
+    rows = []
     try:
         rows = conn.execute(
-            f"""
+            """
             SELECT
                 ri.resource_uid, ri.source_path, ri.source_name, ri.source_type,
                 ri.content_hash, ri.byte_size, ri.modified_at, ri.encoding,
                 ri.raw_event_id, ri.card_path,
                 rc.chunk_uid, rc.chunk_index, rc.content, rc.content_hash,
-                rc.start_offset, rc.end_offset
+                rc.start_offset, rc.end_offset, bm25(resource_chunks_fts) AS rank
+            FROM resource_chunks_fts
+            JOIN resource_chunks AS rc ON rc.rowid=resource_chunks_fts.rowid
+            JOIN resource_imports AS ri ON ri.resource_uid = rc.resource_uid
+            WHERE resource_chunks_fts MATCH ?
+              AND ri.profile_id=? AND ri.workspace_id=? AND ri.subject_id=?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (fts_query(searchable_terms), profile_id, workspace_id, subject_id, bounded_limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    if not rows:
+        # Deterministic compatibility path for SQLite builds without FTS5.
+        predicates: list[str] = []
+        params: list[object] = [profile_id, workspace_id, subject_id]
+        for term in searchable_terms:
+            predicates.append("LOWER(rc.content) LIKE ?")
+            params.append(f"%{term}%")
+        # A filename can be useful evidence even when the selected chunk does
+        # not repeat it.  It remains explicitly marked as evidence.
+        for term in searchable_terms[:6]:
+            predicates.append("LOWER(ri.source_name) LIKE ?")
+            params.append(f"%{term}%")
+        params.append(bounded_limit)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    ri.resource_uid, ri.source_path, ri.source_name, ri.source_type,
+                    ri.content_hash, ri.byte_size, ri.modified_at, ri.encoding,
+                    ri.raw_event_id, ri.card_path,
+                    rc.chunk_uid, rc.chunk_index, rc.content, rc.content_hash,
+                    rc.start_offset, rc.end_offset
             FROM resource_imports AS ri
             JOIN resource_chunks AS rc ON rc.resource_uid = ri.resource_uid
             WHERE ri.profile_id=? AND ri.workspace_id=? AND ri.subject_id=?
@@ -754,10 +968,10 @@ def resource_candidates(
             """,
             tuple(params),
         ).fetchall()
-    except sqlite3.OperationalError:
-        # Stores created before the resource migration continue to retrieve
-        # ordinary memories normally; source evidence simply is not present.
-        return []
+        except sqlite3.OperationalError:
+            # Stores created before the resource migration continue to retrieve
+            # ordinary memories normally; source evidence simply is not present.
+            return []
 
     # Return the strongest matching chunk per resource.  This prevents a long
     # source file from crowding all ordinary memory results while preserving a
@@ -769,7 +983,7 @@ def resource_candidates(
             resource_uid, source_path, source_name, source_type, content_hash,
             byte_size, modified_at, encoding, raw_event_id, card_path,
             chunk_uid, chunk_index, content, chunk_hash, start_offset, end_offset,
-        ) = row
+        ) = row[:16]
         content_text = str(content or "")
         haystack = f"{source_name}\n{content_text}".casefold()
         matched = [term for term in searchable_terms if term in haystack]
@@ -871,38 +1085,39 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
         "memory_kinds": args.memory_kind,
         "include_candidates": args.include_candidates,
         "valid_at": args.valid_at or datetime.now(timezone.utc).isoformat(),
+        "candidate_limit": int(getattr(args, "candidate_limit", 0) or 0),
     }
     terms = query_terms(query)
     fts_score_map = fts_scores(conn, terms, filters, max(args.candidate_pool, args.top_k * 4))
     chunk_score_map = {} if args.no_chunks else chunk_scores(conn, terms, filters, max(args.candidate_pool, args.top_k * 4))
     embedding_score_map = embedding_scores(conn, query, filters, args.embedding_model) if args.include_embeddings else {}
 
-    clauses = []
-    params: list[object] = []
-    scope_clauses, scope_params = scoped_subject_clauses(filters, alias="d")
-    clauses.extend(scope_clauses); params.extend(scope_params)
-    if args.subject_name:
-        clauses.append("LOWER(d.subject_name) = ?")
-        params.append(args.subject_name.casefold())
-    if domains:
-        placeholders = ", ".join("?" for _ in domains)
-        clauses.append(f"LOWER(d.domain) IN ({placeholders})")
-        params.extend(domains)
-    if kinds:
-        placeholders = ", ".join("?" for _ in kinds)
-        clauses.append(f"LOWER(d.memory_kind) IN ({placeholders})")
-        params.extend(kinds)
-    if not args.include_candidates:
-        clauses.append("LOWER(d.memory_kind) != 'candidate'")
-    clauses.append("LOWER(COALESCE(d.status, '')) NOT IN ('superseded', 'corrected')")
-    clauses.append("COALESCE(d.security_state, 'clean') NOT IN ('blocked', 'suspicious')")
-    clauses.append("COALESCE(d.prompt_eligible, 1)=1")
-    clauses.append("(COALESCE(d.replaced_by, '') = '' OR COALESCE(d.replaced_by, '') = '[]')")
-    clauses.append("(COALESCE(d.valid_to, d.end_at, '') = '' OR COALESCE(d.valid_to, d.end_at) > ?)")
-    params.append(str(filters["valid_at"]))
-
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    rows = conn.execute(
+    candidate_paths, candidate_memory_ids = bounded_document_candidates(
+        conn,
+        query=query,
+        terms=terms,
+        filters=filters,
+        fts_paths=set(fts_score_map),
+        chunk_paths=set(chunk_score_map),
+        top_k=args.top_k,
+        candidate_pool=args.candidate_pool,
+        expand_hops=args.expand_hops,
+    )
+    clauses, params = document_filter_clauses(filters)
+    candidate_conditions: list[str] = []
+    candidate_params: list[object] = []
+    if candidate_paths:
+        candidate_conditions.append(f"d.path IN ({', '.join('?' for _ in candidate_paths)})")
+        candidate_params.extend(sorted(candidate_paths))
+    if candidate_memory_ids:
+        candidate_conditions.append(f"d.memory_id IN ({', '.join('?' for _ in candidate_memory_ids)})")
+        candidate_params.extend(sorted(candidate_memory_ids))
+    # No candidate is an ordinary empty-store result, not permission to fall
+    # back to a full corpus query.
+    if not candidate_conditions:
+        rows = []
+    else:
+        rows = conn.execute(
         f"""
         SELECT
             d.path,
@@ -941,10 +1156,10 @@ def retrieve(args: argparse.Namespace, *, query: str | None = None) -> dict[str,
             COALESCE(s.last_hit_at, '') AS last_hit_at
         FROM documents AS d
         LEFT JOIN scores AS s ON s.path = d.path
-        {where}
+        WHERE {' AND '.join([*clauses, '(' + ' OR '.join(candidate_conditions) + ')'])}
         """,
-        tuple(params),
-    ).fetchall()
+        (*params, *candidate_params),
+        ).fetchall()
 
     columns = [
         "path",

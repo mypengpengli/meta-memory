@@ -6,6 +6,8 @@
 
 > Meta Memory is CLI-first and runs on a machine you control. The current repository supports Python 3.10+ and is installed from this source repository.
 
+> **2.6:** Start with the practical [操作指南](docs/operations.md) and use the [升级指南](docs/upgrade.md) whenever the installed Agent or Python environment changes.
+
 [中文](#中文) · [English](#english)
 
 ---
@@ -72,16 +74,16 @@ meta-memory setup
 
 它会保存姓名、记忆库位置和是否启用定时整理/Dream。默认配置文件为 `~/.meta-memory/config.toml`，默认记忆库为 `~/.meta-memory/data`。
 
-`setup` 默认启用每 5 分钟的维护任务和每天一次 Dream；首次安装也可以先用
+`setup` 默认启用每 10 分钟一次的增量 Heartbeat 和每天一次 Deep Dream；首次安装也可以先用
 `--no-schedule` 只初始化数据，确认后再安装平台定时任务。非交互式示例：
 
 ```bash
 meta-memory setup --name "Li Peng" --maintenance yes --dream yes --no-schedule --non-interactive
-meta-memory status
+meta-memory overview
 meta-memory doctor
 ```
 
-所有公开命令都会输出 JSON。`status` 用来查看数据位置、待处理任务和总体状态；`doctor` 用来做健康检查。
+终端中默认输出便于阅读的文本；管道、Agent 和 `--json` 使用稳定 JSON。`overview` 是日常状态入口，`doctor` 用来做健康检查。
 
 ### 3. 写入并找回第一条记忆
 
@@ -224,14 +226,15 @@ meta-memory search --cwd "D:\work\meta-memory" --project auto "SQLite"
 
 | 目的 | 命令 | 结果 |
 | --- | --- | --- |
-| 看当前状态 | `meta-memory status` | 数据目录、待处理任务、健康摘要 |
+| 看当前状态与下一步 | `meta-memory overview` | Agent、队列、Heartbeat、Deep Dream 和明确的下一步 |
 | 做健康检查 | `meta-memory doctor` | 迁移、FTS、阻塞 Claim 等检查 |
 | 让对话入队后立即整理 | `meta-memory maintain --max-jobs 20` | 处理原始事件、候选和投影 |
 | 显式保存一条记忆 | `meta-memory remember --project auto --content "…"` | 带来源立即写入并更新投影 |
 | 搜索记忆与来源证据 | `meta-memory search --project auto "关键词"` | 返回 Claim、Dream 或资源证据；只有 `page_role: claim` 的 ID 可用于纠正 |
-| 搜索历史原话 | `meta-memory history --project auto "关键词"` | 返回会话中的历史消息 |
-| 生成近期 Dream 报告 | `meta-memory dream --scan-days 7` | JSON 的 `report` 给出报告文件路径 |
-| 导入已有资料 | `meta-memory import notes.md --project auto` | 保存原始资料证据和资源卡 |
+| 搜索/继续历史工作 | `meta-memory history recent --project auto` / `history search "关键词"` | 默认返回完成会话摘要；需要时再 `history show` |
+| 审核自动记忆候选 | `meta-memory inbox list` | 查看、批准或拒绝待处理提案 |
+| 生成近期 Dream 报告 | `meta-memory dream deep --scan-days 7 --dry-run` | 先预览，再生成来源可追溯的报告 |
+| 导入已有资料 | `meta-memory import ./notes --recursive --changed-only --project auto` | 保存原始资料证据和资源卡 |
 | 备份本地记忆库 | `meta-memory backup` | 生成一致性 `.zip` 备份 |
 | 安装或检查定时任务 | `meta-memory schedule install` / `meta-memory schedule status` | 安装或显示当前平台的维护/Dream 任务 |
 
@@ -243,7 +246,7 @@ meta-memory search --cwd "D:\work\meta-memory" --project auto "SQLite"
 meta-memory import ./notes/architecture.md --project meta-memory
 ```
 
-导入内容被保存为**可追溯的来源证据**，不是自动写成“用户事实”。当前公开 CLI 不会因为导入文件就自动把它提升为长期记忆；这是为了避免把文档里的旧结论或第三方内容误认为你的偏好和当前项目状态。
+导入内容被保存为**可追溯的来源证据**，不是自动写成“用户事实”。可用 `meta-memory resource list/show/refresh/remove/export` 管理它们；导入文件不会自动提升为长期记忆，避免把文档里的旧结论或第三方内容误认为你的偏好和当前项目状态。
 每个文件会使用由内容 Hash 派生的 `resource:<hash>` 合成会话，因此相同文件重试不会重复导入。
 
 ### 查看和纠正错误记忆
@@ -272,14 +275,15 @@ meta-memory correct \
 - macOS：LaunchAgents；
 - Linux：crontab。
 
-整理任务默认每 5 分钟运行一次 `meta-memory maintain`；Dream 默认在 23:30 运行 `meta-memory dream`。它们都可以随时手动执行：
+Heartbeat 默认每 10 分钟运行一次，只处理有新增或 dirty 的工作区；Deep Dream 默认在 23:30 运行。它们都可以随时手动执行：
 
 ```bash
-meta-memory maintain
-meta-memory dream --scan-days 7
+meta-memory dream heartbeat
+meta-memory dream deep --scan-days 7 --dry-run
+meta-memory dream deep --scan-days 7
 ```
 
-自动整理会把原始对话组织为会话卡、原子记忆、候选、Claim 和检索投影。Dream 只生成带来源的推断报告，例如重复主题、项目摘要和未解决问题；它不会删除原始证据，也不会把推断直接伪装成确定事实。
+自动整理会把原始对话组织为结构化会话状态、原子记忆、候选、Claim 和检索投影。普通任务、催促和确认会留在会话层；稳定偏好、项目决策和可复用流程才会成为长期候选。Dream 只生成带来源的推断报告；无来源或来源未变化时返回 `idle`，不会产生空报告或空提示词节点。
 
 `memory_mode` 位于配置的 `[behavior]` 区段，可取 `manual`、`conservative` 或
 `automatic`（默认）。显式 `remember` 和 `correct` 同步生效；自动模式只会提升有
@@ -413,7 +417,7 @@ Meta Memory 把“所有历史”与“可安全复用的记忆”分开：
 
 ### 多 Agent 共享与边界
 
-多个 Agent 可以共享同一用户的偏好、项目决策和结构化项目记忆。原始会话与 `history` 结果会按来源 Agent 隔离：即使宿主复用了同一个会话 ID，也不会把另一个 Agent 的对话原文注入当前上下文。带 `Agent-observed` 标记的项目记忆来自可追溯的工具/Agent 证据，不等同于用户事实。它不能保证某个宿主 Agent 一定遵循 Skill，也不能保证 LLM 的抽取或 Dream 推断永远正确。
+多个 Agent 可以共享同一用户的偏好、项目决策和结构化项目记忆。接续意图（如“继续、上次、之前做过”）会自动带入少量已完成、过滤后的工作区摘要；原始会话和跨 Agent 的详细历史仍需显式 `history show`/`--detail`，不会自动注入当前上下文。带 `Agent-observed` 标记的项目记忆来自可追溯的工具/Agent 证据，不等同于用户事实。它不能保证某个宿主 Agent 一定遵循 Skill，也不能保证 LLM 的抽取或 Dream 推断永远正确。
 
 SQLite 模式适合一台中心设备、个人或小团队的适量并发写入；不适合多台机器直接同时写同一文件、数百个并发写入 Agent 或多租户 SaaS。
 
@@ -501,12 +505,16 @@ meta-memory agent verify hermes
 
 Agents using the same system account share the default configuration and store. An Agent launcher pins the config path used when it was installed. For a non-default configuration, use the same `META_MEMORY_CONFIG` value (or `meta-memory --config <path> install-agent <agent>`) to install or reinstall every Agent launcher, then use those regenerated launchers.
 
+After an upgrade, repository move, or Python environment rebuild, run `meta-memory agent upgrade-status`, `meta-memory agent sync --all`, and `meta-memory schedule install` so every launcher and local task uses the current contract.
+
 ## Everyday operations
 
 | Task | Command |
 | --- | --- |
 | Save an explicit, sourced memory | `meta-memory remember --project auto --content "…"` |
 | Search structured memory | `meta-memory search --project auto "keyword"` |
+| Inspect/manage a Claim | `meta-memory memory recent/show/archive/forget` |
+| Review automatic proposals | `meta-memory inbox list/show/approve/reject` |
 | Search completed session summaries | `meta-memory history --project auto "keyword"` |
 | Read bounded completed-history detail when necessary | `meta-memory history --project auto "keyword" --detail` |
 | Inspect store and queued work | `meta-memory status` |
@@ -516,6 +524,7 @@ Agents using the same system account share the default configuration and store. 
 | Run daily deep synthesis now | `meta-memory dream deep --scan-days 7` |
 | Inspect Dream scheduling/state | `meta-memory dream status` |
 | Import source evidence | `meta-memory import notes.md --project auto` |
+| Inspect imported sources | `meta-memory resource list/show/refresh/remove` |
 | Create a consistent backup | `meta-memory backup` |
 
 For a custom integration, use the real turn lifecycle. `before` durably records the user request before retrieval, so use its returned `turn_id` and save the completed answer before sending that exact draft to the user:
@@ -531,7 +540,7 @@ meta-memory maintain
 
 The normal `history` query shares only completed, filtered session summaries within the same profile/workspace/subject; use `--detail` only to continue concrete prior work or when the summary is insufficient. Started Turns and assistant drafts are never shared, and a Turn may only be completed by the Agent that created it. Tool-backed project evidence is shown as `Agent-observed`; it is traceable operational evidence, not a user statement.
 
-`before` can return an advisory `unfinished_previous_turn` warning after the configured five-minute threshold. Continue the current answer; the heartbeat first replays any matching spool entry and only marks an unrecoverable Turn `abandoned` after the configured 60-minute threshold. A `project_identity_mismatch` warning never merges projects automatically—check the directory binding with `meta-memory project set` instead.
+`before` can return an advisory `unfinished_previous_turn` warning after the configured five-minute threshold. Continue the current answer; for work that lasts a long time, renew its lease with `meta-memory turn touch <turn-id>`. The heartbeat first replays matching spool entries and only abandons inactive Turns after the configured threshold; `turn reopen` and `turn complete` provide an auditable late path. A `project_identity_mismatch` warning never merges projects automatically—check the directory binding with `meta-memory project set` instead.
 
 `--project auto` uses the Git root (or current directory), then a saved directory binding. Unbound Git repositories use a stable `origin` remote fingerprint, so a normal clone can recall the same project after a portable restore even when its checkout directory has a different name. Other directories use a basename plus path fingerprint to avoid same-name collisions. Bind a directory with:
 
@@ -557,13 +566,13 @@ Dream has a lightweight heartbeat (every 10 minutes by default) and a daily deep
 
 ```bash
 meta-memory dream heartbeat
+meta-memory dream deep --scan-days 7 --dry-run
 meta-memory dream deep --scan-days 7
 meta-memory dream status
-meta-memory config set dream.heartbeat_interval_minutes 10
-meta-memory schedule install
+meta-memory config set dream.heartbeat_interval_minutes 10 --apply
 ```
 
-Valid heartbeat intervals are 1–10080 minutes. Changing one requires `schedule install` to refresh the local scheduler.
+Valid heartbeat intervals are 1–10080 minutes. `config set ... --apply` refreshes the scheduler immediately; without it, the response explicitly states that a schedule refresh is required.
 
 ## Data, backup, and limits
 

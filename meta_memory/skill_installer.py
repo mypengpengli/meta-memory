@@ -1,6 +1,7 @@
 """Install a verified, Agent-specific Meta Memory Skill and launcher."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,13 @@ from .agent_specs import BUILTIN_AGENT_IDS, detect_agent, get_agent_spec
 from .config import AppConfig, load_config, save_config
 
 
+# This version changes only when the host/CLI hand-off contract changes.  It is
+# intentionally independent from the package version so an upgrade can tell a
+# user whether an installed Skill still speaks the current turn protocol.
+SKILL_CONTRACT_VERSION = "turn-v2"
+LAUNCHER_CONTRACT_VERSION = "launcher-v1"
+
+
 def _template_text(name: str) -> str:
     """Load installed package data, with a source-tree fallback for dev use."""
 
@@ -23,6 +31,21 @@ def _template_text(name: str) -> str:
         return resources.files("meta_memory").joinpath("templates", name).read_text(encoding="utf-8")
     except (FileNotFoundError, ModuleNotFoundError):
         return (Path(__file__).resolve().parent / "templates" / name).read_text(encoding="utf-8")
+
+
+def _text_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _file_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _template_hash(name: str) -> str:
+    return _text_hash(_template_text(name))
 
 
 def _render_template(name: str, **values: object) -> str:
@@ -171,6 +194,8 @@ def _write_agent_registry(config: AppConfig, *, spec, launcher: Path, skill_file
 
     path = _agent_registry_path(config, spec.agent_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    from . import __version__
+
     payload = {
         "agent_id": spec.agent_id,
         "display_name": spec.display_name,
@@ -180,6 +205,16 @@ def _write_agent_registry(config: AppConfig, *, spec, launcher: Path, skill_file
         "launcher": str(launcher),
         "config": str(Path(config.path).expanduser().resolve()),
         "store": str(Path(config.store).expanduser().resolve()),
+        "package_version": __version__,
+        "app_version": __version__,
+        "contract_version": SKILL_CONTRACT_VERSION,
+        "skill_contract_version": SKILL_CONTRACT_VERSION,
+        "launcher_contract_version": LAUNCHER_CONTRACT_VERSION,
+        "skill_template_hash": _template_hash("skill.md.template"),
+        "template_hash": _template_hash("skill.md.template"),
+        "host_template_hash": _template_hash("host-instruction.md.template"),
+        "skill_content_hash": _file_hash(skill_file),
+        "launcher_content_hash": _file_hash(launcher),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
@@ -308,3 +343,144 @@ def install_agents(
         )
         for agent in selected
     ]
+
+
+def _registry_payloads(config: AppConfig) -> dict[str, dict[str, object]]:
+    directory = _agent_registry_path(config, "_").parent
+    result: dict[str, dict[str, object]] = {}
+    if not directory.is_dir():
+        return result
+    for path in directory.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            result[path.stem] = value
+    return result
+
+
+def sync_agent(config: AppConfig, agent_id: str, *, verify: bool = True) -> dict[str, object]:
+    """Regenerate one installed integration from the canonical template."""
+    agent = str(agent_id or "").strip().casefold()
+    registry = _registry_payloads(config).get(agent)
+    if agent in BUILTIN_AGENT_IDS:
+        return install_agent(agent, config=config, verify=verify)
+    if not registry:
+        raise ValueError("Custom Agent is not installed; provide its original custom skill directory with install-agent custom.")
+    skill = Path(str(registry.get("skill") or ""))
+    if not str(skill):
+        raise ValueError("Installed custom Agent has no recorded Skill path.")
+    # ``install_agent(custom)`` receives the directory before its
+    # ``meta-memory`` child.  This reconstruction keeps old registries usable.
+    custom_root = skill.parent.parent
+    host = registry.get("host_instruction")
+    return install_agent(
+        "custom",
+        config=config,
+        custom_skill_dir=custom_root,
+        custom_agent_id=agent,
+        custom_host_file=str(host) if host else None,
+        no_host_file=not bool(host),
+        verify=verify,
+    )
+
+
+def sync_agents(
+    config: AppConfig,
+    *,
+    agents: Iterable[str] = (),
+    all_agents: bool = False,
+    verify: bool = True,
+) -> dict[str, object]:
+    registered = _registry_payloads(config)
+    selected = [str(item).strip().casefold() for item in agents if str(item).strip()]
+    if all_agents:
+        selected = sorted(registered)
+    selected = list(dict.fromkeys(selected))
+    if not selected:
+        return {
+            "status": "needs_action", "synced": [],
+            "next_action": "meta-memory install-agent codex",
+            "reason": "no_installed_agents",
+        }
+    results: list[dict[str, object]] = []
+    for agent in selected:
+        try:
+            results.append(sync_agent(config, agent, verify=verify))
+        except (OSError, ValueError, RuntimeError) as exc:
+            results.append({"status": "error", "agent": agent, "error": str(exc)})
+    failed = [item for item in results if str(item.get("status")) == "error"]
+    return {"status": "partial" if failed else "ok", "synced": results, "failed": len(failed)}
+
+
+def uninstall_agent(config: AppConfig, agent_id: str) -> dict[str, object]:
+    """Remove only files and the managed host block owned by one integration."""
+    agent = str(agent_id or "").strip().casefold()
+    registry_path = _agent_registry_path(config, agent)
+    registry = _registry_payloads(config).get(agent)
+    if not registry:
+        return {"status": "not_found", "agent": agent, "removed": []}
+    removed: list[str] = []
+    for key in ("launcher", "skill"):
+        path = Path(str(registry.get(key) or ""))
+        if path.is_file():
+            path.unlink()
+            removed.append(str(path))
+    # A host instruction can be shared by custom integrations.  Remove its
+    # managed block only once no other registry still refers to that host.
+    host_text = str(registry.get("host_instruction") or "")
+    others = _registry_payloads(config)
+    host_is_shared = any(
+        name != agent and str(value.get("host_instruction") or "") == host_text
+        for name, value in others.items()
+    )
+    host = Path(host_text) if host_text else None
+    if host and host.is_file() and not host_is_shared:
+        expression = re.compile(r"(?:\n)?<!-- meta-memory:begin -->.*?<!-- meta-memory:end -->\s*", re.S)
+        old = host.read_text(encoding="utf-8")
+        updated = expression.sub("", old).rstrip() + ("\n" if old.strip() else "")
+        if updated != old:
+            host.write_text(updated, encoding="utf-8")
+            removed.append(str(host))
+    if registry_path.is_file():
+        registry_path.unlink()
+        removed.append(str(registry_path))
+    return {"status": "ok", "agent": agent, "removed": removed, "host_block_retained": bool(host_is_shared)}
+
+
+def _upgrade_row(config: AppConfig, agent: str, registry: dict[str, object]) -> dict[str, object]:
+    skill = Path(str(registry.get("skill") or ""))
+    launcher = Path(str(registry.get("launcher") or ""))
+    current_template = _template_hash("skill.md.template")
+    expected_skill = str(registry.get("skill_content_hash") or "")
+    actual_skill = _file_hash(skill)
+    expected_launcher = str(registry.get("launcher_content_hash") or "")
+    actual_launcher = _file_hash(launcher)
+    missing = not skill.is_file() or not launcher.is_file()
+    contract_changed = str(registry.get("skill_contract_version") or "") != SKILL_CONTRACT_VERSION
+    template_changed = str(registry.get("skill_template_hash") or "") != current_template
+    drifted = bool(expected_skill and actual_skill and expected_skill != actual_skill) or bool(expected_launcher and actual_launcher and expected_launcher != actual_launcher)
+    state = "missing" if missing else "needs_sync" if contract_changed or template_changed else "drifted" if drifted else "up_to_date"
+    return {
+        "agent": agent, "status": state, "installed": not missing,
+        "skill_contract_version": registry.get("skill_contract_version"), "current_contract_version": SKILL_CONTRACT_VERSION,
+        "template_changed": template_changed, "contract_changed": contract_changed, "local_drift": drifted,
+        "next_action": None if state == "up_to_date" else f"meta-memory agent sync {agent}",
+    }
+
+
+def agent_upgrade_status(config: AppConfig, *, agent_id: str = "", all_agents: bool = False) -> dict[str, object]:
+    registries = _registry_payloads(config)
+    selected = sorted(registries) if all_agents or not str(agent_id).strip() else [str(agent_id).strip().casefold()]
+    rows = [
+        _upgrade_row(config, agent, registries[agent]) if agent in registries else {
+            "agent": agent, "status": "not_installed", "installed": False,
+            "next_action": f"meta-memory install-agent {agent}",
+        }
+        for agent in selected
+    ]
+    if not rows:
+        return {"status": "needs_action", "agents": [], "next_action": "meta-memory install-agent codex"}
+    needs = [item for item in rows if item["status"] != "up_to_date"]
+    return {"status": "needs_action" if needs else "ok", "agents": rows, "needs_sync": len(needs)}

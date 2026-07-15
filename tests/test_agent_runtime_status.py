@@ -31,7 +31,9 @@ class AgentRuntimeStatusTests(unittest.TestCase):
     def _age_turn(self, turn_uid: str) -> None:
         conn = open_db(self.config.store)
         try:
-            conn.execute("UPDATE turns SET started_at='2000-01-01T00:00:00+00:00' WHERE turn_uid=?", (turn_uid,))
+            # Recovery uses the renewable activity lease rather than creation
+            # time, so a synthetic stale turn must age both timestamps.
+            conn.execute("UPDATE turns SET started_at='2000-01-01T00:00:00+00:00',last_active_at='2000-01-01T00:00:00+00:00' WHERE turn_uid=?", (turn_uid,))
             conn.commit()
         finally:
             conn.close()

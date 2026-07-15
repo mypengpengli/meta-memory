@@ -20,7 +20,98 @@ SENSITIVE = re.compile(r"\b(health|medical|diagnosis|finance|salary|bank|relatio
 UNCERTAIN = re.compile(r"\b(maybe|perhaps|might|guess|probably|unsure)\b|可能|也许|大概|猜测|不确定|好像")
 ACK = re.compile(r"^(?:ok|okay|thanks|thank you|got it|continue|好的|谢谢|收到|继续)[!！。.]?$", re.I)
 BOUNDARY = re.compile(r"(?<=[。！？!?.])\s*|\n+")
-EXTRACTION_VERSION = "rules-v2"
+EXTRACTION_VERSION = "rules-v3-retention"
+
+# This is deliberately a small, explainable gate before the unit classifier.
+# Session cards retain every conversational event; the gate only decides
+# whether an event should enter the *long-term* extraction pipeline.
+_IGNORE_ENTRY = re.compile(
+    r"^(?:ok(?:ay)?|thanks?|thank\s+you|got\s+it|continue|go\s+on|"
+    r"好的|好|收到|明白(?:了)?|了解(?:了)?|谢谢|没事|不用了|继续|嗯|哦|行|可以|加油|快点)"
+    r"(?:[!！。,.，\s]*)$",
+    re.I,
+)
+_EXPLICIT_MEMORY = re.compile(
+    r"(?:请(?:你)?记住|记下来|长期记忆|保存为(?:长期)?记忆|以后都|从现在(?:开始|起)|"
+    r"remember\s+(?:this|that)|save\s+(?:this|that)\s+(?:as\s+)?memory|from\s+now\s+on)",
+    re.I,
+)
+_STABLE_SIGNAL = re.compile(
+    r"(?:以后|今后|往后|从现在(?:开始|起)|长期|默认|每次|总是|始终|一直|一律|固定|"
+    r"习惯|偏好|原则|规范|约定|工作流|流程|不再|持续|always|every\s+time|by\s+default|"
+    r"from\s+now\s+on|long[-\s]?term|preference|habit|policy|workflow)",
+    re.I,
+)
+_STABLE_WORKFLOW = re.compile(
+    r"(?:提交|推送|合并|发布|部署|备份|同步|更新|检查|验证|运行|排查|修复|记录|"
+    r"commit|push|merge|release|deploy|backup|sync|update|check|verify|run|debug|fix|record)",
+    re.I,
+)
+_PROJECT_FACT = re.compile(
+    r"(?:项目|系统|仓库|代码|配置|数据库|分支|project|system|repository|code|config|database|branch)"
+    r".{0,48}(?:目前|现在|已经|改为|迁移|使用|版本|架构|currently|now|uses?|migrated|changed|version|architecture)",
+    re.I,
+)
+_ONE_SHOT_REQUEST = re.compile(
+    r"^(?:请(?:你)?|麻烦(?:你)?|帮(?:我|忙)?|能(?:否|不能|不能够)?|可以(?:帮我)?|"
+    r"现在|这次|本次|今天|先|继续|查看|看看|提交|推送|运行|执行|修改|改(?:一下|下)|"
+    r"修复|处理|完成|please|can\s+you|could\s+you|help\s+me|run|execute|commit|push|merge|"
+    r"fix|update|continue|show|check)",
+    re.I,
+)
+_TRANSIENT_SIGNAL = re.compile(
+    r"(?:这次|本次|当前(?:这一步|任务|问题)?|今天|马上|先(?:做|看|处理)|临时|稍后|"
+    r"this\s+(?:time|task|step)|right\s+now|for\s+now|temporary|later)",
+    re.I,
+)
+
+
+def route_memory_entry(
+    content: str,
+    *,
+    source_type: str = "conversation-user",
+    explicit: bool = False,
+) -> dict[str, str]:
+    """Classify the retention boundary for one automatically observed event.
+
+    ``ignore`` means the message carries no durable or session-state signal;
+    ``session_only`` stays in raw events/session cards but never creates a
+    memory unit; ``long_term_candidate`` proceeds to the reviewable semantic
+    pipeline.  Explicit remember calls use a separate synchronous path, but
+    callers may pass ``explicit=True`` to make that guarantee explicit.
+    """
+
+    text = " ".join(str(content or "").split()).strip()
+    source = str(source_type or "").casefold().replace("_", "-")
+    if explicit:
+        return {"retention_class": "long_term_candidate", "reason": "explicit_memory"}
+    if not text:
+        return {"retention_class": "ignore", "reason": "empty"}
+    if source in {"resource", "agent-observation", "tool-result"}:
+        # These sources already have their own provenance and policy gates;
+        # do not mistake a quoted imperative inside a resource for a user
+        # request.
+        return {"retention_class": "long_term_candidate", "reason": f"{source}_evidence"}
+    if _IGNORE_ENTRY.match(text) or ACK.match(text):
+        return {"retention_class": "ignore", "reason": "acknowledgement_or_nudge"}
+    if _EXPLICIT_MEMORY.search(text):
+        return {"retention_class": "long_term_candidate", "reason": "explicit_memory_instruction"}
+    if _STABLE_SIGNAL.search(text):
+        if _STABLE_WORKFLOW.search(text):
+            return {"retention_class": "long_term_candidate", "reason": "stable_workflow_or_preference"}
+        return {"retention_class": "long_term_candidate", "reason": "stable_preference_or_constraint"}
+    if is_question(text) and not contains_assertion(text):
+        return {"retention_class": "session_only", "reason": "information_request"}
+    if _ONE_SHOT_REQUEST.search(text) or _TRANSIENT_SIGNAL.search(text):
+        return {"retention_class": "session_only", "reason": "one_shot_request_or_transient_task"}
+    if _PROJECT_FACT.search(text):
+        return {"retention_class": "long_term_candidate", "reason": "project_state_or_decision"}
+    return {"retention_class": "long_term_candidate", "reason": "declarative_candidate"}
+
+
+# A descriptive alias makes this useful to policy callers and public tooling
+# without coupling them to the implementation name above.
+classify_memory_entry = route_memory_entry
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,13 +153,19 @@ def atomic_clauses(content: str) -> list[str]:
 
 def structured_fields(text: str, topic_hint: str, domain_hint: str) -> dict[str, object]:
     predicate, kind, subject, durability = "states", "domain", "user", .55
-    if re.search(r"\b(?:prefer|preference|like responses)\b|偏好|喜欢.*(?:回答|方式)|希望.*(?:回答|说明)", text, re.I): predicate,kind,subject,durability="prefers","profile","user",.9
+    stable_workflow = bool(_STABLE_SIGNAL.search(text) and _STABLE_WORKFLOW.search(text))
+    if stable_workflow:
+        # "以后直接推送远端" is a reusable workflow constraint, not a
+        # one-time push request.  Keep the whole clause as the object so it
+        # remains intelligible when recalled independently of its source.
+        predicate,kind,subject,durability="procedure","domain","workflow",.95
+    elif re.search(r"\b(?:prefer|preference|like responses)\b|偏好|喜欢.*(?:回答|方式)|希望.*(?:回答|说明)", text, re.I): predicate,kind,subject,durability="prefers","profile","user",.9
     elif re.search(r"\b(?:now|currently|migrated|changed to|uses?)\b|现在|目前|已经改成|迁移到", text, re.I): predicate,kind,subject,durability="current_state","state","project",.75
     elif re.search(r"\b(?:previously|used to|before)\b|以前|之前|曾经", text, re.I): predicate,kind,subject,durability="historical_state","event","project",.7
     elif re.search(r"\b(?:please|when troubleshooting|when debugging|when .*?(?:debug|troubleshoot)|first .*? then)\b|以后.*(?:请|先)|排查.*(?:先|再)", text, re.I): predicate,kind,subject,durability="procedure","domain","workflow",.8
     elif re.search(r"\b(?:goal|plan|will|need to)\b|目标|计划|需要", text, re.I): predicate,kind,subject,durability="goal","goal","project",.65
     matched = re.search(r"(?:uses?|use|to|为|是|改成|迁移到)\s+([A-Za-z0-9_.+/#-]{2,}|[\u4e00-\u9fff]{2,})", text, re.I)
-    object_text = matched.group(1) if matched else text[:240]
+    object_text = text[:240] if stable_workflow else (matched.group(1) if matched else text[:240])
     topic = topic_hint or re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", object_text.casefold()).strip("-") or "memory"
     return {"predicate":predicate,"unit_kind":kind,"subject_text":subject,"object_text":object_text[:240],"topic":topic[:80],"domain":domain_hint or "general","durability":durability,"qualifiers":{},"entities":{},"valid_from":"","valid_to":""}
 
@@ -135,6 +232,13 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
         if event_end_id is not None: event_clauses.append("id<=?"); event_params.append(event_end_id)
         events = conn.execute(f"SELECT id,source_type,content,topic_hint,domain_hint,event_time,created_at,profile_id,workspace_id,visibility_scope,origin_agent_id FROM raw_events WHERE {' AND '.join(event_clauses)} ORDER BY id", event_params).fetchall()
         max_seen = int(last_extracted or 0)
+        # Do not spend an optional LLM call on acknowledgements or one-shot
+        # work requests.  They are retained by the session card, but are not
+        # candidates for a long-term semantic unit.
+        routing_by_event = {
+            int(row[0]): route_memory_entry(str(row[2] or ""), source_type=str(row[1] or ""))
+            for row in events
+        }
         # Imported resources may contain third-party or historical material.
         # Keep their extraction deterministic and local; they can become only
         # non-prompt candidates, never an LLM-promoted user fact.
@@ -142,15 +246,33 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
             {"raw_event_id": int(row[0]), "content": str(row[2] or "")}
             for row in events
             if str(row[1] or "") != "resource"
+            and routing_by_event[int(row[0])]["retention_class"] == "long_term_candidate"
         ])
         for event_id, source_type, content, topic_hint, domain_hint, event_time, created_at, event_profile, event_workspace, event_visibility, event_agent in events:
             max_seen = max(max_seen,int(event_id)); source_type, content = str(source_type or ""), " ".join(str(content or "").split())[:2000]
             if not content or ACK.match(content): skipped.append({"raw_event_id":event_id,"reason":"empty_or_ack"}); continue
             if source_type=="conversation-assistant" and not include_assistant: skipped.append({"raw_event_id":event_id,"reason":"assistant_content_disabled"}); continue
+            retention = routing_by_event.get(int(event_id)) or route_memory_entry(content, source_type=source_type)
+            if retention["retention_class"] != "long_term_candidate":
+                skipped.append({
+                    "raw_event_id": event_id,
+                    "reason": retention["retention_class"],
+                    "retention_reason": retention["reason"],
+                })
+                continue
             raw = {"event_time":str(event_time or ""),"created_at":str(created_at or "")}; llm = llm_by_event.get(int(event_id), []); candidates = llm or [{"claim_text":part} for part in atomic_clauses(content)]
             for clause_index, extracted in enumerate(candidates):
                 clause = str(extracted.get("claim_text") or "").strip()
                 if not clause or ACK.match(clause) or (is_question(clause) and not contains_assertion(clause)): skipped.append({"raw_event_id":event_id,"reason":"question_or_nonmemory"}); continue
+                clause_retention = route_memory_entry(clause, source_type=source_type)
+                if clause_retention["retention_class"] != "long_term_candidate":
+                    skipped.append({
+                        "raw_event_id": event_id,
+                        "clause_index": clause_index,
+                        "reason": clause_retention["retention_class"],
+                        "retention_reason": clause_retention["reason"],
+                    })
+                    continue
                 fallback = structured_fields(clause,str(topic_hint or ""),str(domain_hint or "")); fields = normalize_extracted_unit(extracted if llm else {}, fallback=fallback, raw_event=raw)
                 classified = classify(str(topic_hint or first_sentence(clause)[:80] or f"raw-event-{event_id}"), clause, str(sid), str(name or "Unknown")); confidence = clamp01(extracted.get("confidence"), float(classified["suggested_payload"]["confidence"])) if llm else (min(float(classified["suggested_payload"]["confidence"]),.25) if source_type=="conversation-assistant" else float(classified["suggested_payload"]["confidence"]))
                 if source_type == "resource":
@@ -179,7 +301,7 @@ def extract_units(root, *, subject_id: str | None = None, session_id: str | None
                 if not validation["valid"]: skipped.append({"raw_event_id":event_id,"reason":"validation","errors":validation["errors"]}); continue
                 if dry_run: created.append({"unit_id":None,"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]}); continue
                 key=sha256_text(f"{sid}:{event_id}:{clause_index}:{EXTRACTION_VERSION}:{sha256_text(clause)}")
-                cursor=conn.execute("""INSERT OR IGNORE INTO memory_units(unit_key,subject_id,subject_name,session_id,session_card_id,raw_event_id,source_event_ids,unit_kind,topic,content,content_hash,confidence,uncertainty,importance,sensitivity,source_type,status,domain,predicate,subject_text,object_text,qualifiers_json,valid_from,valid_to,observed_at,durability,entities_json,security_state,security_findings_json,clause_index,extraction_version,profile_id,workspace_id,visibility_scope,origin_agent_id,owner_agent_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (key,sid,name,sess,cid,event_id,json.dumps([event_id]),fields["unit_kind"],fields["topic"],clause,sha256_text(clause),confidence,unit["uncertainty"],unit["importance"],sensitivity(clause),source_type,fields["domain"],fields["predicate"],fields["subject_text"],fields["object_text"],json.dumps(fields["qualifiers"],ensure_ascii=False),fields["valid_from"],fields["valid_to"],fields["observed_at"] or utc_now(),fields["durability"],json.dumps(fields["entities"],ensure_ascii=False),validation["security_state"],json.dumps(validation["security_findings"],ensure_ascii=False),clause_index,EXTRACTION_VERSION,event_profile or card_profile,unit_workspace,unit_visibility,event_agent or origin_agent_id or card_agent or "",(event_agent or owner_agent_id) if unit_visibility=="agent" else None))
+                cursor=conn.execute("""INSERT OR IGNORE INTO memory_units(unit_key,subject_id,subject_name,session_id,session_card_id,raw_event_id,source_event_ids,unit_kind,topic,content,content_hash,confidence,uncertainty,importance,sensitivity,source_type,status,domain,predicate,subject_text,object_text,qualifiers_json,valid_from,valid_to,observed_at,durability,entities_json,security_state,security_findings_json,clause_index,extraction_version,profile_id,workspace_id,visibility_scope,origin_agent_id,owner_agent_id,retention_class,retention_reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (key,sid,name,sess,cid,event_id,json.dumps([event_id]),fields["unit_kind"],fields["topic"],clause,sha256_text(clause),confidence,unit["uncertainty"],unit["importance"],sensitivity(clause),source_type,fields["domain"],fields["predicate"],fields["subject_text"],fields["object_text"],json.dumps(fields["qualifiers"],ensure_ascii=False),fields["valid_from"],fields["valid_to"],fields["observed_at"] or utc_now(),fields["durability"],json.dumps(fields["entities"],ensure_ascii=False),validation["security_state"],json.dumps(validation["security_findings"],ensure_ascii=False),clause_index,EXTRACTION_VERSION,event_profile or card_profile,unit_workspace,unit_visibility,event_agent or origin_agent_id or card_agent or "",(event_agent or owner_agent_id) if unit_visibility=="agent" else None,clause_retention["retention_class"],clause_retention["reason"]))
                 if cursor.rowcount: created.append({"unit_id":int(cursor.lastrowid),"raw_event_id":event_id,"clause_index":clause_index,"predicate":fields["predicate"]})
         if not dry_run and max_seen > int(last_extracted or 0):
             remaining = conn.execute("SELECT EXISTS(SELECT 1 FROM raw_events WHERE session_card_id=? AND id>?)", (cid, max_seen)).fetchone()[0]

@@ -109,25 +109,128 @@ def _retry(root: Path, item_id: int, worker_id: str, error: Exception) -> str:
     conn.commit(); conn.close(); return status
 
 
+def _refresh_hot_scope(root: Path, entity_id: str) -> dict[str, object]:
+    """Build one canonical snapshot for a coalesced scope/generation.
+
+    A claim write can enqueue many ``hot/refresh`` outbox rows in one review
+    batch.  Hot memory is a scope projection, not a claim projection, so
+    processing each row used to regenerate the same files repeatedly.  The
+    compare-and-swap below also prevents maintenance from doing a second build
+    once this worker has completed the exact dirty generation.
+    """
+
+    scope = entity_id.split("\x1f")
+    if len(scope) < 3 or not all(scope[:3]):
+        raise ValueError("invalid hot projection scope")
+    subject, profile, workspace = scope[:3]
+    agent = scope[3] if len(scope) > 3 else ""
+    conn = open_db(root)
+    try:
+        row = conn.execute(
+            """
+            SELECT claim_generation FROM workspace_runtime_state
+            WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=?
+            """,
+            (profile, workspace, subject, agent),
+        ).fetchone()
+        canonical_agent = agent
+        # Older producers encoded origin_agent_id in every hot outbox key,
+        # while shared runtime state intentionally uses the empty agent scope.
+        # Prefer that canonical shared scope when it exists.
+        if row is None and agent:
+            row = conn.execute(
+                """
+                SELECT claim_generation FROM workspace_runtime_state
+                WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=''
+                """,
+                (profile, workspace, subject),
+            ).fetchone()
+            if row is not None:
+                canonical_agent = ""
+        generation = int(row[0] or 0) if row else None
+    finally:
+        conn.close()
+    snapshot = build_hot_memory(
+        root,
+        subject_id=subject,
+        profile_id=profile,
+        workspace_id=workspace,
+        agent_id=canonical_agent,
+        generation=generation,
+    )
+    if generation is not None:
+        conn = open_db(root)
+        try:
+            conn.execute(
+                """
+                UPDATE workspace_runtime_state
+                SET hot_dirty=CASE WHEN claim_generation=? THEN 0 ELSE 1 END,
+                    hot_generation=CASE WHEN claim_generation=? THEN ? ELSE hot_generation END,
+                    last_maintained_at=?,last_success_at=?,last_error=NULL,updated_at=?
+                WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=?
+                """,
+                (
+                    generation,
+                    generation,
+                    generation,
+                    utc_now(),
+                    utc_now(),
+                    utc_now(),
+                    profile,
+                    workspace,
+                    subject,
+                    canonical_agent,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"scope": {"subject_id": subject, "profile_id": profile, "workspace_id": workspace, "agent_id": canonical_agent}, "snapshot": snapshot, "generation": generation}
+
+
 def process_projection_outbox(root: Path, *, limit: int = 100, worker_id: str = "") -> dict[str, object]:
     worker_id = worker_id or f"projection:{uuid.uuid4()}"
     rows = _claim_batch(root, worker_id, limit=limit)
     processed: list[dict[str, object]] = []
-    for item_id, entity_type, entity_id, operation in rows:
+    hot_groups: dict[str, list[int]] = {}
+    ordinary_rows: list[tuple[int, str, str, str]] = []
+    for item in rows:
+        item_id, entity_type, entity_id, operation = item
+        if entity_type == "hot" and operation == "refresh":
+            hot_groups.setdefault(entity_id, []).append(item_id)
+        else:
+            ordinary_rows.append(item)
+
+    # Reindex claim projections first, then build each affected hot scope once
+    # against the final generation for this worker batch.
+    for item_id, entity_type, entity_id, operation in ordinary_rows:
         try:
             if entity_type == "claim" and operation == "reindex":
                 conn = open_db(root); row = conn.execute("SELECT memory_path FROM claims WHERE id=?", (entity_id,)).fetchone(); conn.close()
                 if row and str(row[0] or ""):
                     _reindex_path(root, str(row[0]))
-            elif entity_type == "hot" and operation == "refresh":
-                scope = entity_id.split("\x1f")
-                subject, profile, workspace = scope[:3]
-                build_hot_memory(root, subject_id=subject, profile_id=profile, workspace_id=workspace, agent_id=scope[3] if len(scope) > 3 else "")
             _complete(root, item_id, worker_id)
             processed.append({"id": item_id, "status": "completed"})
         except Exception as exc:
             processed.append({"id": item_id, "status": _retry(root, item_id, worker_id, exc), "error": str(exc)})
-    return {"status": "ok", "worker_id": worker_id, "processed": processed}
+    for entity_id, item_ids in hot_groups.items():
+        try:
+            result = _refresh_hot_scope(root, entity_id)
+            for index, item_id in enumerate(item_ids):
+                _complete(root, item_id, worker_id)
+                processed.append(
+                    {
+                        "id": item_id,
+                        "status": "completed",
+                        "coalesced": len(item_ids) > 1,
+                        "scope_refresh": index == 0,
+                        "hot": result,
+                    }
+                )
+        except Exception as exc:
+            for item_id in item_ids:
+                processed.append({"id": item_id, "status": _retry(root, item_id, worker_id, exc), "error": str(exc)})
+    return {"status": "ok", "worker_id": worker_id, "processed": processed, "hot_scopes_refreshed": len(hot_groups)}
 
 
 def main() -> None:

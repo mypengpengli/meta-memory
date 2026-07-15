@@ -22,17 +22,20 @@ def unfinished_warnings(config: AppConfig, *, agent_id: str, workspace_id: str, 
     try:
         rows = conn.execute(
             """
-            SELECT turn_uid,started_at FROM turns
+            SELECT turn_uid,started_at,last_active_at FROM turns
             WHERE profile_id=? AND origin_agent_id=? AND workspace_id=? AND status='started'
-              AND turn_uid!=? AND julianday(started_at)<=julianday('now', ?)
-            ORDER BY started_at LIMIT 5
+              AND turn_uid!=? AND julianday(COALESCE(NULLIF(last_active_at,''),started_at))<=julianday('now', ?)
+            ORDER BY COALESCE(NULLIF(last_active_at,''),started_at) LIMIT 5
             """,
             (config.profile_id, agent_id, workspace_id, exclude_turn_uid, f"-{max(1, int(config.turns_unfinished_warning_minutes))} minutes"),
         ).fetchall()
     finally:
         conn.close()
     return [
-        {"code": "unfinished_previous_turn", "turn_id": str(row[0]), "started_at": str(row[1] or ""), "spool_available": _spool_available(config, str(row[0]))}
+        {
+            "code": "unfinished_previous_turn", "turn_id": str(row[0]), "started_at": str(row[1] or ""),
+            "last_active_at": str(row[2] or row[1] or ""), "spool_available": _spool_available(config, str(row[0])),
+        }
         for row in rows
     ]
 
@@ -49,8 +52,8 @@ def recover_expired_turns(config: AppConfig, *, limit: int = 50) -> dict[str, ob
             """
             SELECT turn_uid,origin_agent_id,assistant_event_id FROM turns
             WHERE profile_id=? AND status='started'
-              AND julianday(started_at)<=julianday('now', ?)
-            ORDER BY started_at LIMIT ?
+              AND julianday(COALESCE(NULLIF(last_active_at,''),started_at))<=julianday('now', ?)
+            ORDER BY COALESCE(NULLIF(last_active_at,''),started_at) LIMIT ?
             """,
             (config.profile_id, f"-{max(1, int(config.turns_abandon_after_minutes))} minutes", max(1, limit)),
         ).fetchall()

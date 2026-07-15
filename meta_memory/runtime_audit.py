@@ -14,7 +14,13 @@ _SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|bearer\s+|(?:a
 
 
 def repository_fingerprint(project: ProjectContext) -> str:
-    remote = _git_remote_identity(project.root)
+    # Project resolution has already paid for the Git lookup.  Keep the
+    # fallback for third-party callers that still construct ProjectContext
+    # directly using its original three positional fields.
+    cached = str(getattr(project, "repository_fingerprint", "") or "")
+    if cached:
+        return cached
+    remote = str(getattr(project, "remote_identity", "") or "") or _git_remote_identity(project.root)
     material = remote or str(Path(project.root).expanduser().resolve())
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 

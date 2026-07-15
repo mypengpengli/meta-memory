@@ -76,6 +76,7 @@ def _context_args(
         heartbeat_max_events=20,
         top_k=config.top_k,
         candidate_pool=max(config.top_k * 4, 24),
+        candidate_limit=getattr(config, "retrieval_candidate_limit", 96),
         expand_hops=1,
         include_candidates=False,
         no_basics=False,
@@ -98,8 +99,8 @@ def _update_context_status(root: Path, turn_uid: str, *, status: str, error: str
     conn = open_db(root)
     try:
         conn.execute(
-            "UPDATE turns SET context_status=?, last_error=?, updated_at=? WHERE turn_uid=?",
-            (status, error or None, utc_now(), turn_uid),
+            "UPDATE turns SET context_status=?, last_error=?, last_active_at=?, updated_at=? WHERE turn_uid=?",
+            (status, error or None, utc_now(), utc_now(), turn_uid),
         )
         conn.commit()
     finally:
@@ -186,8 +187,8 @@ def begin_turn(
                 INSERT INTO turns(
                     turn_uid,profile_id,workspace_id,subject_id,origin_agent_id,
                     external_session_id,internal_session_id,request_hash,status,
-                    context_status,client_type,client_id,started_at,updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'started', 'pending', 'agent', ?, ?, ?)
+                    context_status,client_type,client_id,started_at,last_active_at,updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'started', 'pending', 'agent', ?, ?, ?, ?)
                 """,
                 (
                     turn_uid,
@@ -199,6 +200,7 @@ def begin_turn(
                     internal_session_id,
                     request_hash,
                     stable_agent,
+                    utc_now(),
                     utc_now(),
                     utc_now(),
                 ),
@@ -225,9 +227,14 @@ def begin_turn(
             )
             user_event_id = int(event["raw_event_id"])
             conn.execute(
-                "UPDATE turns SET user_event_id=?,updated_at=? WHERE turn_uid=?",
-                (user_event_id, utc_now(), turn_uid),
+                "UPDATE turns SET user_event_id=?,last_active_at=?,updated_at=? WHERE turn_uid=?",
+                (user_event_id, utc_now(), utc_now(), turn_uid),
             )
+        if existing and str(existing[10] or "") == "started":
+            # Retrying a durable begin call is an activity renewal, not a
+            # duplicate user message.  This keeps a legitimate long turn from
+            # being aged out while the host resumes work.
+            conn.execute("UPDATE turns SET last_active_at=?,updated_at=? WHERE turn_uid=?", (utc_now(), utc_now(), turn_uid))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -276,6 +283,8 @@ def begin_turn(
             "hot_context": "",
             "context": "",
             "query_route": {},
+            "cross_agent_continuity": {"status": "unavailable", "sessions": []},
+            "same_agent_session_evidence": None,
             "warnings": ["Memory retrieval failed; continue without recalled memory.", *runtime_warnings, *recovery_warnings],
             "idempotent": not created,
             "user_event_id": user_event_id,
@@ -304,6 +313,8 @@ def begin_turn(
         "context": prepared["context_markdown"],
         "query_route": prepared["query_route"],
         "hot_memory_snapshot_hash": prepared["hot_memory_snapshot_hash"],
+        "cross_agent_continuity": prepared.get("cross_agent_continuity", {"status": "ok", "sessions": []}),
+        "same_agent_session_evidence": prepared.get("same_agent_session_evidence"),
         "warnings": warnings,
         "idempotent": not created,
         "user_event_id": user_event_id,
@@ -311,7 +322,14 @@ def begin_turn(
     }
 
 
-def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agent_id: str = "") -> dict[str, Any]:
+def complete_turn(
+    config: AppConfig,
+    *,
+    turn_uid: str,
+    assistant_text: str,
+    agent_id: str = "",
+    allow_late: bool = False,
+) -> dict[str, Any]:
     """Atomically save the assistant response and enqueue downstream work."""
     if not turn_uid.strip():
         raise ValueError("A turn id is required.")
@@ -340,9 +358,10 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             raise ValueError("Turn not found.")
         if agent_id and str(row[4] or "") != _agent(agent_id):
             raise ValueError("Turn belongs to a different Agent.")
-        if str(row[9]) == "abandoned":
-            raise ValueError("Cannot complete an abandoned turn.")
-        if str(row[9]) == "completed":
+        previous_status = str(row[9] or "")
+        if previous_status == "abandoned" and not allow_late:
+            raise ValueError("Cannot complete an abandoned turn; reopen it or use late completion.")
+        if previous_status in {"completed", "completed_late"}:
             if str(row[10] or "") != response_hash:
                 raise ValueError("Turn is already completed with a different assistant response.")
             conn.commit()
@@ -362,6 +381,7 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
                 "review_job_id": str(row[8] or ""),
                 "queued": bool(row[8]),
                 "idempotent": True,
+                "late_completion": previous_status == "completed_late",
             }
         if not row[6]:
             raise ValueError("Turn has no persisted user event and cannot be completed.")
@@ -400,14 +420,20 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             origin_agent_id=str(row[4]),
             conn=conn,
         )
+        late_completion = previous_status == "abandoned"
         conn.execute(
             """
             UPDATE turns
-            SET assistant_event_id=?,review_job_uid=?,response_hash=?,status='completed',
-                completed_at=?,updated_at=?,last_error=NULL
+            SET assistant_event_id=?,review_job_uid=?,response_hash=?,status=?,completion_kind=?,
+                completed_at=?,last_active_at=?,updated_at=?,last_error=NULL
             WHERE turn_uid=?
             """,
-            (assistant_event_id, str(review["job_id"]), response_hash, utc_now(), utc_now(), turn_uid),
+            (
+                assistant_event_id, str(review["job_id"]), response_hash,
+                "completed_late" if late_completion else "completed",
+                "late" if late_completion else "normal",
+                utc_now(), utc_now(), utc_now(), turn_uid,
+            ),
         )
         conn.execute(
             """
@@ -434,12 +460,161 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             "review_job_id": str(review["job_id"]),
             "queued": True,
             "idempotent": False,
+            "late_completion": late_completion,
         }
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _turn_summary(row) -> dict[str, object]:
+    return {
+        "turn_id": str(row[0]), "profile_id": str(row[1]), "workspace_id": str(row[2]),
+        "subject_id": str(row[3]), "agent_id": str(row[4]), "session_id": str(row[5]),
+        "status": str(row[6]), "context_status": str(row[7]), "started_at": str(row[8] or ""),
+        "last_active_at": str(row[9] or ""), "completed_at": str(row[10] or ""),
+        "reopened_at": str(row[11] or ""), "reopen_count": int(row[12] or 0),
+        "completion_kind": str(row[13] or "normal"), "last_error": str(row[14] or ""),
+    }
+
+
+def get_turn(config: AppConfig, *, turn_uid: str, agent_id: str = "") -> dict[str, Any]:
+    """Return lifecycle metadata without exposing user/assistant bodies."""
+
+    if not turn_uid.strip():
+        raise ValueError("A turn id is required.")
+    bootstrap()
+    from _common import open_db
+
+    conn = open_db(Path(config.store))
+    try:
+        row = conn.execute(
+            """
+            SELECT turn_uid,profile_id,workspace_id,subject_id,origin_agent_id,external_session_id,status,context_status,
+                   started_at,last_active_at,completed_at,reopened_at,reopen_count,completion_kind,last_error
+            FROM turns WHERE turn_uid=? AND profile_id=?
+            """,
+            (turn_uid, config.profile_id),
+        ).fetchone()
+        if not row:
+            raise ValueError("Turn not found.")
+        if agent_id and str(row[4] or "") != _agent(agent_id):
+            raise ValueError("Turn belongs to a different Agent.")
+        return {"status": "ok", "turn": _turn_summary(row)}
+    finally:
+        conn.close()
+
+
+def list_turns(
+    config: AppConfig,
+    *,
+    agent_id: str = "",
+    workspace_id: str = "",
+    statuses: tuple[str, ...] | list[str] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """List bounded lifecycle metadata for a CLI recovery/status surface."""
+
+    bootstrap()
+    from _common import open_db
+
+    clauses = ["profile_id=?"]
+    params: list[object] = [config.profile_id]
+    if agent_id:
+        clauses.append("origin_agent_id=?")
+        params.append(_agent(agent_id))
+    if workspace_id:
+        clauses.append("workspace_id=?")
+        params.append(workspace_id)
+    normalized = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+    if normalized:
+        clauses.append("status IN ({})".format(",".join("?" for _ in normalized)))
+        params.extend(normalized)
+    conn = open_db(Path(config.store))
+    try:
+        rows = conn.execute(
+            """
+            SELECT turn_uid,profile_id,workspace_id,subject_id,origin_agent_id,external_session_id,status,context_status,
+                   started_at,last_active_at,completed_at,reopened_at,reopen_count,completion_kind,last_error
+            FROM turns WHERE """ + " AND ".join(clauses) + " ORDER BY COALESCE(last_active_at,started_at) DESC LIMIT ?",
+            (*params, max(1, int(limit))),
+        ).fetchall()
+        return {"status": "ok", "turns": [_turn_summary(row) for row in rows]}
+    finally:
+        conn.close()
+
+
+def touch_turn(config: AppConfig, *, turn_uid: str, agent_id: str = "", note: str = "") -> dict[str, Any]:
+    """Renew a normal long-running turn without adding another raw event."""
+
+    if not turn_uid.strip():
+        raise ValueError("A turn id is required.")
+    bootstrap()
+    from _common import open_db, utc_now
+
+    conn = open_db(Path(config.store))
+    try:
+        row = conn.execute("SELECT origin_agent_id,status FROM turns WHERE turn_uid=? AND profile_id=?", (turn_uid, config.profile_id)).fetchone()
+        if not row:
+            raise ValueError("Turn not found.")
+        if agent_id and str(row[0] or "") != _agent(agent_id):
+            raise ValueError("Turn belongs to a different Agent.")
+        status = str(row[1] or "")
+        if status == "abandoned":
+            raise ValueError("Turn is abandoned; reopen it before touching.")
+        if status in {"completed", "completed_late"}:
+            raise ValueError("Cannot touch a completed turn.")
+        now = utc_now()
+        conn.execute(
+            "UPDATE turns SET last_active_at=?,updated_at=?,last_error=CASE WHEN ?='' THEN last_error ELSE ? END WHERE turn_uid=?",
+            (now, now, note.strip(), note.strip()[:1000], turn_uid),
+        )
+        conn.commit()
+        return {"status": "ok", "turn_id": turn_uid, "touched_at": now, "renewed": True}
+    finally:
+        conn.close()
+
+
+def reopen_turn(config: AppConfig, *, turn_uid: str, agent_id: str = "", reason: str = "") -> dict[str, Any]:
+    """Reopen an abandoned turn so the usual completion path can finish it."""
+
+    if not turn_uid.strip():
+        raise ValueError("A turn id is required.")
+    bootstrap()
+    from _common import open_db, utc_now
+
+    conn = open_db(Path(config.store))
+    try:
+        row = conn.execute("SELECT origin_agent_id,status FROM turns WHERE turn_uid=? AND profile_id=?", (turn_uid, config.profile_id)).fetchone()
+        if not row:
+            raise ValueError("Turn not found.")
+        if agent_id and str(row[0] or "") != _agent(agent_id):
+            raise ValueError("Turn belongs to a different Agent.")
+        status = str(row[1] or "")
+        if status == "started":
+            return {"status": "ok", "turn_id": turn_uid, "reopened": False, "idempotent": True}
+        if status != "abandoned":
+            raise ValueError("Only an abandoned turn can be reopened.")
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE turns SET status='started',last_error=?,last_active_at=?,reopened_at=?,
+                reopen_count=reopen_count+1,updated_at=? WHERE turn_uid=?
+            """,
+            (reason.strip()[:1000] or None, now, now, now, turn_uid),
+        )
+        conn.commit()
+        return {"status": "ok", "turn_id": turn_uid, "reopened": True, "reopened_at": now}
+    finally:
+        conn.close()
+
+
+def complete_late_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agent_id: str = "") -> dict[str, Any]:
+    """Complete an abandoned turn while preserving an explicit late marker."""
+
+    return complete_turn(config, turn_uid=turn_uid, assistant_text=assistant_text, agent_id=agent_id, allow_late=True)
 
 
 def abandon_turn(config: AppConfig, *, turn_uid: str, reason: str = "") -> dict[str, Any]:

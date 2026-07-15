@@ -27,6 +27,7 @@ def _retrieval_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         store=str(store_root(args.store)), query=None, query_file=None,
         top_k=args.top_k, candidate_pool=args.candidate_pool,
+        candidate_limit=getattr(args, "candidate_limit", None),
         expand_hops=args.expand_hops, session_id=args.session_id,
         workspace_id=args.workspace_id, profile_id=args.profile_id, agent_id=args.agent_id, active_subject_id=[], valid_at=None, no_chunks=bool(getattr(args, "no_chunks", False)),
         include_embeddings=bool(getattr(args, "include_embeddings", False)), embedding_model="external", rrf_k=60,
@@ -50,18 +51,57 @@ def _raw_search_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def _auxiliary_context(*, sessions: dict[str, object] | None, procedures: list[dict[str, object]]) -> str:
+def _continuity_line(item: dict[str, object]) -> str:
+    """Render only a bounded completed-card state, never a transcript."""
+
+    agent = str(item.get("origin_agent_id") or "another-agent")
+    session = str(item.get("external_session_id") or item.get("session_id") or "session")
+    summary = " ".join(str(item.get("summary") or "").split())[:900]
+    state = item.get("rolling_state") if isinstance(item.get("rolling_state"), dict) else {}
+    fragments: list[str] = []
+    goal = " ".join(str(state.get("goal") or "").split())[:260]
+    if goal:
+        fragments.append(f"goal: {goal}")
+    for key, label in (("completed", "completed"), ("decisions", "decisions"), ("blockers", "blockers"), ("next_steps", "next")):
+        values = state.get(key) if isinstance(state, dict) else []
+        if isinstance(values, list) and values:
+            text = " ".join(str(values[-1]).split())[:260]
+            if text:
+                fragments.append(f"{label}: {text}")
+    tail = f" ({'; '.join(fragments)})" if fragments else ""
+    return f"- [Agent: {agent}; Session: {session}] {summary}{tail}".rstrip()
+
+
+def _auxiliary_context(
+    *,
+    sessions: dict[str, object] | None,
+    procedures: list[dict[str, object]],
+    continuity_summaries: dict[str, object] | None = None,
+) -> str:
     lines: list[str] = []
+    continuity_rows = [
+        item for item in list((continuity_summaries or {}).get("sessions", []))
+        if isinstance(item, dict) and str(item.get("origin_agent_id") or "")
+    ]
+    if continuity_rows:
+        # Keep the provenance obvious: these are shared completed summaries,
+        # not Claims and not raw messages from the current Agent.
+        lines.extend(["## Workspace Continuity (completed summaries from other Agents)"])
+        lines.extend(_continuity_line(item) for item in continuity_rows[:3])
     session_rows = [
         item for item in list((sessions or {}).get("sessions", []))
         if str(item.get("source", "")).casefold() not in {"resource", "tool", "subagent", "agent-observation"}
     ]
     if session_rows:
-        lines.extend(["## Relevant Past Sessions"])
+        if lines:
+            lines.append("")
+        lines.extend(["## Same-Agent Session Evidence"])
         for item in session_rows[:3]:
             lines.append(f"- {item.get('title') or item.get('external_session_id') or 'session'}: {item.get('match_snippet', '')}")
     if procedures:
-        lines.extend(["", "## Reusable Procedures"])
+        if lines:
+            lines.append("")
+        lines.extend(["## Reusable Procedures"])
         for item in procedures[:4]:
             lines.append(f"- {item.get('task_class', 'procedure')}: {item.get('instruction_text', '')}")
     return "\n".join(lines).strip()
@@ -436,7 +476,7 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     from session_archive import ensure_session
     from retrieve_memories import retrieve
     from search_raw_events import search_events
-    from session_search import discovery
+    from session_search import discover_continuity_summaries, discovery
     from procedural_learning import retrieve_procedures
     route = route_query(query)
     depth = str(getattr(args, "search_depth", "auto") or "auto").casefold()
@@ -466,6 +506,16 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         workspace_id=args.workspace_id, profile_id=args.profile_id,
         agent_id=args.agent_id, exclude_session_id=args.session_id,
     ) if route.get("needs_session_search") else None
+    continuity_summaries = discover_continuity_summaries(
+        root,
+        subject_id=args.subject_id,
+        query=query,
+        current_agent_id=args.agent_id,
+        current_session_id=args.session_id,
+        limit=3,
+        workspace_id=args.workspace_id,
+        profile_id=args.profile_id,
+    )
     procedures = retrieve_procedures(root, subject_id=args.subject_id, query=query, profile_id=args.profile_id, workspace_id=args.workspace_id, agent_id=args.agent_id) if route.get("needs_procedure") else []
 
     recorded = None
@@ -490,7 +540,11 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         )
 
     context = assemble_context(retrieved, raw_evidence, token_budget=args.context_token_budget)
-    auxiliary = _auxiliary_context(sessions=session_evidence, procedures=procedures)
+    auxiliary = _auxiliary_context(
+        sessions=session_evidence,
+        procedures=procedures,
+        continuity_summaries=continuity_summaries,
+    )
     context = _append_auxiliary_within_budget(context, auxiliary, args.context_token_budget)
     if args.context_out_file:
         Path(args.context_out_file).write_text(context, encoding="utf-8")
@@ -509,7 +563,12 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
         "heartbeat": {"status": "deferred", "reason": "review is scheduled after the assistant reply"},
         "retrieved": retrieved,
         "raw_evidence": raw_evidence,
+        # Backwards-compatible same-Agent raw archive evidence remains under
+        # ``session_evidence``.  Cross-Agent continuation is deliberately a
+        # separate, completed-card-only field.
         "session_evidence": session_evidence,
+        "same_agent_session_evidence": session_evidence,
+        "cross_agent_continuity": continuity_summaries,
         "procedures": procedures,
         "context_markdown": context,
     }

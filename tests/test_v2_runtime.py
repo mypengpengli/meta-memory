@@ -33,7 +33,7 @@ class MetaMemoryV2Tests(unittest.TestCase):
         conn = open_db(self.root)
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
         conn.close()
-        self.assertEqual(versions, [f"{number:03d}" for number in range(1, 22)])
+        self.assertEqual(versions, [f"{number:03d}" for number in range(1, 24)])
         conn = open_db(self.root)
         try:
             tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -78,7 +78,7 @@ class MetaMemoryV2Tests(unittest.TestCase):
         versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
         columns = [row[1] for row in conn.execute("PRAGMA table_info(raw_events)")]
         conn.close()
-        self.assertEqual(versions, [f"{number:03d}" for number in range(1, 22)])
+        self.assertEqual(versions, [f"{number:03d}" for number in range(1, 24)])
         self.assertIn("content", columns)
         self.assertIn("session_card_id", columns)
 

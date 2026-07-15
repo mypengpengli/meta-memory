@@ -52,16 +52,85 @@ def resolve_claim_entities(root, claim_id: str, entities: list[dict[str, object]
     return linked
 
 
-def enrich_retrieval_scores(conn, items: list[dict[str, object]], query_terms: list[str], *, workspace_id: str = "default") -> None:
-    aliases = [normalize_alias(term) for term in query_terms if normalize_alias(term)]
+def retrieval_seed_claim_ids(
+    conn,
+    query_terms: list[str],
+    *,
+    workspace_id: str = "default",
+    limit: int = 64,
+) -> set[str]:
+    """Return a capped set of claims matched by entity aliases.
+
+    Retrieval calls this before loading document projections so entity matches
+    participate in recall without turning the graph into an unbounded scan.
+    """
+
+    aliases = list(dict.fromkeys(normalize_alias(term) for term in query_terms if normalize_alias(term)))
     if not aliases:
-        return
-    placeholders = ", ".join("?" for _ in aliases)
-    rows = conn.execute(f"SELECT DISTINCT ce.claim_uid FROM entity_aliases ea JOIN claim_entities ce ON ce.entity_uid=ea.entity_uid WHERE ea.workspace_id=? AND ea.normalized_alias IN ({placeholders})", (workspace_id, *aliases)).fetchall()
-    matched = {str(row[0]) for row in rows}
+        return set()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT ce.claim_uid
+            FROM entity_aliases AS ea
+            JOIN claim_entities AS ce ON ce.entity_uid=ea.entity_uid
+            WHERE ea.workspace_id=?
+              AND ea.normalized_alias IN ({', '.join('?' for _ in aliases)})
+            LIMIT ?
+            """,
+            (workspace_id, *aliases, max(1, int(limit))),
+        ).fetchall()
+    except Exception:
+        return set()
+    return {str(row[0]) for row in rows if str(row[0] or "")}
+
+
+def graph_candidate_claim_ids(
+    conn,
+    seed_claim_ids: set[str],
+    *,
+    hops: int = 1,
+    limit: int = 64,
+) -> set[str]:
+    """Return bounded graph neighbours for already relevant claims only."""
+
+    frontier = {value for value in seed_claim_ids if value}
+    discovered: set[str] = set()
+    remaining = max(0, int(limit))
+    for _ in range(max(0, min(int(hops), 2))):
+        if not frontier or remaining <= 0:
+            break
+        values = sorted(frontier)
+        placeholders = ", ".join("?" for _ in values)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT from_claim_id,to_claim_id
+                FROM memory_edges
+                WHERE from_claim_id IN ({placeholders}) OR to_claim_id IN ({placeholders})
+                ORDER BY id DESC LIMIT ?
+                """,
+                (*values, *values, remaining),
+            ).fetchall()
+        except Exception:
+            break
+        next_frontier: set[str] = set()
+        for left, right in rows:
+            for value in (str(left or ""), str(right or "")):
+                if value and value not in seed_claim_ids and value not in discovered:
+                    discovered.add(value)
+                    next_frontier.add(value)
+                    if len(discovered) >= limit:
+                        return discovered
+        frontier = next_frontier
+        remaining = max(0, limit - len(discovered))
+    return discovered
+
+
+def enrich_retrieval_scores(conn, items: list[dict[str, object]], query_terms: list[str], *, workspace_id: str = "default") -> None:
+    matched = retrieval_seed_claim_ids(conn, query_terms, workspace_id=workspace_id, limit=max(32, len(items) * 2))
     active = {str(item.get("memory_id") or "") for item in items if float(item.get("field_score", 0.0) or 0.0) > 0}
-    edges = conn.execute("SELECT from_claim_id, to_claim_id FROM memory_edges").fetchall()
-    adjacent = {str(right) for left, right in edges if str(left) in active} | {str(left) for left, right in edges if str(right) in active}
+    adjacent = graph_candidate_claim_ids(conn, active, hops=1, limit=max(32, len(items) * 2))
     for item in items:
         uid = str(item.get("memory_id") or "")
         if uid in matched:

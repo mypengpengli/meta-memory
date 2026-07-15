@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
-from .scheduler_launcher import scheduler_launcher_path, scheduler_log_path, write_scheduler_launcher
+from .scheduler_launcher import (
+    record_schedule_plan,
+    run_scheduled_action,
+    scheduler_launcher_path,
+    scheduler_log_path,
+    scheduler_runtime_status,
+    write_scheduler_launcher,
+)
 
 
 _BEGIN = "# meta-memory:begin"
@@ -43,11 +50,56 @@ def _windows_task_command(launcher: Path, action: str) -> str:
     return f'cmd.exe /d /c ""{launcher}" {action}"'
 
 
+def _heartbeat_interval(config: AppConfig) -> int:
+    return max(1, int(getattr(config, "dream_heartbeat_interval_minutes", config.maintenance_interval_minutes)))
+
+
+def _linux_heartbeat_schedule(config: AppConfig) -> tuple[str, int, bool]:
+    """Return cron expression, platform tick, and whether the launcher gates it.
+
+    Cron's ``*/N`` is not valid for N>59 and is not a true interval across an
+    hour for many values.  Exact calendar-friendly intervals get native cron;
+    all other long cadences use a small tick plus the durable due gate in the
+    launcher, so the configured interval remains authoritative.
+    """
+
+    interval = _heartbeat_interval(config)
+    if interval <= 59:
+        return f"*/{interval} * * * *", interval, True
+    if interval == 60:
+        return "0 * * * *", interval, True
+    if interval < 1440 and interval % 60 == 0 and 24 % (interval // 60) == 0:
+        return f"0 */{interval // 60} * * *", interval, True
+    if interval == 1440:
+        return "0 0 * * *", interval, True
+    if interval == 10080:
+        return "0 0 * * 0", interval, True
+    # A 15-minute tick is intentionally bounded even for a one-week desired
+    # cadence; scheduler_runtime_state makes it a no-op until it is due.
+    tick = min(15, interval)
+    return f"*/{tick} * * * *", tick, True
+
+
+def _windows_heartbeat_schedule(config: AppConfig) -> tuple[list[str], int]:
+    interval = _heartbeat_interval(config)
+    if interval <= 59:
+        return ["MINUTE", "/MO", str(interval)], interval
+    if interval == 60:
+        return ["HOURLY", "/MO", "1"], interval
+    if interval < 1440 and interval % 60 == 0 and interval // 60 <= 23:
+        return ["HOURLY", "/MO", str(interval // 60)], interval
+    if interval % 1440 == 0 and interval // 1440 <= 365:
+        return ["DAILY", "/MO", str(interval // 1440)], interval
+    tick = min(15, interval)
+    return ["MINUTE", "/MO", str(tick)], tick
+
+
 def _linux_block(config: AppConfig, launcher: Path) -> str:
     rows = [_BEGIN]
     command = shlex.quote(str(launcher))
     if bool(getattr(config, "dream_heartbeat_enabled", config.maintenance_enabled)):
-        rows.append(f"*/{max(1, int(getattr(config, 'dream_heartbeat_interval_minutes', config.maintenance_interval_minutes)))} * * * * {command} maintain")
+        expression, _tick, _guarded = _linux_heartbeat_schedule(config)
+        rows.append(f"{expression} {command} maintain")
     if bool(getattr(config, "dream_deep_enabled", config.dream_enabled)):
         hour, minute = _dream_time(config)
         rows.append(f"{minute} {hour} * * * {command} dream")
@@ -95,10 +147,11 @@ def schedule_install(config: AppConfig) -> dict[str, object]:
     launcher = write_scheduler_launcher(config)
     if os.name == "nt":
         results = []
+        _windows_args, heartbeat_tick = _windows_heartbeat_schedule(config)
         for action in actions:
             args = ["schtasks", "/Create", "/F", "/TN", _task_names(config)[action], "/SC"]
             if action == "maintain":
-                args.extend(["MINUTE", "/MO", str(max(1, int(getattr(config, "dream_heartbeat_interval_minutes", config.maintenance_interval_minutes))))])
+                args.extend(_windows_args)
             else:
                 hour, minute = _dream_time(config)
                 args.extend(["DAILY", "/ST", f"{hour:02d}:{minute:02d}"])
@@ -108,6 +161,8 @@ def schedule_install(config: AppConfig) -> dict[str, object]:
         failed = [item for item in results if item["returncode"]]
         if failed:
             raise RuntimeError(f"Windows Task Scheduler rejected Meta Memory tasks: {failed}")
+        for action in actions:
+            record_schedule_plan(config, action=action, installed_interval_minutes=(heartbeat_tick if action == "maintain" else None))
         return {"status": "ok", "platform": "windows", "launcher": str(launcher), "tasks": results}
     if sys.platform == "darwin":
         directory = Path.home() / "Library" / "LaunchAgents"
@@ -125,6 +180,7 @@ def schedule_install(config: AppConfig) -> dict[str, object]:
             if completed.returncode:
                 raise RuntimeError(f"launchctl bootstrap failed for {label}: {completed.stderr.strip()}")
             subprocess.run(["launchctl", "enable", f"gui/{uid}/{label}"], capture_output=True, text=True, check=False)
+            record_schedule_plan(config, action=action, installed_interval_minutes=(_heartbeat_interval(config) if action == "maintain" else None))
             files.append(str(path))
         return {"status": "ok", "platform": "macos", "launcher": str(launcher), "files": files}
     current_run = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
@@ -134,28 +190,35 @@ def schedule_install(config: AppConfig) -> dict[str, object]:
     completed = subprocess.run(["crontab", "-"], input=updated, capture_output=True, text=True, check=False)
     if completed.returncode:
         raise RuntimeError(f"Could not install crontab: {completed.stderr.strip()}")
+    _expression, tick, _guarded = _linux_heartbeat_schedule(config)
+    for action in actions:
+        record_schedule_plan(config, action=action, installed_interval_minutes=(tick if action == "maintain" else None))
     return {"status": "ok", "platform": "linux", "launcher": str(launcher), "tasks": actions}
 
 
 def schedule_status(config: AppConfig) -> dict[str, object]:
     launcher = scheduler_launcher_path(config)
     expected = _enabled_actions(config)
+    runtime = scheduler_runtime_status(config)
+    log = scheduler_log_path(config)
     if os.name == "nt":
         rows = []
         for action in ("maintain", "dream"):
             completed = subprocess.run(["schtasks", "/Query", "/TN", _task_names(config)[action]], capture_output=True, text=True, check=False)
             rows.append({"action": action, "installed": completed.returncode == 0, "detail": (completed.stdout or completed.stderr).strip()})
-        return {"status": "ok", "platform": "windows", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "tasks": rows}
+        _args, tick = _windows_heartbeat_schedule(config)
+        return {"status": "ok", "platform": "windows", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "tasks": rows, "expected": expected, "runtime": runtime, "log_path": str(log), "log_exists": log.is_file(), "heartbeat_schedule": {"task_arguments": _args, "installed_tick_minutes": tick, "due_gate": True, "desired_interval_minutes": _heartbeat_interval(config)}}
     if sys.platform == "darwin":
         uid = str(os.getuid()); rows = []
         for action in ("maintain", "dream"):
             label = f"com.meta-memory.{action}.{_key(config)}"
             completed = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"], capture_output=True, text=True, check=False)
             rows.append({"action": action, "installed": completed.returncode == 0})
-        return {"status": "ok", "platform": "macos", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "tasks": rows}
+        return {"status": "ok", "platform": "macos", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "tasks": rows, "expected": expected, "runtime": runtime, "log_path": str(log), "log_exists": log.is_file(), "heartbeat_schedule": {"start_interval_seconds": _heartbeat_interval(config) * 60, "installed_tick_minutes": _heartbeat_interval(config), "due_gate": True, "desired_interval_minutes": _heartbeat_interval(config)}}
     completed = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
     text = completed.stdout if completed.returncode == 0 else ""
-    return {"status": "ok", "platform": "linux", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "managed_block": _BEGIN in text and _END in text, "expected": expected}
+    expression, tick, guarded = _linux_heartbeat_schedule(config)
+    return {"status": "ok", "platform": "linux", "launcher": str(launcher), "launcher_exists": launcher.is_file(), "managed_block": _BEGIN in text and _END in text, "expected": expected, "runtime": runtime, "log_path": str(log), "log_exists": log.is_file(), "heartbeat_schedule": {"cron": expression, "installed_tick_minutes": tick, "due_gate": guarded, "desired_interval_minutes": _heartbeat_interval(config)}}
 
 
 def schedule_remove(config: AppConfig) -> dict[str, object]:
@@ -186,9 +249,9 @@ def schedule_run(config: AppConfig, action: str) -> dict[str, Any]:
     if action not in {"maintain", "dream"}:
         raise ValueError("Schedule action must be maintain or dream.")
     launcher = write_scheduler_launcher(config)
-    command = [str(launcher), action] if os.name != "nt" else [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", f'"{launcher}" {action}']
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    return {"status": "ok" if completed.returncode == 0 else "error", "action": action, "returncode": completed.returncode, "stdout": completed.stdout.strip(), "stderr": completed.stderr.strip(), "launcher": str(launcher)}
+    result = run_scheduled_action(config, action=action, force=True)
+    result["launcher"] = str(launcher)
+    return result
 
 
 # Compatibility name retained for callers from the original public CLI.

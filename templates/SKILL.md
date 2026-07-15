@@ -1,10 +1,18 @@
 ---
 name: meta-memory
-description: Use on every user turn. Call `meta-memory before` before answering and `meta-memory after` after answering.
+description: Repository compatibility mirror; use the installed canonical Meta Memory Skill contract for every user turn.
 ---
 
-# Meta Memory
+# Meta Memory compatibility mirror
 
-Use the shared local `meta-memory` CLI for every user turn. Keep the stable
-session id unchanged within the conversation. Do not expose internal database
-scope, token, or agent-private options to the user.
+The only installation source of truth is
+`meta_memory/templates/skill.md.template`. Regenerate a host integration with:
+
+```bash
+meta-memory agent sync --all
+```
+
+The contract is: call `before` before drafting, retain its `turn_id`, call
+`after --turn <turn_id>` with the exact final answer before sending it, and use
+`overview`/`recovery` for operational state. See the root `SKILL.md` for the
+repository-readable version of the same workflow.

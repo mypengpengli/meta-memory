@@ -7,22 +7,23 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .backup import backup_app, restore_app
 from .config import AppConfig, load_config, save_config, slug
-from .dream_heartbeat import dream_status, run_deep, run_heartbeat
-from .importer import import_file
-from .legacy import bootstrap
-from .maintenance import maintain, status
-from .project_detection import bind_project, resolve_project
-from .runtime import after, before, correct, history, origin_agent_id, read_text, remember, search
-from .scheduler import install_schedule, schedule_install, schedule_remove, schedule_run, schedule_status
-from .skill_installer import install_agents
 
 
 AGENTS = ["claude-code", "codex", "openclaw", "custom", "all"]
 
 
-def _emit(value: Any) -> None:
+def _emit(value: Any, *, output_format: str = "json") -> None:
+    if output_format == "auto":
+        output_format = "text" if sys.stdout.isatty() else "json"
+    if output_format == "text":
+        from .ux_overview import human_text
+
+        try:
+            print(human_text(value))
+        except UnicodeEncodeError:
+            print(human_text(value).encode("ascii", "backslashreplace").decode("ascii"))
+        return
     text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
     try:
         print(text)
@@ -45,12 +46,22 @@ def _ask(prompt: str, default: str) -> str:
 
 
 def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
+    from .scheduler import install_schedule
+    from .skill_installer import install_agents
+
     interactive = not args.non_interactive and sys.stdin.isatty()
     name = args.name or (_ask("你的名称", config.user_name) if interactive else config.user_name)
     store = args.store or (_ask("记忆保存位置", str(config.store)) if interactive else str(config.store))
-    maintenance = args.maintenance or (_ask("安装每 5 分钟自动整理？(yes/no)", "yes" if config.maintenance_enabled else "no") if interactive else ("yes" if config.maintenance_enabled else "no"))
+    maintenance = args.maintenance or (_ask("安装每 10 分钟自动整理？(yes/no)", "yes" if config.maintenance_enabled else "no") if interactive else ("yes" if config.maintenance_enabled else "no"))
     dream_enabled = args.dream or (_ask("安装夜间 Dream？(yes/no)", "yes" if config.dream_enabled else "no") if interactive else ("yes" if config.dream_enabled else "no"))
     agents = args.agents or ([] if not interactive else [item.strip() for item in _ask("接入 Agent（codex,claude-code,openclaw，逗号分隔）", "").split(",") if item.strip()])
+    # ``nargs='*'`` intentionally makes an empty setup selection explicit;
+    # report it as an action item instead of claiming an Agent was installed.
+    if args.agents is not None:
+        agents = list(args.agents)
+    unknown = [item for item in agents if item not in AGENTS]
+    if unknown:
+        raise ValueError(f"Unsupported Agent selection: {', '.join(unknown)}")
     config.user_name = name
     config.user_id = slug(name, "user")
     config.store = Path(store).expanduser()
@@ -73,28 +84,47 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
         no_host_file=args.no_host_file,
     ) if agents else []
     scheduling = install_schedule(config) if (config.maintenance_enabled or config.dream_enabled) and not args.no_schedule else {"status": "skipped", "reason": "not selected"}
-    return {"status": "ok", "config": str(config.path), "store": initialized, "agents": installed, "schedule": scheduling, "doctor": doctor(config.store)}
+    no_agent = not installed
+    return {
+        "status": "needs_action" if no_agent else "ok", "config": str(config.path), "store": initialized,
+        "agents": installed, "schedule": scheduling, "doctor": doctor(config.store),
+        "next_action": "meta-memory install-agent codex" if no_agent else None,
+        "warning": "No Agent integration was installed." if no_agent else None,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="meta-memory", description="Shared local long-term memory for AI agents.")
     parser.add_argument("--config", help="Configuration path; defaults to ~/.meta-memory/config.toml")
     parser.add_argument("--agent-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--format", choices=["auto", "json", "text"], default="auto", help="Output format (default: text in a terminal, JSON when piped).")
+    parser.add_argument("--json", dest="output_format_json", action="store_true", help="Force machine-readable JSON output.")
+    from . import __version__
+    parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
 
     setup = commands.add_parser("setup", help="Initialize a store and optionally install tasks and Agent skills")
     setup.add_argument("--name"); setup.add_argument("--store"); setup.add_argument("--maintenance", choices=["yes", "no"]); setup.add_argument("--dream", choices=["yes", "no"])
-    setup.add_argument("--agents", nargs="+", choices=AGENTS); setup.add_argument("--skill-dir"); setup.add_argument("--agent-id"); setup.add_argument("--no-schedule", action="store_true"); setup.add_argument("--non-interactive", action="store_true")
+    setup.add_argument("--agents", nargs="*", choices=AGENTS); setup.add_argument("--skill-dir"); setup.add_argument("--agent-id"); setup.add_argument("--no-schedule", action="store_true"); setup.add_argument("--non-interactive", action="store_true")
     setup_host = setup.add_mutually_exclusive_group(); setup_host.add_argument("--host-file"); setup_host.add_argument("--no-host-file", action="store_true")
 
-    install = commands.add_parser("install-agent", help="Install the Meta Memory Skill for one Agent")
-    install.add_argument("agent", nargs="?", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir"); install.add_argument("--agent-id")
+    install = commands.add_parser("install-agent", help="Install the Meta Memory Skill for one or more Agents")
+    install.add_argument("agent", nargs="*", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir"); install.add_argument("--agent-id")
     install_host = install.add_mutually_exclusive_group(); install_host.add_argument("--host-file"); install_host.add_argument("--no-host-file", action="store_true")
 
     project = commands.add_parser("project", help="Bind the current directory to a project")
     project_commands = project.add_subparsers(dest="project_command", required=True)
     project_set = project_commands.add_parser("set", help="Bind this directory to a project name")
     project_set.add_argument("name"); project_set.add_argument("--cwd")
+    project_current_cmd = project_commands.add_parser("current", help="Show the current resolved project")
+    project_current_cmd.add_argument("--project", default="auto"); project_current_cmd.add_argument("--cwd")
+    project_commands.add_parser("list", help="List configured project bindings")
+    project_rename_cmd = project_commands.add_parser("rename", help="Rename a bound project and migrate its local scope")
+    project_rename_cmd.add_argument("old"); project_rename_cmd.add_argument("new")
+    project_unbind_cmd = project_commands.add_parser("unbind", help="Remove the current directory binding without deleting memory")
+    project_unbind_cmd.add_argument("--cwd"); project_unbind_cmd.add_argument("--all", action="store_true")
+    project_stats_cmd = project_commands.add_parser("stats", help="Show scoped project memory counts")
+    project_stats_cmd.add_argument("--project", default="auto"); project_stats_cmd.add_argument("--cwd")
 
     before_cmd = commands.add_parser("before", help="Load bounded relevant context before answering")
     before_cmd.add_argument("--project", default="auto"); before_cmd.add_argument("--session", default="auto"); before_cmd.add_argument("--turn", default=""); before_cmd.add_argument("--query"); before_cmd.add_argument("--query-file"); before_cmd.add_argument("--cwd")
@@ -109,9 +139,42 @@ def build_parser() -> argparse.ArgumentParser:
     correct_cmd.add_argument("--memory", required=True); correct_cmd.add_argument("--content"); correct_cmd.add_argument("--content-file")
 
     search_cmd = commands.add_parser("search", help="Search current user/project memory")
-    search_cmd.add_argument("query"); search_cmd.add_argument("--project", default="auto"); search_cmd.add_argument("--limit", type=int); search_cmd.add_argument("--cwd")
-    history_cmd = commands.add_parser("history", help="Search prior session messages")
-    history_cmd.add_argument("query"); history_cmd.add_argument("--project", default="auto"); history_cmd.add_argument("--cwd"); history_cmd.add_argument("--detail", action="store_true")
+    search_cmd.add_argument("query"); search_cmd.add_argument("--project", default="auto"); search_cmd.add_argument("--limit", type=int); search_cmd.add_argument("--cwd"); search_cmd.add_argument("--claims-only", action="store_true")
+    history_cmd = commands.add_parser("history", help="Search, browse, or show prior sessions")
+    history_cmd.add_argument("history_args", nargs="*"); history_cmd.add_argument("--project", default="auto"); history_cmd.add_argument("--cwd"); history_cmd.add_argument("--detail", action="store_true"); history_cmd.add_argument("--last", type=int, default=8); history_cmd.add_argument("--limit", type=int, default=20)
+
+    inbox_cmd = commands.add_parser("inbox", aliases=["review"], help="Review queued memory proposals and feedback")
+    inbox_commands = inbox_cmd.add_subparsers(dest="inbox_command", required=True)
+    inbox_list_cmd = inbox_commands.add_parser("list", help="List reviewable proposals")
+    inbox_list_cmd.add_argument("--project", default="auto"); inbox_list_cmd.add_argument("--cwd"); inbox_list_cmd.add_argument("--status", default="pending"); inbox_list_cmd.add_argument("--kind", choices=["memory", "skill", "all"], default="memory"); inbox_list_cmd.add_argument("--limit", type=int, default=50); inbox_list_cmd.add_argument("--all-projects", action="store_true")
+    inbox_show_cmd = inbox_commands.add_parser("show", help="Show one proposal and its planned change")
+    inbox_show_cmd.add_argument("proposal_id"); inbox_show_cmd.add_argument("--kind", choices=["memory", "skill"], default="memory")
+    inbox_approve_cmd = inbox_commands.add_parser("approve", help="Approve and apply a memory proposal")
+    inbox_approve_cmd.add_argument("proposal_id"); inbox_approve_cmd.add_argument("--kind", choices=["memory", "skill"], default="memory")
+    inbox_reject_cmd = inbox_commands.add_parser("reject", help="Reject a pending proposal")
+    inbox_reject_cmd.add_argument("proposal_id"); inbox_reject_cmd.add_argument("--kind", choices=["memory", "skill"], default="memory"); inbox_reject_cmd.add_argument("--note", default="")
+    inbox_feedback_cmd = inbox_commands.add_parser("feedback", help="Record usefulness or correction feedback for a Claim")
+    inbox_feedback_cmd.add_argument("--memory", required=True); inbox_feedback_cmd.add_argument("--type", required=True, choices=["used", "helpful", "user_confirmed", "unhelpful", "outdated", "incorrect", "irrelevant"]); inbox_feedback_cmd.add_argument("--note", default=""); inbox_feedback_cmd.add_argument("--retrieval-id", default="")
+
+    memory_cmd = commands.add_parser("memory", help="Inspect and manage long-term Claims")
+    memory_commands = memory_cmd.add_subparsers(dest="memory_command", required=True)
+    memory_list_cmd = memory_commands.add_parser("list", help="List Claims in the selected project")
+    memory_list_cmd.add_argument("--project", default="auto"); memory_list_cmd.add_argument("--cwd"); memory_list_cmd.add_argument("--limit", type=int, default=50); memory_list_cmd.add_argument("--status", default=""); memory_list_cmd.add_argument("--kind", default=""); memory_list_cmd.add_argument("--all-projects", action="store_true")
+    memory_recent_cmd = memory_commands.add_parser("recent", help="List recently updated active Claims")
+    memory_recent_cmd.add_argument("--project", default="auto"); memory_recent_cmd.add_argument("--cwd"); memory_recent_cmd.add_argument("--limit", type=int, default=20); memory_recent_cmd.add_argument("--all-projects", action="store_true")
+    memory_show_cmd = memory_commands.add_parser("show", help="Show a Claim, sources, versions, and feedback")
+    memory_show_cmd.add_argument("memory_id"); memory_show_cmd.add_argument("--project", default="auto"); memory_show_cmd.add_argument("--cwd"); memory_show_cmd.add_argument("--all-projects", action="store_true")
+    memory_search_cmd = memory_commands.add_parser("search", help="Search memory evidence")
+    memory_search_cmd.add_argument("query"); memory_search_cmd.add_argument("--project", default="auto"); memory_search_cmd.add_argument("--cwd"); memory_search_cmd.add_argument("--limit", type=int); memory_search_cmd.add_argument("--claims-only", action="store_true")
+    memory_correct_cmd = memory_commands.add_parser("correct", help="Correct a Claim while preserving its evidence")
+    memory_correct_cmd.add_argument("memory_id"); memory_correct_cmd.add_argument("--content"); memory_correct_cmd.add_argument("--content-file")
+    memory_feedback_cmd = memory_commands.add_parser("feedback", help="Record useful, outdated, or incorrect Claim feedback")
+    memory_feedback_cmd.add_argument("memory_id"); memory_feedback_cmd.add_argument("--type", required=True, choices=["used", "helpful", "user_confirmed", "unhelpful", "outdated", "incorrect", "irrelevant"]); memory_feedback_cmd.add_argument("--note", default=""); memory_feedback_cmd.add_argument("--retrieval-id", default="")
+    for action, help_text in [("archive", "Stop recalling a Claim but retain its history"), ("forget", "Remove a Claim from active and derived memory")]:
+        child = memory_commands.add_parser(action, help=help_text)
+        child.add_argument("memory_id"); child.add_argument("--project", default="auto"); child.add_argument("--cwd"); child.add_argument("--all-projects", action="store_true")
+    memory_export_cmd = memory_commands.add_parser("export", help="Export Claims as JSON or Markdown")
+    memory_export_cmd.add_argument("--project", default="auto"); memory_export_cmd.add_argument("--cwd"); memory_export_cmd.add_argument("--output"); memory_export_cmd.add_argument("--format", choices=["json", "markdown"], default="json"); memory_export_cmd.add_argument("--status", default=""); memory_export_cmd.add_argument("--all-projects", action="store_true")
 
     session_cmd = commands.add_parser("session", help="Inspect, rotate, or close the local automatic session")
     session_commands = session_cmd.add_subparsers(dest="session_command", required=True)
@@ -119,7 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
         child = session_commands.add_parser(name, help=help_text)
         child.add_argument("--project", default="auto"); child.add_argument("--session", default="auto"); child.add_argument("--cwd")
 
-    commands.add_parser("status", help="Show local store status")
+    overview_cmd = commands.add_parser("overview", help="Show one-screen readiness and next action")
+    overview_cmd.add_argument("--project", default="auto"); overview_cmd.add_argument("--cwd")
+    status_cmd = commands.add_parser("status", help="Show local store status plus an operational overview")
+    status_cmd.add_argument("--project", default="auto"); status_cmd.add_argument("--cwd")
     commands.add_parser("doctor", help="Run a non-mutating health check")
     agent_cmd = commands.add_parser("agent", help="Inspect or verify a local Agent integration")
     agent_commands = agent_cmd.add_subparsers(dest="agent_command", required=True)
@@ -127,10 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
     agent_status_cmd.add_argument("--all", action="store_true"); agent_status_cmd.add_argument("--project", default="auto"); agent_status_cmd.add_argument("--cwd"); agent_status_cmd.add_argument("--verbose", action="store_true")
     agent_verify_cmd = agent_commands.add_parser("verify", help="Verify one installed Agent launcher and shared runtime")
     agent_verify_cmd.add_argument("agent_id"); agent_verify_cmd.add_argument("--project", default="auto"); agent_verify_cmd.add_argument("--cwd")
+    agent_sync_cmd = agent_commands.add_parser("sync", help="Regenerate installed Agent integrations from the current contract")
+    agent_sync_cmd.add_argument("agents", nargs="*"); agent_sync_cmd.add_argument("--all", action="store_true"); agent_sync_cmd.add_argument("--no-verify", action="store_true")
+    agent_repair_cmd = agent_commands.add_parser("repair", help="Alias for agent sync")
+    agent_repair_cmd.add_argument("agents", nargs="*"); agent_repair_cmd.add_argument("--all", action="store_true"); agent_repair_cmd.add_argument("--no-verify", action="store_true")
+    agent_uninstall_cmd = agent_commands.add_parser("uninstall", help="Remove one managed Agent integration")
+    agent_uninstall_cmd.add_argument("agent_id")
+    agent_upgrade_cmd = agent_commands.add_parser("upgrade-status", help="Check Skill/launcher contract and template freshness")
+    agent_upgrade_cmd.add_argument("agent_id", nargs="?"); agent_upgrade_cmd.add_argument("--all", action="store_true")
     config_cmd = commands.add_parser("config", help="Read or update supported local runtime configuration")
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_get = config_commands.add_parser("get", help="Read one supported configuration key"); config_get.add_argument("key")
-    config_set = config_commands.add_parser("set", help="Set one supported configuration key"); config_set.add_argument("key"); config_set.add_argument("value")
+    config_commands.add_parser("list", help="List supported public configuration keys")
+    config_describe = config_commands.add_parser("describe", help="Describe one supported configuration key"); config_describe.add_argument("key")
+    config_set = config_commands.add_parser("set", help="Set one supported configuration key"); config_set.add_argument("key"); config_set.add_argument("value"); config_set.add_argument("--apply", action="store_true", help="Install/refresh the scheduler even when it was not installed before")
     maintenance = commands.add_parser("maintain", help="Run the single periodic maintenance cycle")
     maintenance.add_argument("--max-jobs", type=int, default=20)
 
@@ -145,47 +221,139 @@ def build_parser() -> argparse.ArgumentParser:
     dream.add_argument("--scan-days", type=int)
     dream_commands = dream.add_subparsers(dest="dream_command")
     dream_commands.add_parser("heartbeat", help="Run the lightweight incremental memory heartbeat now")
-    dream_commands.add_parser("deep", help="Run the deep daily synthesis now")
+    dream_deep_cmd = dream_commands.add_parser("deep", help="Run the deep daily synthesis now")
+    dream_deep_cmd.add_argument("--scan-days", dest="deep_scan_days", type=int); dream_deep_cmd.add_argument("--dry-run", action="store_true")
     dream_commands.add_parser("status", help="Show Dream heartbeat and deep-synthesis state")
+    dream_list_cmd = dream_commands.add_parser("list", help="List recent deep Dream runs")
+    dream_list_cmd.add_argument("--limit", type=int, default=30); dream_list_cmd.add_argument("--include-archived", action="store_true")
+    dream_show_cmd = dream_commands.add_parser("show", help="Show one Dream run or latest")
+    dream_show_cmd.add_argument("run_id", nargs="?", default="latest"); dream_show_cmd.add_argument("--no-content", action="store_true")
+    dream_archive_cmd = dream_commands.add_parser("archive", help="Archive generated reports for one Dream run")
+    dream_archive_cmd.add_argument("run_id")
+
+    turn_cmd = commands.add_parser("turn", help="Inspect and manage durable turn lifecycle state")
+    turn_commands = turn_cmd.add_subparsers(dest="turn_command", required=True)
+    turn_list_cmd = turn_commands.add_parser("list", help="List recent durable turns")
+    turn_list_cmd.add_argument("--unfinished", action="store_true"); turn_list_cmd.add_argument("--project", default="auto"); turn_list_cmd.add_argument("--cwd"); turn_list_cmd.add_argument("--all-agents", action="store_true"); turn_list_cmd.add_argument("--limit", type=int, default=20)
+    turn_show_cmd = turn_commands.add_parser("show", help="Show turn lifecycle metadata")
+    turn_show_cmd.add_argument("turn_id")
+    turn_touch_cmd = turn_commands.add_parser("touch", help="Renew a long-running turn")
+    turn_touch_cmd.add_argument("turn_id"); turn_touch_cmd.add_argument("--note", default="")
+    turn_reopen_cmd = turn_commands.add_parser("reopen", help="Reopen an abandoned turn")
+    turn_reopen_cmd.add_argument("turn_id"); turn_reopen_cmd.add_argument("--reason", default="")
+    turn_complete_cmd = turn_commands.add_parser("complete", help="Complete an abandoned turn with a late final response")
+    turn_complete_cmd.add_argument("turn_id"); turn_complete_cmd.add_argument("--assistant"); turn_complete_cmd.add_argument("--assistant-file")
+
+    recovery_cmd = commands.add_parser("recovery", help="Inspect or replay deferred turn completions")
+    recovery_commands = recovery_cmd.add_subparsers(dest="recovery_command", required=True)
+    recovery_status_cmd = recovery_commands.add_parser("status", help="Show spool and unfinished-turn recovery state")
+    recovery_status_cmd.add_argument("--project", default="auto"); recovery_status_cmd.add_argument("--cwd")
+    recovery_replay_cmd = recovery_commands.add_parser("replay", help="Replay deferred completions and recover expired turns")
+    recovery_replay_cmd.add_argument("--limit", type=int, default=100)
 
     backup = commands.add_parser("backup", help="Create a consistent ZIP backup")
     backup.add_argument("--output")
     restore = commands.add_parser("restore", help="Restore a portable backup and update the local configuration")
     restore.add_argument("archive"); restore.add_argument("--destination"); restore.add_argument("--force", action="store_true")
-    imported = commands.add_parser("import", help="Import a local file as source evidence")
-    imported.add_argument("file"); imported.add_argument("--project", default="auto"); imported.add_argument("--cwd")
+    imported = commands.add_parser("import", help="Import a local file or directory as source evidence")
+    imported.add_argument("file"); imported.add_argument("--project", default="auto"); imported.add_argument("--cwd"); imported.add_argument("--recursive", action="store_true"); imported.add_argument("--changed-only", action="store_true")
+    resource_cmd = commands.add_parser("resource", help="List, inspect, refresh, remove, or export imported sources")
+    resource_commands = resource_cmd.add_subparsers(dest="resource_command", required=True)
+    resource_list_cmd = resource_commands.add_parser("list", help="List imported source evidence")
+    resource_list_cmd.add_argument("--project", default="auto"); resource_list_cmd.add_argument("--cwd"); resource_list_cmd.add_argument("--limit", type=int, default=100); resource_list_cmd.add_argument("--all-projects", action="store_true")
+    resource_show_cmd = resource_commands.add_parser("show", help="Show source metadata and bounded chunks")
+    resource_show_cmd.add_argument("resource_id"); resource_show_cmd.add_argument("--project", default="auto"); resource_show_cmd.add_argument("--cwd"); resource_show_cmd.add_argument("--all-projects", action="store_true"); resource_show_cmd.add_argument("--chunk-limit", type=int, default=5)
+    resource_refresh_cmd = resource_commands.add_parser("refresh", help="Re-import a source from its original path")
+    resource_refresh_cmd.add_argument("resource_id"); resource_refresh_cmd.add_argument("--project", default="auto"); resource_refresh_cmd.add_argument("--cwd")
+    resource_remove_cmd = resource_commands.add_parser("remove", help="Remove indexed source evidence while retaining raw audit history")
+    resource_remove_cmd.add_argument("resource_id"); resource_remove_cmd.add_argument("--project", default="auto"); resource_remove_cmd.add_argument("--cwd"); resource_remove_cmd.add_argument("--all-projects", action="store_true")
+    resource_export_cmd = resource_commands.add_parser("export", help="Export resource metadata as JSON or Markdown")
+    resource_export_cmd.add_argument("--project", default="auto"); resource_export_cmd.add_argument("--cwd"); resource_export_cmd.add_argument("--output"); resource_export_cmd.add_argument("--format", choices=["json", "markdown"], default="json"); resource_export_cmd.add_argument("--all-projects", action="store_true")
     return parser
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config(args.config)
+    command = args.command
+    if command in {"before", "after", "remember", "correct", "search", "history", "memory", "session", "overview", "status", "agent", "import", "resource", "turn", "recovery"}:
+        from .runtime import after, before, correct, origin_agent_id, read_text, remember, search
     if args.command == "setup": return _setup(config, args)
     if args.command == "install-agent":
-        agents = ["all"] if args.all else ([args.agent] if args.agent else [])
+        from .skill_installer import install_agents
+        agents = (["all"] if args.all else []) + list(args.agent or [])
         if not agents:
             raise ValueError("Provide an agent name or --all.")
-        return {
-            "status": "ok",
-            "installed": install_agents(
-                agents,
-                config=config,
-                custom_skill_dir=args.skill_dir,
-                custom_agent_id=args.agent_id,
-                custom_host_file=args.host_file,
-                no_host_file=args.no_host_file,
-            ),
-        }
+        installed = install_agents(
+            agents,
+            config=config,
+            custom_skill_dir=args.skill_dir,
+            custom_agent_id=args.agent_id,
+            custom_host_file=args.host_file,
+            no_host_file=args.no_host_file,
+        )
+        return {"status": "ok" if installed else "needs_action", "installed": installed, "next_action": None if installed else "Name an Agent explicitly, e.g. meta-memory install-agent codex."}
     if args.command == "project":
-        context = bind_project(config, args.name, args.cwd); save_config(config)
-        return {"status": "ok", "project": context.project_id, "root": str(context.root), "config": str(config.path)}
+        from .project_detection import bind_project
+        from .ux_projects import project_current, project_list, project_rename, project_stats, project_unbind
+        if args.project_command == "set":
+            context = bind_project(config, args.name, args.cwd); save_config(config)
+            return {"status": "ok", "project": context.project_id, "root": str(context.root), "config": str(config.path)}
+        if args.project_command == "current": return project_current(config, project_name=args.project, start=args.cwd)
+        if args.project_command == "list": return project_list(config)
+        if args.project_command == "rename": return project_rename(config, old=args.old, new=args.new)
+        if args.project_command == "unbind": return project_unbind(config, start=args.cwd, all_bindings=args.all)
+        return project_stats(config, project_name=args.project, start=args.cwd)
     if args.command == "before": return before(config, query=read_text(args.query, args.query_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, turn_uid=args.turn)
     if args.command == "after": return after(config, turn_uid=args.turn, user_text=read_text(args.user, args.user_file), assistant_text=read_text(args.assistant, args.assistant_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
     if args.command == "remember": return remember(config, content=read_text(args.content, args.content_file), title=args.title, session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, scope=args.scope, source_kind=args.source_kind, source_ref=args.source_ref)
     if args.command == "correct": return correct(config, memory_id=args.memory, content=read_text(args.content, args.content_file), agent_id=args.agent_id)
-    if args.command == "search": return search(config, query=args.query, project_name=args.project, start=args.cwd, limit=args.limit, agent_id=args.agent_id)
-    if args.command == "history": return history(config, query=args.query, project_name=args.project, start=args.cwd, agent_id=args.agent_id, detail=args.detail)
+    if args.command == "search":
+        result = search(config, query=args.query, project_name=args.project, start=args.cwd, limit=args.limit, agent_id=args.agent_id)
+        if args.claims_only:
+            result["results"] = [item for item in result.get("results", []) if str(item.get("memory_kind") or "") not in {"resource", "dream"} and bool(item.get("id") or item.get("memory_id"))]
+            result["claims_only"] = True
+        return result
+    if args.command == "history":
+        from .ux_history import history_recent, history_search, history_show
+        parts = list(args.history_args or [])
+        if not parts:
+            raise ValueError("Use `history <query>`, `history recent`, `history search <query>`, or `history show <session-id>`.")
+        action = str(parts[0]).casefold()
+        if action == "recent": return history_recent(config, project_name=args.project, start=args.cwd, limit=args.limit, agent_id=args.agent_id)
+        if action == "show":
+            if len(parts) < 2: raise ValueError("history show requires a session id.")
+            return history_show(config, session_id=parts[1], project_name=args.project, start=args.cwd, agent_id=args.agent_id, last=args.last)
+        query = " ".join(parts[1:] if action == "search" else parts).strip()
+        return history_search(config, query=query, project_name=args.project, start=args.cwd, agent_id=args.agent_id, detail=args.detail)
+    if args.command in {"inbox", "review"}:
+        from .ux_inbox import inbox_approve, inbox_feedback, inbox_list, inbox_reject, inbox_show
+        if args.inbox_command == "list": return inbox_list(config, project_name=args.project, start=args.cwd, status=args.status, kind=args.kind, limit=args.limit, all_projects=args.all_projects)
+        if args.inbox_command == "show": return inbox_show(config, proposal_id=args.proposal_id, kind=args.kind)
+        if args.inbox_command == "approve": return inbox_approve(config, proposal_id=args.proposal_id, kind=args.kind, agent_id=args.agent_id)
+        if args.inbox_command == "reject": return inbox_reject(config, proposal_id=args.proposal_id, kind=args.kind, note=args.note)
+        return inbox_feedback(config, memory_id=args.memory, feedback_type=args.type, note=args.note, retrieval_id=args.retrieval_id, agent_id=args.agent_id)
+    if args.command == "memory":
+        from .ux_memory import memory_archive, memory_export, memory_forget, memory_list, memory_recent, memory_show
+        if args.memory_command == "list": return memory_list(config, project_name=args.project, start=args.cwd, limit=args.limit, status=args.status, kind=args.kind, all_projects=args.all_projects)
+        if args.memory_command == "recent": return memory_recent(config, project_name=args.project, start=args.cwd, limit=args.limit, all_projects=args.all_projects)
+        if args.memory_command == "show": return memory_show(config, memory_id=args.memory_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects)
+        if args.memory_command == "search":
+            result = search(config, query=args.query, project_name=args.project, start=args.cwd, limit=args.limit, agent_id=args.agent_id)
+            if args.claims_only:
+                result["results"] = [item for item in result.get("results", []) if str(item.get("memory_kind") or "") not in {"resource", "dream"} and bool(item.get("id") or item.get("memory_id"))]
+                result["claims_only"] = True
+            return result
+        if args.memory_command == "correct": return correct(config, memory_id=args.memory_id, content=read_text(args.content, args.content_file), agent_id=args.agent_id)
+        if args.memory_command == "feedback":
+            from .ux_inbox import inbox_feedback
+
+            return inbox_feedback(config, memory_id=args.memory_id, feedback_type=args.type, note=args.note, retrieval_id=args.retrieval_id, agent_id=args.agent_id)
+        if args.memory_command == "archive": return memory_archive(config, memory_id=args.memory_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects)
+        if args.memory_command == "forget": return memory_forget(config, memory_id=args.memory_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects)
+        return memory_export(config, project_name=args.project, start=args.cwd, output=args.output, format=args.format, status=args.status, all_projects=args.all_projects)
     if args.command == "session":
         from .session_manager import close_session as close_cached_session, new_session, resolve_session
+        from .project_detection import resolve_project
         project = resolve_project(config, args.project, args.cwd)
         agent = origin_agent_id(args.agent_id)
         if args.session_command == "new":
@@ -199,39 +367,152 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 from session_archive import close_session as close_archived_session
                 close_archived_session(config.store, value.session_id, subject_id=config.subject_id, profile_id=config.profile_id, workspace_id=project.workspace_id, origin_agent_id=agent)
         return {"status": "ok", "project": project.project_id, "agent_id": agent, "session": None if value is None else {"id": value.session_id, "source": value.source, "reused": value.reused}}
-    if args.command == "status": return status(config)
-    if args.command == "doctor": return status(config)["health"]
+    if args.command == "overview":
+        from .ux_overview import overview
+
+        return overview(config, project_name=args.project, start=args.cwd, agent_id=args.agent_id)
+    if args.command == "status":
+        from .maintenance import status
+        from .ux_overview import overview
+
+        # Keep the long-standing top-level ``status: ok`` contract used by
+        # installed launchers, while adding the human-facing overview beneath
+        # it instead of changing the machine result to needs_action.
+        result = status(config)
+        result["overview"] = overview(config, project_name=args.project, start=args.cwd, agent_id=args.agent_id)
+        return result
+    if args.command == "doctor":
+        from .maintenance import status
+
+        return status(config)["health"]
     if args.command == "agent":
         from .agent_status import agent_status, verify_agent
+        from .skill_installer import agent_upgrade_status, sync_agents, uninstall_agent
         if args.agent_command == "verify":
             return verify_agent(config, agent_id=args.agent_id, project_name=args.project, start=args.cwd)
-        return agent_status(config, agent_id=origin_agent_id(args.agent_id), all_agents=args.all, project_name=args.project, start=args.cwd, verbose=args.verbose)
+        if args.agent_command in {"sync", "repair"}:
+            return sync_agents(config, agents=args.agents, all_agents=args.all, verify=not args.no_verify)
+        if args.agent_command == "uninstall": return uninstall_agent(config, args.agent_id)
+        if args.agent_command == "upgrade-status": return agent_upgrade_status(config, agent_id=args.agent_id or "", all_agents=args.all)
+        return agent_status(config, agent_id=origin_agent_id(args.agent_id), all_agents=args.all, installed_default=not args.all, project_name=args.project, start=args.cwd, verbose=args.verbose)
     if args.command == "config":
-        from .config_commands import get_config_value, set_config_value
-        return get_config_value(config, args.key) if args.config_command == "get" else set_config_value(config, args.key, args.value)
-    if args.command == "maintain": return maintain(config, max_jobs=args.max_jobs)
+        from .config_commands import describe_config_value, get_config_value, list_config_values, set_config_value
+        if args.config_command == "get": return get_config_value(config, args.key)
+        if args.config_command == "list": return list_config_values(config)
+        if args.config_command == "describe": return describe_config_value(config, args.key)
+        return set_config_value(config, args.key, args.value, apply_schedule=args.apply)
+    if args.command == "maintain":
+        from .maintenance import maintain
+
+        return maintain(config, max_jobs=args.max_jobs)
     if args.command == "schedule":
+        from .scheduler import schedule_install, schedule_remove, schedule_run, schedule_status
+
         if args.schedule_command == "install": return schedule_install(config)
         if args.schedule_command == "status": return schedule_status(config)
         if args.schedule_command == "remove": return schedule_remove(config)
         return schedule_run(config, "maintain" if args.schedule_command == "run-maintain" else "dream")
     if args.command == "dream":
+        from .dream import archive_dream_run, list_dream_runs, preview_dream, show_dream_run
+        from .dream_heartbeat import dream_status, run_deep, run_heartbeat
+
         if args.dream_command == "heartbeat": return run_heartbeat(config)
         if args.dream_command == "status": return dream_status(config)
-        return run_deep(config, scan_days=args.scan_days)
-    if args.command == "backup": return backup_app(config, args.output)
-    if args.command == "restore": return restore_app(config, args.archive, args.destination, force=args.force)
-    if args.command == "import": return import_file(config, file_path=args.file, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
+        if args.dream_command == "list": return list_dream_runs(config, limit=args.limit, include_archived=args.include_archived)
+        if args.dream_command == "show": return show_dream_run(config, run_id=args.run_id, include_content=not args.no_content)
+        if args.dream_command == "archive": return archive_dream_run(config, run_id=args.run_id)
+        days = getattr(args, "deep_scan_days", None) or args.scan_days
+        if args.dry_run: return preview_dream(config, scan_days=days)
+        return run_deep(config, scan_days=days)
+    if args.command == "turn":
+        from .project_detection import resolve_project
+        from .turn_service import complete_late_turn, get_turn, list_turns, reopen_turn, touch_turn
+
+        stable_agent = "" if getattr(args, "all_agents", False) else origin_agent_id(args.agent_id)
+        if args.turn_command == "list":
+            project = resolve_project(config, args.project, args.cwd)
+            statuses = ("started", "abandoned") if args.unfinished else None
+            return list_turns(config, agent_id=stable_agent, workspace_id=project.workspace_id, statuses=statuses, limit=args.limit)
+        if args.turn_command == "show": return get_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id))
+        if args.turn_command == "touch": return touch_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id), note=args.note)
+        if args.turn_command == "complete": return complete_late_turn(config, turn_uid=args.turn_id, assistant_text=read_text(args.assistant, args.assistant_file), agent_id=origin_agent_id(args.agent_id))
+        return reopen_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id), reason=args.reason)
+    if args.command == "recovery":
+        from .project_detection import resolve_project
+        from .spool import pending_dir, replay_spool
+        from .turn_recovery import recover_expired_turns
+        from .turn_service import list_turns
+
+        if args.recovery_command == "replay":
+            replayed = replay_spool(config, limit=args.limit)
+            recovered = recover_expired_turns(config, limit=args.limit)
+            return {"status": "ok", "spool": replayed, "turn_recovery": recovered}
+        project = resolve_project(config, args.project, args.cwd)
+        turns = list_turns(config, workspace_id=project.workspace_id, statuses=("started", "abandoned"), limit=50)
+        spool = pending_dir(config)
+        return {"status": "ok", "project": project.project_id, "pending_spool": len(list(spool.glob("*.json"))) if spool.is_dir() else 0, "unfinished_turns": turns.get("turns", []), "next_action": "meta-memory recovery replay" if (turns.get("turns") or spool.is_dir() and any(spool.glob("*.json"))) else None}
+    if args.command == "backup":
+        from .backup import backup_app
+
+        return backup_app(config, args.output)
+    if args.command == "restore":
+        from .backup import restore_app
+
+        return restore_app(config, args.archive, args.destination, force=args.force)
+    if args.command == "import":
+        from .importer import import_file, import_paths
+
+        if not args.recursive and not args.changed_only and Path(args.file).expanduser().is_file():
+            return import_file(config, file_path=args.file, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
+        return import_paths(config, path=args.file, recursive=args.recursive, changed_only=args.changed_only, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
+    if args.command == "resource":
+        from .importer import resource_export, resource_list, resource_refresh, resource_remove, resource_show
+
+        if args.resource_command == "list": return resource_list(config, project_name=args.project, start=args.cwd, limit=args.limit, all_projects=args.all_projects)
+        if args.resource_command == "show": return resource_show(config, resource_id=args.resource_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects, chunk_limit=args.chunk_limit)
+        if args.resource_command == "refresh": return resource_refresh(config, resource_id=args.resource_id, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
+        if args.resource_command == "remove": return resource_remove(config, resource_id=args.resource_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects)
+        return resource_export(config, project_name=args.project, start=args.cwd, output=args.output, format=args.format, all_projects=args.all_projects)
     raise ValueError(f"Unsupported command: {args.command}")
 
 
+def _normalise_output_args(argv: list[str]) -> list[str]:
+    """Accept ``--json`` in the natural post-command position as well."""
+    values = list(argv)
+    if "--json" in values:
+        values = [item for item in values if item != "--json"]
+        values.insert(0, "--json")
+    # A command-level export uses ``--format markdown``.  Only lift formats
+    # that belong to the global output contract.
+    for index, item in enumerate(list(values)):
+        if item == "--format" and index + 1 < len(values) and values[index + 1] in {"auto", "json", "text"}:
+            value = values[index + 1]
+            del values[index:index + 2]
+            values[0:0] = ["--format", value]
+            break
+    return values
+
+
 def main(argv: list[str] | None = None) -> None:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Launchers are commonly executed through ``cmd.exe`` while their caller
+    # captures stdout as UTF-8.  Pin non-interactive output to UTF-8 before
+    # any localized scheduler/detail text is serialized into JSON.
+    if not sys.stdout.isatty() and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
     try:
-        result = dispatch(build_parser().parse_args(argv))
+        parsed = build_parser().parse_args(_normalise_output_args(raw))
+        result = dispatch(parsed)
     except (OSError, ValueError, RuntimeError) as exc:
         _emit({"status": "error", "error": str(exc)})
         raise SystemExit(2) from exc
-    _emit(result)
+    output_format = "json" if bool(getattr(parsed, "output_format_json", False)) else str(getattr(parsed, "format", "auto"))
+    if output_format not in {"auto", "json", "text"}:
+        output_format = "auto"
+    _emit(result, output_format=output_format)
 
 
 if __name__ == "__main__":

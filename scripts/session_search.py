@@ -47,6 +47,12 @@ def _scroll_conn(conn, session_id: str, anchor: int, window: int, *, include_hid
 
 
 _SECRET = re.compile(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|bearer\s+|(?:api[_-]?key|token|cookie|password|secret)\s*[:=]\s*)[^\s,;]+")
+_CONTINUITY_INTENT = re.compile(
+    r"(?:继续|接着|承接|上次|上一轮|之前(?:的)?(?:进度|工作|会话|任务)?|前面(?:的)?(?:进度|工作)?|"
+    r"做到哪|未完成|遗留|后续|resume|continue|pick\s+up|carry\s+on|last\s+time|"
+    r"previous\s+(?:work|session|task)|where\s+(?:we|i)\s+left\s+off|follow[-\s]?up)",
+    re.I,
+)
 
 
 def _safe_text(value: object, limit: int) -> str:
@@ -60,6 +66,37 @@ def _questions(value: object) -> list[str]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return [_safe_text(item, 280) for item in parsed if str(item).strip()][:8] if isinstance(parsed, list) else []
+
+
+def _rolling_state(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(str(value or "{}")) if not isinstance(value, dict) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = {}
+    parsed = parsed if isinstance(parsed, dict) else {}
+    result: dict[str, object] = {"schema_version": int(parsed.get("schema_version") or 0)}
+    goal = _safe_text(parsed.get("goal") or "", 420)
+    if goal:
+        result["goal"] = goal
+    for key in ("completed", "decisions", "artifacts", "blockers", "next_steps", "open_questions"):
+        raw = parsed.get(key)
+        if isinstance(raw, list):
+            values = []
+            for item in raw:
+                text = _safe_text(item, 420)
+                if text and text not in values:
+                    values.append(text)
+            result[key] = values[:12]
+        else:
+            result[key] = []
+    result["updated_at"] = str(parsed.get("updated_at") or "")
+    return result
+
+
+def is_continuity_intent(query: str) -> bool:
+    """Whether a user is asking an Agent to resume prior workspace work."""
+
+    return bool(_CONTINUITY_INTENT.search(str(query or "")))
 
 
 def _internal_session_id(conn, *, profile_id: str, workspace_id: str, subject_id: str, agent_id: str, external_session_id: str) -> str:
@@ -79,6 +116,8 @@ def discover_session_summaries(
     workspace_id: str = "default",
     profile_id: str = "default",
     agent_id: str = "",
+    exclude_session_id: str = "",
+    cross_agent_only: bool = False,
 ) -> dict[str, object]:
     """Search completed, workspace-visible cards without reading transcripts."""
 
@@ -87,27 +126,56 @@ def discover_session_summaries(
         clauses = [
             "c.subject_id=?", "c.workspace_id=?", "c.profile_id=?", "c.state='active'",
             "c.completed_turn_count>0", "COALESCE(c.summary_visibility,'workspace')='workspace'",
+            "COALESCE(c.summary_dirty,0)=0",
         ]
         params: list[object] = [subject_id, workspace_id, profile_id]
-        if agent_id:
+        if cross_agent_only and agent_id:
+            clauses.append("COALESCE(c.origin_agent_id,'')!=?")
+            params.append(agent_id)
+        elif agent_id:
             clauses.append("COALESCE(c.origin_agent_id,'')=?")
             params.append(agent_id)
+        if exclude_session_id:
+            clauses.append("COALESCE(c.session_id,'')!=?")
+            params.append(exclude_session_id)
         terms = _terms(query)
-        if terms:
-            matches: list[str] = []
-            for _ in terms:
-                matches.append("(LOWER(COALESCE(c.summary,'')) LIKE ? OR LOWER(COALESCE(c.tool_summary,'')) LIKE ? OR LOWER(COALESCE(c.open_questions,'')) LIKE ?)")
-                needle = f"%{_}%"
-                params.extend([needle, needle, needle])
-            clauses.append("(" + " OR ".join(matches) + ")")
-        rows = conn.execute(
-            """
-            SELECT c.id,c.session_id,c.origin_agent_id,c.summary,c.tool_summary,c.open_questions,
+        select = """
+            SELECT c.id,c.session_id,c.origin_agent_id,c.summary,c.tool_summary,c.open_questions,c.rolling_state_json,
                    c.completed_turn_count,c.last_completed_turn_at,c.updated_at
-            FROM session_cards AS c
-            WHERE """ + " AND ".join(clauses) + " ORDER BY COALESCE(c.last_completed_turn_at,c.updated_at) DESC LIMIT ?",
-            (*params, max(1, limit)),
-        ).fetchall()
+            """
+        rows = []
+        fts_used = False
+        if terms:
+            # The FTS table is optional on SQLite builds without FTS5 and is
+            # introduced by the runtime migration.  A missing table or parser
+            # edge case deliberately falls through to deterministic LIKE.
+            try:
+                rows = conn.execute(
+                    select + " FROM session_cards_fts JOIN session_cards AS c ON c.id=session_cards_fts.rowid WHERE session_cards_fts MATCH ? AND "
+                    + " AND ".join(clauses)
+                    + " ORDER BY bm25(session_cards_fts),COALESCE(c.last_completed_turn_at,c.updated_at) DESC LIMIT ?",
+                    (_fts_query(terms), *params, max(1, limit)),
+                ).fetchall()
+                fts_used = True
+            except Exception:
+                rows = []
+                fts_used = False
+        if not rows:
+            fts_used = False
+            like_clauses = list(clauses)
+            like_params = list(params)
+            if terms:
+                matches: list[str] = []
+                for _ in terms:
+                    matches.append("(LOWER(COALESCE(c.summary,'')) LIKE ? OR LOWER(COALESCE(c.tool_summary,'')) LIKE ? OR LOWER(COALESCE(c.open_questions,'')) LIKE ? OR LOWER(COALESCE(c.rolling_state_json,'')) LIKE ?)")
+                    needle = f"%{_}%"
+                    like_params.extend([needle, needle, needle, needle])
+                like_clauses.append("(" + " OR ".join(matches) + ")")
+            rows = conn.execute(
+                select + " FROM session_cards AS c WHERE " + " AND ".join(like_clauses)
+                + " ORDER BY COALESCE(c.last_completed_turn_at,c.updated_at) DESC LIMIT ?",
+                (*like_params, max(1, limit)),
+            ).fetchall()
         sessions = []
         for row in rows:
             external = str(row[1] or "")
@@ -121,13 +189,76 @@ def discover_session_summaries(
                 "summary": _safe_text(row[3], 6000),
                 "tool_summary": _safe_text(row[4], 1200),
                 "open_questions": _questions(row[5]),
-                "completed_turns": int(row[6] or 0),
-                "last_completed_turn_at": str(row[7] or ""),
-                "updated_at": str(row[8] or ""),
+                "rolling_state": _rolling_state(row[6]),
+                "completed_turns": int(row[7] or 0),
+                "last_completed_turn_at": str(row[8] or ""),
+                "updated_at": str(row[9] or ""),
             })
-        return {"status": "ok", "mode": "summary", "query": query, "sessions": sessions}
+        return {"status": "ok", "mode": "summary", "query": query, "fts_used": fts_used, "sessions": sessions}
     finally:
         conn.close()
+
+
+def discover_continuity_summaries(
+    root,
+    *,
+    subject_id: str,
+    query: str,
+    current_agent_id: str,
+    current_session_id: str = "",
+    limit: int = 3,
+    workspace_id: str = "default",
+    profile_id: str = "default",
+) -> dict[str, object]:
+    """Return 1--3 completed summaries from *other* Agents when resuming.
+
+    A continuation phrase often has no overlap with the old summary (for
+    example just ``继续``), so query matches are preferred but recent completed
+    workspace cards fill the remainder.  Transcripts are never read here.
+    """
+
+    capped = max(1, min(3, int(limit or 3)))
+    if not is_continuity_intent(query):
+        return {"status": "ok", "mode": "continuity", "continuity_intent": False, "sessions": []}
+    matched = discover_session_summaries(
+        root,
+        subject_id=subject_id,
+        query=query,
+        limit=capped,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        agent_id=current_agent_id,
+        exclude_session_id=current_session_id,
+        cross_agent_only=True,
+    )
+    sessions = list(matched.get("sessions", []))
+    if len(sessions) < capped:
+        recent = discover_session_summaries(
+            root,
+            subject_id=subject_id,
+            query="",
+            limit=max(capped * 3, 6),
+            workspace_id=workspace_id,
+            profile_id=profile_id,
+            agent_id=current_agent_id,
+            exclude_session_id=current_session_id,
+            cross_agent_only=True,
+        )
+        seen = {int(item.get("card_id") or 0) for item in sessions}
+        for item in list(recent.get("sessions", [])):
+            card_id = int(item.get("card_id") or 0)
+            if card_id and card_id not in seen:
+                sessions.append(item)
+                seen.add(card_id)
+            if len(sessions) >= capped:
+                break
+    return {
+        "status": "ok",
+        "mode": "continuity",
+        "continuity_intent": True,
+        "query": query,
+        "sessions": sessions[:capped],
+    }
 
 
 def read_session_detail(

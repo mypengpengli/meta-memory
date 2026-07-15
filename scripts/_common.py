@@ -220,12 +220,17 @@ def open_db(root: Path) -> sqlite3.Connection:
                 _WAL_INITIALIZED_DBS.add(key)
     # Schema changes are deliberately centralized in versioned migrations.
     # Import lazily to keep every standalone script executable from this folder.
-    from db_migrations import run_migrations
+    from db_migrations import run_migrations, schema_is_current
 
     if key not in _MIGRATED_DBS:
         with _MIGRATION_LOCK:
             if key not in _MIGRATED_DBS:
-                run_migrations(conn)
+                # A CLI invocation is normally a new process.  Use one cheap
+                # schema-version probe on its first connection and reserve the
+                # checksum/legacy-column/FTS repair walk for an actual upgrade
+                # (or the explicit db_migrations repair command).
+                if not schema_is_current(conn):
+                    run_migrations(conn)
                 _MIGRATED_DBS.add(key)
     return conn
 

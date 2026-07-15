@@ -129,11 +129,25 @@ def _one_status(config: AppConfig, *, agent_id: str, project, verbose: bool) -> 
     return result
 
 
-def agent_status(config: AppConfig, *, agent_id: str, all_agents: bool = False, project_name: str = "auto", start: str | Path | None = None, verbose: bool = False) -> dict[str, object]:
+def agent_status(
+    config: AppConfig,
+    *,
+    agent_id: str,
+    all_agents: bool = False,
+    installed_default: bool = False,
+    project_name: str = "auto",
+    start: str | Path | None = None,
+    verbose: bool = False,
+) -> dict[str, object]:
     project = resolve_project(config, project_name, start)
-    agents = _known_agents(config, workspace_id=project.workspace_id) if all_agents else [agent_id]
+    known = _known_agents(config, workspace_id=project.workspace_id)
+    agents = known if (all_agents or installed_default) and known else [agent_id]
     rows = [_one_status(config, agent_id=name, project=project, verbose=verbose) for name in agents]
-    return {"status": "ok", "project": project.project_id, "agents": rows if all_agents else [], **({} if all_agents else rows[0])}
+    grouped = all_agents or installed_default
+    return {
+        "status": "ok", "project": project.project_id, "agents": rows if grouped else [],
+        **({} if grouped else rows[0]),
+    }
 
 
 def verify_agent(config: AppConfig, *, agent_id: str, project_name: str = "auto", start: str | Path | None = None) -> dict[str, object]:

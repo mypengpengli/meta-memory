@@ -32,7 +32,9 @@ class AppConfig:
     default_project: str = "general"
     search_depth: str = "auto"
     maintenance_enabled: bool = True
-    maintenance_interval_minutes: int = 5
+    # ``maintenance`` is the legacy name for the incremental heartbeat.  Keep
+    # the field for old configs, but use the same 10-minute default everywhere.
+    maintenance_interval_minutes: int = 10
     dream_enabled: bool = True
     dream_schedule: str = "23:30"
     dream_scan_days: int = 7
@@ -55,9 +57,16 @@ class AppConfig:
     turns_abandon_after_minutes: int = 60
     session_auto_expire_hours: int = 8
     top_k: int = 8
+    retrieval_candidate_limit: int = 96
     embeddings: bool = False
     http_api: bool = False
     agent_private_memory: bool = False
+    retention_operational_days: int = 90
+    retention_retrieval_days: int = 30
+    retention_dream_report_days: int = 30
+    maintenance_compact_enabled: bool = True
+    scheduler_log_max_bytes: int = 1_000_000
+    scheduler_log_keep_files: int = 5
     projects: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -146,7 +155,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         default_project=slug(str(_value(data, "behavior", "default_project", "general")), "general"),
         search_depth=normalize_search_depth(_value(data, "behavior", "search_depth", "auto")),
         maintenance_enabled=_bool(_value(data, "maintenance", "enabled", True), True),
-        maintenance_interval_minutes=_interval(_value(data, "maintenance", "interval_minutes", 5), 5),
+        # The old maintenance setting is the fallback for pre-heartbeat
+        # configs. Once `[dream].heartbeat_interval_minutes` exists it is the
+        # canonical value, so status/config never show conflicting 5/10-minute
+        # schedules for the same incremental worker.
+        maintenance_interval_minutes=_interval(heartbeat_interval, 10),
         dream_enabled=deep_enabled,
         dream_schedule=deep_schedule,
         dream_scan_days=deep_scan_days,
@@ -169,9 +182,16 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         turns_abandon_after_minutes=max(1, int(_value(data, "turns", "abandon_after_minutes", 60))),
         session_auto_expire_hours=max(1, int(_value(data, "session", "auto_expire_hours", 8))),
         top_k=max(1, int(_value(data, "retrieval", "top_k", 8))),
+        retrieval_candidate_limit=max(24, min(512, int(_value(data, "retrieval", "candidate_limit", 96)))),
         embeddings=_bool(_value(data, "retrieval", "embeddings", False), False),
         http_api=_bool(_value(data, "advanced", "http_api", False), False),
         agent_private_memory=_bool(_value(data, "advanced", "agent_private_memory", False), False),
+        retention_operational_days=max(1, int(_value(data, "retention", "operational_days", 90))),
+        retention_retrieval_days=max(1, int(_value(data, "retention", "retrieval_days", 30))),
+        retention_dream_report_days=max(1, int(_value(data, "retention", "dream_report_days", 30))),
+        maintenance_compact_enabled=_bool(_value(data, "maintenance", "compact_enabled", True), True),
+        scheduler_log_max_bytes=max(65536, int(_value(data, "scheduler", "log_max_bytes", 1_000_000))),
+        scheduler_log_keep_files=max(1, min(20, int(_value(data, "scheduler", "log_keep_files", 5)))),
         projects=projects,
     )
 
@@ -192,11 +212,13 @@ def save_config(config: AppConfig) -> Path:
         "[storage]", f"path = {_quote(str(config.store))}", "",
         "[behavior]", f"memory_mode = {_quote(normalize_memory_mode(config.memory_mode))}", f"default_project = {_quote(config.default_project)}", f"search_depth = {_quote(normalize_search_depth(config.search_depth))}", "",
         "[session]", f"auto_expire_hours = {max(1, int(config.session_auto_expire_hours))}", "",
-        "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", "",
+        "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", f"compact_enabled = {str(config.maintenance_compact_enabled).lower()}", "",
         "[dream]", f"enabled = {str(deep_enabled).lower()}", f"heartbeat_enabled = {str(config.dream_heartbeat_enabled).lower()}", f"heartbeat_interval_minutes = {_interval(config.dream_heartbeat_interval_minutes, 10)}", f"heartbeat_max_scopes = {max(1, int(config.dream_heartbeat_max_scopes))}", f"heartbeat_max_jobs = {max(1, int(config.dream_heartbeat_max_jobs))}", f"deep_enabled = {str(deep_enabled).lower()}", f"deep_schedule = {_quote(config.dream_deep_schedule)}", f"deep_scan_days = {max(1, int(config.dream_deep_scan_days))}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {max(1, int(config.dream_scan_days))}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
         "[history]", f"scope = {_quote(normalize_history_scope(config.history_scope))}", f"allow_detail = {str(config.history_allow_detail).lower()}", f"detail_max_sessions = {max(1, int(config.history_detail_max_sessions))}", f"detail_max_turns = {max(1, int(config.history_detail_max_turns))}", f"detail_max_chars = {max(256, int(config.history_detail_max_chars))}", f"tool_summary_max_chars = {max(120, int(config.history_tool_summary_max_chars))}", "",
         "[turns]", f"unfinished_warning_minutes = {max(1, int(config.turns_unfinished_warning_minutes))}", f"abandon_after_minutes = {max(1, int(config.turns_abandon_after_minutes))}", "",
-        "[retrieval]", f"top_k = {config.top_k}", f"embeddings = {str(config.embeddings).lower()}", "",
+        "[retrieval]", f"top_k = {config.top_k}", f"candidate_limit = {max(24, min(512, int(config.retrieval_candidate_limit)))}", f"embeddings = {str(config.embeddings).lower()}", "",
+        "[retention]", f"operational_days = {max(1, int(config.retention_operational_days))}", f"retrieval_days = {max(1, int(config.retention_retrieval_days))}", f"dream_report_days = {max(1, int(config.retention_dream_report_days))}", "",
+        "[scheduler]", f"log_max_bytes = {max(65536, int(config.scheduler_log_max_bytes))}", f"log_keep_files = {max(1, min(20, int(config.scheduler_log_keep_files)))}", "",
         "[advanced]", f"http_api = {str(config.http_api).lower()}", f"agent_private_memory = {str(config.agent_private_memory).lower()}", "",
         "[projects]",
     ]
