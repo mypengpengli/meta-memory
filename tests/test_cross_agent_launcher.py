@@ -53,6 +53,24 @@ class CrossAgentLauncherTests(unittest.TestCase):
             status_b = self._run_launcher(Path(str(agent_b["launcher"])), "status")
             self.assertEqual((status_a["status"], status_b["status"]), ("ok", "ok"))
 
+            started = self._run_launcher(
+                Path(str(agent_a["launcher"])), "before", "--project", "launcher-shared", "--session", "agent-a-session",
+                "--turn", "launcher-agent-a-turn", "--query", "The launcher project now shares cross-agent memory signal.",
+            )
+            self.assertEqual(started["agent_id"], "agent-a")
+            completed = self._run_launcher(
+                Path(str(agent_a["launcher"])), "after", "--turn", str(started["turn_id"]), "--assistant", "Agent A completed the shared update.",
+            )
+            self.assertEqual(completed["status"], "ok")
+            heartbeat = self._run_launcher(Path(str(agent_a["launcher"])), "dream", "heartbeat")
+            self.assertEqual(heartbeat["status"], "ok")
+            agent_b_before = self._run_launcher(
+                Path(str(agent_b["launcher"])), "before", "--project", "launcher-shared", "--session", "agent-b-session",
+                "--turn", "launcher-agent-b-turn", "--query", "What is the shared cross-agent memory signal?",
+            )
+            self.assertEqual(agent_b_before["agent_id"], "agent-b")
+            self.assertIn("cross-agent memory signal", agent_b_before["hot_context"] + agent_b_before["context"])
+
     def test_custom_agent_ids_are_strict_and_cannot_impersonate_builtins(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             config = AppConfig(path=Path(temp) / "config.toml", store=Path(temp) / "store")

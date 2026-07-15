@@ -527,7 +527,9 @@ class RuntimeCoordinationAndDreamTests(unittest.TestCase):
 
     def test_scheduler_generation_is_scoped_and_non_destructive(self) -> None:
         self.config.maintenance_interval_minutes = 7
+        self.config.dream_heartbeat_interval_minutes = 7
         self.config.dream_schedule = "23:45"
+        self.config.dream_deep_schedule = "23:45"
         launcher = self.root / "bin with spaces" / "meta-memory-system.cmd"
         block = _linux_block(self.config, launcher)
         self.assertIn("*/7 * * * *", block)

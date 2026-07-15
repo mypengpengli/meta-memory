@@ -38,6 +38,13 @@ class AppConfig:
     dream_scan_days: int = 7
     dream_provider: str = "deterministic"
     dream_command: str = ""
+    dream_heartbeat_enabled: bool = True
+    dream_heartbeat_interval_minutes: int = 10
+    dream_heartbeat_max_scopes: int = 20
+    dream_heartbeat_max_jobs: int = 50
+    dream_deep_enabled: bool = True
+    dream_deep_schedule: str = "23:30"
+    dream_deep_scan_days: int = 7
     history_scope: str = "workspace-summary"
     history_allow_detail: bool = True
     history_detail_max_sessions: int = 3
@@ -99,6 +106,13 @@ def normalize_history_scope(value: Any) -> str:
     return scope if scope in {"agent", "workspace-summary"} else "workspace-summary"
 
 
+def _interval(value: Any, default: int = 10) -> int:
+    try:
+        return min(10080, max(1, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     config_path = Path(path).expanduser() if path else default_config_path()
     if not config_path.exists():
@@ -114,6 +128,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         configured_mode,
         fallback="automatic" if legacy_auto else "manual",
     )
+    maintenance_section = data.get("maintenance", {}) if isinstance(data.get("maintenance", {}), dict) else {}
+    dream_section = data.get("dream", {}) if isinstance(data.get("dream", {}), dict) else {}
+    legacy_interval = maintenance_section.get("interval_minutes")
+    heartbeat_interval = dream_section.get("heartbeat_interval_minutes", legacy_interval if legacy_interval is not None else 10)
+    deep_enabled = _bool(dream_section.get("deep_enabled", dream_section.get("enabled", True)), True)
+    deep_schedule = str(dream_section.get("deep_schedule", dream_section.get("schedule", "23:30")))
+    deep_scan_days = max(1, int(dream_section.get("deep_scan_days", dream_section.get("scan_days", 7))))
     return AppConfig(
         path=config_path,
         user_name=name,
@@ -123,12 +144,19 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         default_project=slug(str(_value(data, "behavior", "default_project", "general")), "general"),
         search_depth=normalize_search_depth(_value(data, "behavior", "search_depth", "auto")),
         maintenance_enabled=_bool(_value(data, "maintenance", "enabled", True), True),
-        maintenance_interval_minutes=max(1, int(_value(data, "maintenance", "interval_minutes", 5))),
-        dream_enabled=_bool(_value(data, "dream", "enabled", True), True),
-        dream_schedule=str(_value(data, "dream", "schedule", "23:30")),
-        dream_scan_days=max(1, int(_value(data, "dream", "scan_days", 7))),
+        maintenance_interval_minutes=_interval(_value(data, "maintenance", "interval_minutes", 5), 5),
+        dream_enabled=deep_enabled,
+        dream_schedule=deep_schedule,
+        dream_scan_days=deep_scan_days,
         dream_provider=str(_value(data, "dream", "provider", "deterministic")).strip().casefold() or "deterministic",
         dream_command=str(_value(data, "dream", "command", "")),
+        dream_heartbeat_enabled=_bool(dream_section.get("heartbeat_enabled", _value(data, "maintenance", "enabled", True)), True),
+        dream_heartbeat_interval_minutes=_interval(heartbeat_interval, 10),
+        dream_heartbeat_max_scopes=max(1, int(dream_section.get("heartbeat_max_scopes", 20))),
+        dream_heartbeat_max_jobs=max(1, int(dream_section.get("heartbeat_max_jobs", 50))),
+        dream_deep_enabled=deep_enabled,
+        dream_deep_schedule=deep_schedule,
+        dream_deep_scan_days=deep_scan_days,
         history_scope=normalize_history_scope(_value(data, "history", "scope", "workspace-summary")),
         history_allow_detail=_bool(_value(data, "history", "allow_detail", True), True),
         history_detail_max_sessions=max(1, int(_value(data, "history", "detail_max_sessions", 3))),
@@ -157,7 +185,7 @@ def save_config(config: AppConfig) -> Path:
         "[behavior]", f"memory_mode = {_quote(normalize_memory_mode(config.memory_mode))}", f"default_project = {_quote(config.default_project)}", f"search_depth = {_quote(normalize_search_depth(config.search_depth))}", "",
         "[session]", f"auto_expire_hours = {max(1, int(config.session_auto_expire_hours))}", "",
         "[maintenance]", f"enabled = {str(config.maintenance_enabled).lower()}", f"interval_minutes = {config.maintenance_interval_minutes}", "",
-        "[dream]", f"enabled = {str(config.dream_enabled).lower()}", f"schedule = {_quote(config.dream_schedule)}", f"scan_days = {config.dream_scan_days}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
+        "[dream]", f"enabled = {str(config.dream_deep_enabled).lower()}", f"heartbeat_enabled = {str(config.dream_heartbeat_enabled).lower()}", f"heartbeat_interval_minutes = {_interval(config.dream_heartbeat_interval_minutes, 10)}", f"heartbeat_max_scopes = {max(1, int(config.dream_heartbeat_max_scopes))}", f"heartbeat_max_jobs = {max(1, int(config.dream_heartbeat_max_jobs))}", f"deep_enabled = {str(config.dream_deep_enabled).lower()}", f"deep_schedule = {_quote(config.dream_deep_schedule)}", f"deep_scan_days = {max(1, int(config.dream_deep_scan_days))}", f"schedule = {_quote(config.dream_deep_schedule)}", f"scan_days = {max(1, int(config.dream_deep_scan_days))}", f"provider = {_quote(config.dream_provider)}", f"command = {_quote(config.dream_command)}", "",
         "[history]", f"scope = {_quote(normalize_history_scope(config.history_scope))}", f"allow_detail = {str(config.history_allow_detail).lower()}", f"detail_max_sessions = {max(1, int(config.history_detail_max_sessions))}", f"detail_max_turns = {max(1, int(config.history_detail_max_turns))}", f"detail_max_chars = {max(256, int(config.history_detail_max_chars))}", f"tool_summary_max_chars = {max(120, int(config.history_tool_summary_max_chars))}", "",
         "[retrieval]", f"top_k = {config.top_k}", f"embeddings = {str(config.embeddings).lower()}", "",
         "[advanced]", f"http_api = {str(config.http_api).lower()}", f"agent_private_memory = {str(config.agent_private_memory).lower()}", "",

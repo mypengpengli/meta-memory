@@ -9,7 +9,7 @@ from typing import Any
 
 from .backup import backup_app, restore_app
 from .config import AppConfig, load_config, save_config, slug
-from .dream import run_dream
+from .dream_heartbeat import dream_status, run_deep, run_heartbeat
 from .importer import import_file
 from .legacy import bootstrap
 from .maintenance import maintain, status
@@ -56,6 +56,8 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
     config.store = Path(store).expanduser()
     config.maintenance_enabled = _yn(maintenance)
     config.dream_enabled = _yn(dream_enabled)
+    config.dream_heartbeat_enabled = config.maintenance_enabled
+    config.dream_deep_enabled = config.dream_enabled
     save_config(config)
     from .legacy import bootstrap
     bootstrap()
@@ -119,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("status", help="Show local store status")
     commands.add_parser("doctor", help="Run a non-mutating health check")
+    config_cmd = commands.add_parser("config", help="Read or update supported local runtime configuration")
+    config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_get = config_commands.add_parser("get", help="Read one supported configuration key"); config_get.add_argument("key")
+    config_set = config_commands.add_parser("set", help="Set one supported configuration key"); config_set.add_argument("key"); config_set.add_argument("value")
     maintenance = commands.add_parser("maintain", help="Run the single periodic maintenance cycle")
     maintenance.add_argument("--max-jobs", type=int, default=20)
 
@@ -129,8 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_commands.add_parser("remove", help="Remove Meta Memory schedules without touching other jobs")
     schedule_commands.add_parser("run-maintain", help="Run maintain through the scheduler launcher now")
     schedule_commands.add_parser("run-dream", help="Run Dream through the scheduler launcher now")
-    dream = commands.add_parser("dream", help="Create a safe nightly inferred summary")
+    dream = commands.add_parser("dream", help="Run Dream heartbeat, deep synthesis, or inspect Dream state")
     dream.add_argument("--scan-days", type=int)
+    dream_commands = dream.add_subparsers(dest="dream_command")
+    dream_commands.add_parser("heartbeat", help="Run the lightweight incremental memory heartbeat now")
+    dream_commands.add_parser("deep", help="Run the deep daily synthesis now")
+    dream_commands.add_parser("status", help="Show Dream heartbeat and deep-synthesis state")
 
     backup = commands.add_parser("backup", help="Create a consistent ZIP backup")
     backup.add_argument("--output")
@@ -185,13 +195,19 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return {"status": "ok", "project": project.project_id, "agent_id": agent, "session": None if value is None else {"id": value.session_id, "source": value.source, "reused": value.reused}}
     if args.command == "status": return status(config)
     if args.command == "doctor": return status(config)["health"]
+    if args.command == "config":
+        from .config_commands import get_config_value, set_config_value
+        return get_config_value(config, args.key) if args.config_command == "get" else set_config_value(config, args.key, args.value)
     if args.command == "maintain": return maintain(config, max_jobs=args.max_jobs)
     if args.command == "schedule":
         if args.schedule_command == "install": return schedule_install(config)
         if args.schedule_command == "status": return schedule_status(config)
         if args.schedule_command == "remove": return schedule_remove(config)
         return schedule_run(config, "maintain" if args.schedule_command == "run-maintain" else "dream")
-    if args.command == "dream": return run_dream(config, scan_days=args.scan_days)
+    if args.command == "dream":
+        if args.dream_command == "heartbeat": return run_heartbeat(config)
+        if args.dream_command == "status": return dream_status(config)
+        return run_deep(config, scan_days=args.scan_days)
     if args.command == "backup": return backup_app(config, args.output)
     if args.command == "restore": return restore_app(config, args.archive, args.destination, force=args.force)
     if args.command == "import": return import_file(config, file_path=args.file, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))

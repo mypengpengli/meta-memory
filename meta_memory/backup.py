@@ -520,6 +520,13 @@ def _apply_restored_config(config: "AppConfig", restored: "AppConfig") -> str:
     config.dream_scan_days = restored.dream_scan_days
     config.dream_provider = restored.dream_provider
     config.dream_command = restored.dream_command
+    config.dream_heartbeat_enabled = restored.dream_heartbeat_enabled
+    config.dream_heartbeat_interval_minutes = restored.dream_heartbeat_interval_minutes
+    config.dream_heartbeat_max_scopes = restored.dream_heartbeat_max_scopes
+    config.dream_heartbeat_max_jobs = restored.dream_heartbeat_max_jobs
+    config.dream_deep_enabled = restored.dream_deep_enabled
+    config.dream_deep_schedule = restored.dream_deep_schedule
+    config.dream_deep_scan_days = restored.dream_deep_scan_days
     config.history_scope = restored.history_scope
     config.history_allow_detail = restored.history_allow_detail
     config.history_detail_max_sessions = restored.history_detail_max_sessions

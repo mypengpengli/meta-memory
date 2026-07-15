@@ -365,6 +365,14 @@ def complete_turn(config: AppConfig, *, turn_uid: str, assistant_text: str, agen
             """,
             (assistant_event_id, str(review["job_id"]), response_hash, utc_now(), utc_now(), turn_uid),
         )
+        conn.execute(
+            """
+            UPDATE session_cards SET summary_dirty=1,updated_at=?
+            WHERE subject_id=? AND profile_id=? AND workspace_id=? AND session_id=?
+              AND COALESCE(origin_agent_id,'')=?
+            """,
+            (utc_now(), str(row[3]), str(row[1]), str(row[2]), str(row[5]), str(row[4] or "")),
+        )
         conn.commit()
         return {
             "status": "ok",

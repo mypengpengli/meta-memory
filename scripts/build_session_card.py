@@ -201,6 +201,72 @@ def build_cards(
     return {"status": "ok", "dry_run": dry_run, "cards": results}
 
 
+def refresh_dirty_cards(
+    root,
+    *,
+    profile_id: str | None = None,
+    workspace_id: str | None = None,
+    subject_id: str | None = None,
+    limit: int = 20,
+) -> dict[str, object]:
+    """Regenerate legacy/dirty summaries only from safe completed evidence."""
+
+    conn = open_db(root)
+    clauses = ["summary_dirty=1"]
+    params: list[object] = []
+    for column, value in (("profile_id", profile_id), ("workspace_id", workspace_id), ("subject_id", subject_id)):
+        if value is not None:
+            clauses.append(f"{column}=?")
+            params.append(value)
+    cards = conn.execute(
+        "SELECT id,subject_id,session_id,profile_id,workspace_id,COALESCE(origin_agent_id,'') FROM session_cards WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY updated_at LIMIT ?",
+        (*params, max(1, limit)),
+    ).fetchall()
+    updated: list[dict[str, object]] = []
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        for card_id, sid, session_id, profile, workspace, agent in cards:
+            rows = conn.execute(
+                """
+                SELECT r.id,r.source_type,r.content,r.created_at,r.event_time
+                FROM session_card_events AS link
+                JOIN raw_events AS r ON r.id=link.raw_event_id
+                LEFT JOIN turns AS t ON t.turn_uid=r.turn_uid
+                WHERE link.card_id=? AND (r.turn_uid IS NULL OR t.status='completed')
+                ORDER BY r.id
+                """,
+                (card_id,),
+            ).fetchall()
+            events = [
+                {"id": int(row[0]), "source_type": str(row[1] or "conversation"), "content": str(row[2] or ""), "created_at": str(row[3] or ""), "event_time": str(row[4] or "")}
+                for row in rows
+            ]
+            summary, questions, tool_summary = event_summary(events)
+            completed = conn.execute(
+                "SELECT COUNT(*),MAX(completed_at) FROM turns WHERE subject_id=? AND profile_id=? AND workspace_id=? AND origin_agent_id=? AND external_session_id=? AND status='completed'",
+                (sid, profile, workspace, agent, session_id),
+            ).fetchone()
+            conn.execute(
+                """
+                UPDATE session_cards SET source_event_ids=?,summary=?,tool_summary=?,open_questions=?,
+                    completed_turn_count=?,last_completed_turn_at=?,summary_visibility='workspace',detail_visibility='workspace',
+                    summary_generation=summary_generation+1,summary_dirty=0,updated_at=? WHERE id=?
+                """,
+                (
+                    json.dumps([event["id"] for event in events][-200:], ensure_ascii=False), summary, tool_summary,
+                    json.dumps(questions, ensure_ascii=False), int(completed[0] or 0), str(completed[1] or "") or None,
+                    now, card_id,
+                ),
+            )
+            updated.append({"card_id": int(card_id), "session_id": str(session_id), "event_count": len(events), "completed_turns": int(completed[0] or 0)})
+        conn.commit()
+        return {"status": "ok", "cards": updated}
+    finally:
+        conn.close()
+
+
 def main() -> None:
     args = parse_args()
     emit(build_cards(store_root(args.store), subject_id=args.subject_id, session_id=args.session_id, min_events=max(1, args.min_events), max_events=max(1, args.max_events), force=args.force, dry_run=args.dry_run, event_start_id=args.event_start_id, event_end_id=args.event_end_id, profile_id=args.profile_id, workspace_id=args.workspace_id, origin_agent_id=args.agent_id or None))

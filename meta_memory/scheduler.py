@@ -25,14 +25,14 @@ def _key(config: AppConfig) -> str:
 
 def _task_names(config: AppConfig) -> dict[str, str]:
     suffix = _key(config)
-    return {"maintain": f"Meta Memory Maintain {suffix}", "dream": f"Meta Memory Dream {suffix}"}
+    return {"maintain": f"Meta Memory Dream Heartbeat {suffix}", "dream": f"Meta Memory Dream Deep {suffix}"}
 
 
 def _enabled_actions(config: AppConfig) -> list[str]:
     actions: list[str] = []
-    if config.maintenance_enabled:
+    if bool(getattr(config, "dream_heartbeat_enabled", config.maintenance_enabled)):
         actions.append("maintain")
-    if config.dream_enabled:
+    if bool(getattr(config, "dream_deep_enabled", config.dream_enabled)):
         actions.append("dream")
     return actions
 
@@ -46,9 +46,9 @@ def _windows_task_command(launcher: Path, action: str) -> str:
 def _linux_block(config: AppConfig, launcher: Path) -> str:
     rows = [_BEGIN]
     command = shlex.quote(str(launcher))
-    if config.maintenance_enabled:
-        rows.append(f"*/{max(1, int(config.maintenance_interval_minutes))} * * * * {command} maintain")
-    if config.dream_enabled:
+    if bool(getattr(config, "dream_heartbeat_enabled", config.maintenance_enabled)):
+        rows.append(f"*/{max(1, int(getattr(config, 'dream_heartbeat_interval_minutes', config.maintenance_interval_minutes)))} * * * * {command} maintain")
+    if bool(getattr(config, "dream_deep_enabled", config.dream_enabled)):
         hour, minute = _dream_time(config)
         rows.append(f"{minute} {hour} * * * {command} dream")
     rows.append(_END)
@@ -57,7 +57,7 @@ def _linux_block(config: AppConfig, launcher: Path) -> str:
 
 def _dream_time(config: AppConfig) -> tuple[int, int]:
     try:
-        hour, minute = (int(part) for part in str(config.dream_schedule).split(":", 1))
+        hour, minute = (int(part) for part in str(getattr(config, "dream_deep_schedule", config.dream_schedule)).split(":", 1))
     except (TypeError, ValueError) as exc:
         raise ValueError("dream.schedule must be HH:MM.") from exc
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
@@ -80,7 +80,7 @@ def _mac_plist(config: AppConfig, label: str, action: str, launcher: Path) -> di
         "RunAtLoad": False,
     }
     if action == "maintain":
-        data["StartInterval"] = max(60, int(config.maintenance_interval_minutes) * 60)
+        data["StartInterval"] = max(60, int(getattr(config, "dream_heartbeat_interval_minutes", config.maintenance_interval_minutes)) * 60)
     else:
         hour, minute = _dream_time(config)
         data["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
@@ -98,7 +98,7 @@ def schedule_install(config: AppConfig) -> dict[str, object]:
         for action in actions:
             args = ["schtasks", "/Create", "/F", "/TN", _task_names(config)[action], "/SC"]
             if action == "maintain":
-                args.extend(["MINUTE", "/MO", str(max(1, int(config.maintenance_interval_minutes)))])
+                args.extend(["MINUTE", "/MO", str(max(1, int(getattr(config, "dream_heartbeat_interval_minutes", config.maintenance_interval_minutes))))])
             else:
                 hour, minute = _dream_time(config)
                 args.extend(["DAILY", "/ST", f"{hour:02d}:{minute:02d}"])

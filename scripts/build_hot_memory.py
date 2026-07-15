@@ -81,7 +81,7 @@ def _content_hash(parts: dict[str, str]) -> str:
     return hashlib.sha256("".join(parts[name] for name in ("USER.md","AGENT.md","CURRENT.md")).encode("utf-8")).hexdigest()
 
 
-def build_hot_memory(root: Path, *, subject_id: str, profile_id: str = "default", workspace_id: str = "default", agent_id: str = "", force: bool = False) -> dict[str, object]:
+def build_hot_memory(root: Path, *, subject_id: str, profile_id: str = "default", workspace_id: str = "default", agent_id: str = "", force: bool = False, generation: int | None = None) -> dict[str, object]:
     claims = _eligible_claims(root, subject_id, profile_id=profile_id, workspace_id=workspace_id, agent_id=agent_id)
     for claim in claims: claim["score"] = hot_memory_score(claim)
     claims.sort(key=lambda item: (float(item["score"]), float(item["importance"])), reverse=True)
@@ -96,41 +96,49 @@ def build_hot_memory(root: Path, *, subject_id: str, profile_id: str = "default"
     rendered = {"USER.md": _render("Core User Memory", user, int(get("hot_memory.user_max_chars"))), "AGENT.md": _render("Agent Operating Principles", agent, int(get("hot_memory.agent_max_chars"))), "CURRENT.md": _render("Current Priorities", current, int(get("hot_memory.current_max_chars")))}
     texts = {name: pair[0] for name, pair in rendered.items()}; ids = [claim_id for _, claim_ids in rendered.values() for claim_id in claim_ids]; digest = _content_hash(texts)
     conn = open_db(root)
-    previous = conn.execute("SELECT snapshot_uid, content_hash FROM hot_snapshots WHERE workspace_id=? AND profile_id=? AND subject_id=? AND agent_id=? AND session_id='' ORDER BY created_at DESC LIMIT 1", (workspace_id, profile_id, subject_id, agent_id)).fetchone()
+    target_generation = int(generation) if generation is not None else int((conn.execute("SELECT claim_generation FROM workspace_runtime_state WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=?", (profile_id, workspace_id, subject_id, agent_id)).fetchone() or [0])[0] or 0)
+    previous = conn.execute("SELECT snapshot_uid, content_hash, generation FROM hot_snapshots WHERE workspace_id=? AND profile_id=? AND subject_id=? AND agent_id=? AND session_id='' ORDER BY created_at DESC LIMIT 1", (workspace_id, profile_id, subject_id, agent_id)).fetchone()
     if previous and str(previous[1]) == digest and not force:
-        conn.execute("UPDATE hot_snapshots SET last_checked_at=? WHERE snapshot_uid=?", (utc_now(), previous[0])); conn.commit(); conn.close()
-        return {"snapshot_uid": str(previous[0]), "content_hash": digest, "changed": False, "scope": str(hot_scope_dir(root, workspace_id=workspace_id, profile_id=profile_id, subject_id=subject_id, agent_id=agent_id)), "source_claim_ids": ids}
+        conn.execute("UPDATE hot_snapshots SET last_checked_at=?,generation=?,refreshed_at=? WHERE snapshot_uid=?", (utc_now(), target_generation, utc_now(), previous[0])); conn.commit(); conn.close()
+        return {"snapshot_uid": str(previous[0]), "content_hash": digest, "changed": False, "generation": target_generation, "scope": str(hot_scope_dir(root, workspace_id=workspace_id, profile_id=profile_id, subject_id=subject_id, agent_id=agent_id)), "source_claim_ids": ids}
     # The canonical snapshot is mutable and unique per scope. Frozen session
     # snapshots are copied into their own rows, so this never changes a
     # conversation that has already been prepared.
     uid = str(previous[0]) if previous else str(uuid.uuid4())
     if previous:
-        conn.execute("UPDATE hot_snapshots SET content_hash=?, user_text=?, agent_text=?, current_text=?, source_claim_ids=?, created_at=?, last_checked_at=? WHERE snapshot_uid=?", (digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False), utc_now(), utc_now(), uid))
+        conn.execute("UPDATE hot_snapshots SET content_hash=?, user_text=?, agent_text=?, current_text=?, source_claim_ids=?, generation=?, refreshed_at=?, created_at=?, last_checked_at=? WHERE snapshot_uid=?", (digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False), target_generation, utc_now(), utc_now(), utc_now(), uid))
     else:
-        conn.execute("INSERT INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, agent_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids) VALUES(?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)", (uid, workspace_id, profile_id, subject_id, agent_id, digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False)))
+        conn.execute("INSERT INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, agent_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids, generation, refreshed_at) VALUES(?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)", (uid, workspace_id, profile_id, subject_id, agent_id, digest, texts["USER.md"], texts["AGENT.md"], texts["CURRENT.md"], json.dumps(ids, ensure_ascii=False), target_generation, utc_now()))
     conn.commit(); conn.close()
     directory = hot_scope_dir(root, workspace_id=workspace_id, profile_id=profile_id, subject_id=subject_id, agent_id=agent_id)
     for name, text in texts.items():
         path = directory / name
         if force or not path.exists() or path.read_text(encoding="utf-8") != text: _atomic_write(path, text)
-    snapshot = {"schema_version":2,"snapshot_uid":uid,"workspace_id":workspace_id,"profile_id":profile_id,"subject_id":subject_id,"agent_id":agent_id,"content_hash":digest,"source_claim_ids":ids,"budgets":{"USER.md":int(get("hot_memory.user_max_chars")),"AGENT.md":int(get("hot_memory.agent_max_chars")),"CURRENT.md":int(get("hot_memory.current_max_chars"))}}
+    snapshot = {"schema_version":2,"snapshot_uid":uid,"workspace_id":workspace_id,"profile_id":profile_id,"subject_id":subject_id,"agent_id":agent_id,"content_hash":digest,"generation":target_generation,"source_claim_ids":ids,"budgets":{"USER.md":int(get("hot_memory.user_max_chars")),"AGENT.md":int(get("hot_memory.agent_max_chars")),"CURRENT.md":int(get("hot_memory.current_max_chars"))}}
     _atomic_write(directory / "snapshot.json", json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
     return {**snapshot,"changed":True,"scope":str(directory)}
 
 
 def freeze_hot_snapshot(root: Path, *, internal_session_id: str, subject_id: str, profile_id: str = "default", workspace_id: str = "default", agent_id: str = "", policy: str = "frozen") -> dict[str, object]:
     conn = open_db(root)
-    row = conn.execute("SELECT s.hot_snapshot_uid, s.hot_snapshot_hash FROM sessions s JOIN hot_snapshots h ON h.snapshot_uid=s.hot_snapshot_uid WHERE s.session_id=? AND s.subject_id=? AND s.workspace_id=? AND s.profile_id=? AND h.agent_id=?", (internal_session_id, subject_id, workspace_id, profile_id, agent_id)).fetchone()
-    if policy in {"frozen", "manual"} and row and row[0]:
+    row = conn.execute("SELECT s.hot_snapshot_uid, s.hot_snapshot_hash, s.hot_generation FROM sessions s JOIN hot_snapshots h ON h.snapshot_uid=s.hot_snapshot_uid WHERE s.session_id=? AND s.subject_id=? AND s.workspace_id=? AND s.profile_id=? AND h.agent_id=?", (internal_session_id, subject_id, workspace_id, profile_id, agent_id)).fetchone()
+    state = conn.execute("SELECT hot_generation FROM workspace_runtime_state WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=?", (profile_id, workspace_id, subject_id, agent_id)).fetchone()
+    canonical_agent = agent_id
+    if state is None and agent_id:
+        canonical_agent = ""
+        state = conn.execute("SELECT hot_generation FROM workspace_runtime_state WHERE profile_id=? AND workspace_id=? AND subject_id=? AND agent_id=''", (profile_id, workspace_id, subject_id)).fetchone()
+    canonical_generation = int(state[0] or 0) if state else 0
+    if policy in {"frozen", "manual"} and row and row[0] and int(row[2] or 0) >= canonical_generation:
         uid = str(row[0]); conn.close(); return load_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, snapshot_uid=uid)
     conn.close()
-    latest = build_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, agent_id=agent_id)
+    latest = build_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, agent_id=canonical_agent, generation=canonical_generation)
     uid = str(latest["snapshot_uid"])
     conn = open_db(root)
-    source = conn.execute("SELECT user_text, agent_text, current_text, source_claim_ids FROM hot_snapshots WHERE snapshot_uid=?", (uid,)).fetchone()
+    source = conn.execute("SELECT user_text, agent_text, current_text, source_claim_ids, generation FROM hot_snapshots WHERE snapshot_uid=?", (uid,)).fetchone()
     session_uid = str(uuid.uuid4())
-    conn.execute("INSERT OR REPLACE INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, agent_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (session_uid, workspace_id, profile_id, subject_id, agent_id, internal_session_id, latest["content_hash"], *source))
-    conn.execute("UPDATE sessions SET hot_snapshot_uid=?, hot_snapshot_hash=?, hot_snapshot_created_at=? WHERE session_id=?", (session_uid, latest["content_hash"], utc_now(), internal_session_id)); conn.commit(); conn.close()
+    generation = int(source[4] or canonical_generation) if source else canonical_generation
+    conn.execute("INSERT OR REPLACE INTO hot_snapshots(snapshot_uid, workspace_id, profile_id, subject_id, agent_id, session_id, content_hash, user_text, agent_text, current_text, source_claim_ids, generation, refreshed_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (session_uid, workspace_id, profile_id, subject_id, agent_id, internal_session_id, latest["content_hash"], *source[:4], generation, utc_now()))
+    conn.execute("UPDATE sessions SET hot_snapshot_uid=?, hot_snapshot_hash=?, hot_snapshot_created_at=?, hot_generation=? WHERE session_id=?", (session_uid, latest["content_hash"], utc_now(), generation, internal_session_id)); conn.commit(); conn.close()
     return load_hot_memory(root, subject_id=subject_id, profile_id=profile_id, workspace_id=workspace_id, snapshot_uid=session_uid)
 
 
