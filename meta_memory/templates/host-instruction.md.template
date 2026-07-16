@@ -1,6 +1,8 @@
 <!-- meta-memory:begin -->
-For every user turn, use the installed Meta Memory Skill for `{{ agent_id }}`.
-Its launcher is `{{ launcher_path }}` and it uses `{{ config_path }}`. Recall
-with `before`, draft and save the complete answer with `after` **before**
-sending that same draft to the user.
+Use the installed Meta Memory Skill for `{{ agent_id }}` on every user turn.
+Its launcher path is `{{ launcher_path }}` and its configuration is `{{ config_path }}`.
+Use the generated Skill's invocation matching this host's actual shell.
+Follow the strict order: `before` → draft the exact final answer → `after` →
+send. Send after `ok` or `spooled` only; a semantic `after` error is not a
+spooled retry and must be resolved before sending.
 <!-- meta-memory:end -->

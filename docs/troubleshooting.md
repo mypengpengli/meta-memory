@@ -28,6 +28,11 @@ asks for it.  A long running Agent operation should use `turn touch <id>`;
 finished work can use the explicit late-completion/reopen lifecycle rather than
 creating a second, duplicate Turn.
 
+Only an `after` result with `status: spooled` is a deferred, replayable
+completion. A missing/wrong Turn, wrong Agent, or changed answer is a semantic
+lifecycle error, not a spool condition; preserve the answer and resolve it
+before sending. See [Agent integration](agent-integration.md).
+
 ## It recalled the wrong project or did not continue prior work
 
 ```bash

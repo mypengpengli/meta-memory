@@ -24,7 +24,7 @@ meta-memory project current
 
 ## 日常对话如何记忆
 
-已经接入的 Agent 会在回答前运行 `before`、在答复发出前运行 `after`。通常不需要手动调用它们。
+已接入且宿主已加载生成 Skill 的 Agent 会在回答前运行 `before`、在答复发出前运行 `after`。安装检查不等于宿主每回合已执行；用一次真实回合后的 `agent status --all --verbose` 确认，并见 [Agent 接入契约](agent-integration.md)。
 
 明确、稳定而且希望长期保留的信息，可以直接写入：
 

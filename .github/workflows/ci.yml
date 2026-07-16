@@ -19,6 +19,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install .
       - run: meta-memory --help
+      - name: Smoke installed package outside the checkout
+        run: python tests/installed_package_smoke.py
       - run: python -m unittest discover -s tests -v
       - run: python scripts/init_memory_store.py --store test-store
       - run: python scripts/seed_evaluation_store.py --store test-store

@@ -172,7 +172,7 @@ def structured_fields(text: str, topic_hint: str, domain_hint: str) -> dict[str,
 
 def optional_llm_units(content: str, raw_event_id: int) -> list[dict[str, object]]:
     if not re.search(r"[。！？!?].+[。！？!?]|\b(?:but|however|previously|now|if)\b|以前|现在|如果|但是", content, re.I): return []
-    try: response = complete((Path(__file__).resolve().parent.parent / "prompts" / "extract_memory_units.md").read_text(encoding="utf-8"), {"raw_event_id":raw_event_id,"content":content}) or {}
+    try: response = complete((Path(__file__).resolve().parent / "resources" / "extract_memory_units.md").read_text(encoding="utf-8"), {"raw_event_id":raw_event_id,"content":content}) or {}
     except Exception: return []
     values = response.get("units") if isinstance(response, dict) else None
     return [item for item in values or [] if isinstance(item,dict) and item.get("source_event_ids")==[raw_event_id] and str(item.get("claim_text") or "").strip() and str(item.get("predicate") or "").strip()][:12]
@@ -188,7 +188,7 @@ def optional_llm_units_batch(events: list[dict[str, object]]) -> dict[int, list[
     if not complex_events:
         return {}
     try:
-        prompt = (Path(__file__).resolve().parent.parent / "prompts" / "extract_memory_units.md").read_text(encoding="utf-8")
+        prompt = (Path(__file__).resolve().parent / "resources" / "extract_memory_units.md").read_text(encoding="utf-8")
         response = complete(prompt, {"events": complex_events, "batch": True}) or {}
     except Exception:
         return {}

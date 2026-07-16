@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig, load_config, save_config, slug
+from .legacy import bootstrap
 
 
 AGENTS = ["claude-code", "codex", "openclaw", "custom", "all"]
@@ -24,6 +25,7 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
             and "%(default)" not in text
             and default is not None
             and default is not False
+            and default != ""
             and default is not argparse.SUPPRESS
             and bool(action.option_strings)
         ):
@@ -103,9 +105,15 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
     unknown = [item for item in agents if item not in AGENTS]
     if unknown:
         raise ValueError(f"Unsupported Agent selection: {', '.join(unknown)}")
+    custom_options = bool(args.skill_dir or args.agent_id or args.host_file or args.no_host_file)
+    if custom_options and "custom" not in agents:
+        raise ValueError("--skill-dir, --agent-id, --host-file and --no-host-file require --agents custom.")
     config.user_name = name
     config.user_id = slug(name, "user")
-    config.store = Path(store).expanduser()
+    # A generated launcher can run from any Agent project directory. Persist
+    # one absolute path now so a relative setup argument never creates a new
+    # memory store merely because the host's cwd changed.
+    config.store = Path(store).expanduser().resolve()
     config.maintenance_enabled = _yn(maintenance)
     config.dream_enabled = _yn(dream_enabled)
     config.dream_heartbeat_enabled = config.maintenance_enabled
@@ -124,13 +132,44 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
         custom_host_file=args.host_file,
         no_host_file=args.no_host_file,
     ) if agents else []
-    scheduling = install_schedule(config) if (config.maintenance_enabled or config.dream_enabled) and not args.no_schedule else {"status": "skipped", "reason": "not selected"}
+    schedule_selected = (config.maintenance_enabled or config.dream_enabled) and not args.no_schedule
+    if schedule_selected:
+        try:
+            scheduling = install_schedule(config)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # Configuration, store initialization, and Agent installation have
+            # already succeeded.  Keep that useful work and surface scheduler
+            # permissions/platform problems as a recoverable setup action.
+            scheduling = {
+                "status": "error",
+                "error": str(exc),
+                "next_action": "meta-memory schedule install",
+            }
+    else:
+        scheduling = {"status": "skipped", "reason": "not selected"}
     no_agent = not installed
+    agent_issues = [
+        item for item in installed
+        if str(item.get("status") or "ok") not in {"ok", "ready"}
+    ]
+    schedule_issue = str(scheduling.get("status") or "") == "error"
+    next_action = None
+    warning = None
+    if no_agent:
+        next_action = "meta-memory install-agent codex"
+        warning = "No Agent integration was installed."
+    elif agent_issues:
+        first = agent_issues[0]
+        next_action = str(first.get("next_action") or f"meta-memory agent verify {first.get('agent') or first.get('agent_id') or ''}").strip()
+        warning = str(first.get("manual_next_step") or "One or more Agent integrations need attention.")
+    elif schedule_issue:
+        next_action = "meta-memory schedule install"
+        warning = "The core runtime and Agent integration were installed, but background scheduling needs attention."
     return {
-        "status": "needs_action" if no_agent else "ok", "config": str(config.path), "store": initialized,
+        "status": "needs_action" if no_agent or agent_issues or schedule_issue else "ok", "config": str(config.path), "store": initialized,
         "agents": installed, "schedule": scheduling, "doctor": doctor(config.store),
-        "next_action": "meta-memory install-agent codex" if no_agent else None,
-        "warning": "No Agent integration was installed." if no_agent else None,
+        "next_action": next_action,
+        "warning": warning,
     }
 
 
@@ -168,8 +207,8 @@ Discover a command:
     setup.add_argument("--maintenance", choices=["yes", "no"], help="Enable the incremental background heartbeat")
     setup.add_argument("--dream", choices=["yes", "no"], help="Enable the daily deep Dream report")
     setup.add_argument("--agents", nargs="*", choices=AGENTS, help="Agents to connect now, for example: codex claude-code")
-    setup.add_argument("--skill-dir", help="Skill directory for a custom Agent")
-    setup.add_argument("--agent-id", help="Stable id for a custom Agent")
+    setup.add_argument("--skill-dir", help="Parent Skill directory required with --agents custom")
+    setup.add_argument("--agent-id", help="Stable lowercase id required with --agents custom")
     setup.add_argument("--no-schedule", action="store_true", help="Save setup without installing background tasks")
     setup.add_argument("--non-interactive", action="store_true", help="Use defaults instead of prompts")
     setup_host = setup.add_mutually_exclusive_group()
@@ -177,8 +216,13 @@ Discover a command:
     setup_host.add_argument("--no-host-file", action="store_true", help="Do not modify a host instruction file")
 
     install = commands.add_parser("install-agent", help="Install the Meta Memory Skill for one or more Agents")
-    install.add_argument("agent", nargs="*", choices=AGENTS); install.add_argument("--all", action="store_true"); install.add_argument("--skill-dir"); install.add_argument("--agent-id")
-    install_host = install.add_mutually_exclusive_group(); install_host.add_argument("--host-file"); install_host.add_argument("--no-host-file", action="store_true")
+    install.add_argument("agent", nargs="*", choices=AGENTS, help="Built-in Agent name, custom, or all detected built-ins")
+    install.add_argument("--all", action="store_true", help="Install every detected built-in Agent")
+    install.add_argument("--skill-dir", help="Parent Skill directory required by a custom Agent")
+    install.add_argument("--agent-id", help="Stable lowercase id required by a custom Agent")
+    install_host = install.add_mutually_exclusive_group()
+    install_host.add_argument("--host-file", help="Host instruction file to update for a custom Agent")
+    install_host.add_argument("--no-host-file", action="store_true", help="Generate the Skill without modifying a host instruction file")
 
     project = commands.add_parser("project", help="Bind the current directory to a project")
     project_commands = project.add_subparsers(dest="project_command", required=True)
@@ -195,10 +239,25 @@ Discover a command:
     project_stats_cmd.add_argument("--project", default="auto"); project_stats_cmd.add_argument("--cwd")
 
     before_cmd = commands.add_parser("before", help="Load bounded relevant context before answering")
-    before_cmd.add_argument("--project", default="auto"); before_cmd.add_argument("--session", default="auto"); before_cmd.add_argument("--turn", default=""); before_cmd.add_argument("--query"); before_cmd.add_argument("--query-file"); before_cmd.add_argument("--cwd")
+    before_cmd.add_argument("--project", default="auto", help="Project name, or auto for the current directory")
+    before_cmd.add_argument("--session", default="auto", help="Session id, or auto for a local rotating session")
+    before_cmd.add_argument("--turn", default="", help="Optional caller-supplied stable turn id")
+    before_query = before_cmd.add_mutually_exclusive_group(required=True)
+    before_query.add_argument("--query", help="User request text")
+    before_query.add_argument("--query-file", help="UTF-8 file containing the exact user request")
+    before_cmd.add_argument("--cwd", help="Directory used to resolve an automatic project")
 
     after_cmd = commands.add_parser("after", help="Finish a durable turn with the assistant draft before sending it")
-    after_cmd.add_argument("--turn", default=""); after_cmd.add_argument("--project", default="auto"); after_cmd.add_argument("--session", default=""); after_cmd.add_argument("--user"); after_cmd.add_argument("--user-file"); after_cmd.add_argument("--assistant"); after_cmd.add_argument("--assistant-file"); after_cmd.add_argument("--cwd")
+    after_cmd.add_argument("--turn", default="", help="Turn id returned by before (recommended)")
+    after_cmd.add_argument("--project", default="auto", help="Project name used only by the legacy after form")
+    after_cmd.add_argument("--session", default="", help="Session id used only by the legacy after form")
+    after_user = after_cmd.add_mutually_exclusive_group()
+    after_user.add_argument("--user", help="Legacy inline user request")
+    after_user.add_argument("--user-file", help="Legacy UTF-8 user-request file")
+    after_answer = after_cmd.add_mutually_exclusive_group(required=True)
+    after_answer.add_argument("--assistant", help="Exact final answer text")
+    after_answer.add_argument("--assistant-file", help="UTF-8 file containing the exact unsent final answer")
+    after_cmd.add_argument("--cwd", help="Directory used only by the legacy after form")
 
     remember_cmd = commands.add_parser("remember", help="Explicitly save a sourced memory")
     remember_cmd.add_argument("--project", default="auto"); remember_cmd.add_argument("--session", default="auto"); remember_cmd.add_argument("--scope", choices=["auto", "user", "project"], default="auto"); remember_cmd.add_argument("--source-kind", choices=["user", "agent-observation", "tool-result", "resource"], default="user", help=argparse.SUPPRESS); remember_cmd.add_argument("--source-ref", default="", help=argparse.SUPPRESS); remember_cmd.add_argument("--title", default=""); remember_cmd.add_argument("--content"); remember_cmd.add_argument("--content-file"); remember_cmd.add_argument("--cwd")
@@ -260,17 +319,25 @@ Discover a command:
     agent_cmd = commands.add_parser("agent", help="Inspect or verify a local Agent integration")
     agent_commands = agent_cmd.add_subparsers(dest="agent_command", required=True)
     agent_status_cmd = agent_commands.add_parser("status", help="Show current Agent runtime status")
-    agent_status_cmd.add_argument("--all", action="store_true"); agent_status_cmd.add_argument("--project", default="auto"); agent_status_cmd.add_argument("--cwd"); agent_status_cmd.add_argument("--verbose", action="store_true")
+    agent_status_cmd.add_argument("--all", action="store_true", help="Show all installed, detected, or runtime-observed Agents")
+    agent_status_cmd.add_argument("--project", default="auto", help="Project whose lifecycle activity should be checked")
+    agent_status_cmd.add_argument("--cwd", help="Directory used to resolve an automatic project")
+    agent_status_cmd.add_argument("--verbose", action="store_true", help="Include paths, verification scope, and runtime details")
     agent_verify_cmd = agent_commands.add_parser("verify", help="Verify one installed Agent launcher and shared runtime")
-    agent_verify_cmd.add_argument("agent_id"); agent_verify_cmd.add_argument("--project", default="auto"); agent_verify_cmd.add_argument("--cwd")
+    agent_verify_cmd.add_argument("agent_id", help="Installed Agent id")
+    agent_verify_cmd.add_argument("--project", default="auto", help="Project whose lifecycle activity should be reported")
+    agent_verify_cmd.add_argument("--cwd", help="Directory used to resolve an automatic project")
     agent_sync_cmd = agent_commands.add_parser("sync", help="Regenerate installed Agent integrations from the current contract")
-    agent_sync_cmd.add_argument("agents", nargs="*"); agent_sync_cmd.add_argument("--all", action="store_true"); agent_sync_cmd.add_argument("--no-verify", action="store_true")
+    agent_sync_cmd.add_argument("agents", nargs="*", help="Installed Agent ids to refresh")
+    agent_sync_cmd.add_argument("--all", action="store_true", help="Refresh every registered Agent")
+    agent_sync_cmd.add_argument("--no-verify", action="store_true", help="Regenerate files without probing launchers")
     agent_repair_cmd = agent_commands.add_parser("repair", help="Alias for agent sync")
     agent_repair_cmd.add_argument("agents", nargs="*"); agent_repair_cmd.add_argument("--all", action="store_true"); agent_repair_cmd.add_argument("--no-verify", action="store_true")
     agent_uninstall_cmd = agent_commands.add_parser("uninstall", help="Remove one managed Agent integration")
     agent_uninstall_cmd.add_argument("agent_id")
     agent_upgrade_cmd = agent_commands.add_parser("upgrade-status", help="Check Skill/launcher contract and template freshness")
-    agent_upgrade_cmd.add_argument("agent_id", nargs="?"); agent_upgrade_cmd.add_argument("--all", action="store_true")
+    agent_upgrade_cmd.add_argument("agent_id", nargs="?", help="Installed Agent id; omitted means the default selection")
+    agent_upgrade_cmd.add_argument("--all", action="store_true", help="Check every registered Agent")
     config_cmd = commands.add_parser("config", help="Read or update supported local runtime configuration")
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_get = config_commands.add_parser("get", help="Read one supported configuration key"); config_get.add_argument("key")
@@ -418,7 +485,22 @@ Discover a command:
     _set_help(setup, description="Create or save the local configuration, optionally install Agent Skills, and install enabled schedules.", examples="""Examples:
   meta-memory setup --agents codex
   meta-memory setup --name Ada --agents codex claude-code
+  meta-memory setup --agents custom --agent-id my-agent --skill-dir ~/.my-agent/skills --no-host-file
   meta-memory setup --non-interactive --no-schedule
+""")
+    _set_help(install, description="Generate an Agent-specific Skill and launcher. Built-ins have known paths; any compatible local CLI Agent can use the custom form.", examples="""Examples:
+  meta-memory install-agent codex
+  meta-memory install-agent --all
+  meta-memory install-agent custom --agent-id my-agent --skill-dir ~/.my-agent/skills --no-host-file
+  meta-memory install-agent custom --agent-id my-agent --skill-dir ~/.my-agent/skills --host-file ~/.my-agent/AGENTS.md
+""")
+    _set_help(before_cmd, description="Begin and durably record a Turn, then return bounded relevant context. Agent integrations must run this before drafting.", examples="""Examples:
+  meta-memory before --query "What did we decide?"
+  meta-memory before --query-file request.txt --turn stable-turn-id
+""")
+    _set_help(after_cmd, description="Persist the exact completed draft for the Turn before it is sent. Reuse the turn id returned by before.", examples="""Examples:
+  meta-memory after --turn <turn-id> --assistant-file response.txt
+  meta-memory after --turn <turn-id> --assistant "Exact final answer"
 """)
     _set_help(overview_cmd, description="Show the current project, setup readiness, memory queue, recent activity, and exact next commands.", examples="""Examples:
   meta-memory overview
@@ -444,6 +526,18 @@ Discover a command:
   meta-memory agent status --all --verbose
   meta-memory agent upgrade-status --all
   meta-memory agent sync --all
+""")
+    _set_help(agent_status_cmd, description="Separate installation files, launcher verification, contract freshness, and observed before/after activity for one project.", examples="""Examples:
+  meta-memory agent status --all --verbose
+  meta-memory agent status --all --project my-project
+""")
+    _set_help(agent_verify_cmd, description="Run the generated launcher against the shared config and store. This does not prove the host loaded the Skill; complete a real Agent turn to verify activation.", examples="""Examples:
+  meta-memory agent verify codex
+  meta-memory agent verify my-agent --project my-project
+""")
+    _set_help(agent_sync_cmd, description="Regenerate Skills and launchers from the installed package. Use after an upgrade, Python move, or contract change.", examples="""Examples:
+  meta-memory agent sync --all
+  meta-memory agent sync codex my-agent
 """)
     _set_help(dream, description="Dream consolidates completed work. Heartbeat is lightweight; deep synthesis is an auditable report and supports preview.", examples="""Examples:
   meta-memory dream heartbeat
@@ -475,6 +569,11 @@ Discover a command:
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
+    # Public CLI commands may import legacy-backed modules which use absolute
+    # imports such as ``from _common import ...``.  Keep this at the one
+    # dispatch boundary so programmatic callers and the console entry point
+    # both have the compatibility path before any command-specific import.
+    bootstrap()
     config = load_config(args.config)
     command = args.command
     if command in {"before", "after", "remember", "correct", "search", "history", "memory", "session", "overview", "status", "agent", "import", "resource", "turn", "recovery"}:
@@ -485,6 +584,9 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         agents = (["all"] if args.all else []) + list(args.agent or [])
         if not agents:
             raise ValueError("Provide an agent name or --all.")
+        custom_options = bool(args.skill_dir or args.agent_id or args.host_file or args.no_host_file)
+        if custom_options and "custom" not in agents:
+            raise ValueError("--skill-dir, --agent-id, --host-file and --no-host-file require install-agent custom.")
         installed = install_agents(
             agents,
             config=config,
@@ -493,7 +595,18 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             custom_host_file=args.host_file,
             no_host_file=args.no_host_file,
         )
-        return {"status": "ok" if installed else "needs_action", "installed": installed, "next_action": None if installed else "Name an Agent explicitly, e.g. meta-memory install-agent codex."}
+        issues = [item for item in installed if str(item.get("status") or "ok") != "ok"]
+        next_action = (
+            str(issues[0].get("next_action") or "meta-memory agent status --all --verbose")
+            if issues
+            else None if installed
+            else "Name an Agent explicitly, e.g. meta-memory install-agent codex."
+        )
+        return {
+            "status": "needs_action" if issues or not installed else "ok",
+            "installed": installed,
+            "next_action": next_action,
+        }
     if args.command == "project":
         from .project_detection import bind_project
         from .ux_projects import project_current, project_list, project_rename, project_stats, project_unbind
@@ -696,6 +809,11 @@ def _normalise_output_args(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Do this before parser/dispatch work so ``python -m meta_memory.cli`` and
+    # the installed ``meta-memory`` console entry share the same cold-start
+    # behavior.  ``bootstrap`` is idempotent, and ``dispatch`` repeats it for
+    # callers that use the dispatch API directly.
+    bootstrap()
     raw = list(sys.argv[1:] if argv is None else argv)
     # Launchers are commonly executed through ``cmd.exe`` while their caller
     # captures stdout as UTF-8.  Pin non-interactive output to UTF-8 before

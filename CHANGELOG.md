@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.7.0 — 2026-07-16
+
+### Portable Agent integrations
+
+- Made every installed CLI entry bootstrap packaged legacy modules before command dispatch, so commands work outside the source checkout without `PYTHONPATH`.
+- Added explicit integration lifecycle observability that separates generated files, verified launchers, and a host-observed `before`/`after` turn.
+- Strengthened the generated Skill contract for any compatible local CLI Agent with an exact `before → draft → after → send` protocol and precise failure handling.
+- Added a practical custom-Agent integration guide and corrected OpenAI Skill metadata to invoke `$meta-memory`.
+
+### Fresh-install confidence
+
+- Added an installed-package smoke test that runs the console command from an unrelated temporary directory and verifies packaged migrations, templates, launchers, lifecycle status, Doctor, and Overview.
+- Packaged the optional LLM prompts and legacy defaults as runtime resources instead of relying on source-checkout paths.
+- Made setup surface recoverable scheduler and integration problems as concrete next actions instead of presenting a partial installation as ready.
+
 ## 2.6.0 — 2026-07-15
 
 ### Daily-use closure

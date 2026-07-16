@@ -4,7 +4,7 @@
 
 Meta Memory gives your local AI agents a shared memory store without turning every conversation into an opaque database. It remembers durable facts and project decisions, keeps source evidence, lets you correct or retire a memory, and continuously consolidates completed work in the background.
 
-Useful companion documents: [practical operations](docs/operations.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
+Useful companion documents: [practical operations](docs/operations.md), [Agent integration](docs/agent-integration.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
 
 # 中文
 
@@ -63,7 +63,7 @@ source .venv/bin/activate
 meta-memory setup --agents codex
 ```
 
-它会询问名称和保存位置，然后会：保存配置、建立本地数据库、安装 Codex Skill，并默认安装 Heartbeat 与 Dream 的后台任务。要跳过后台任务可加 `--no-schedule`；以后随时可运行 `meta-memory schedule install`。
+它会询问名称和保存位置，然后会：保存配置、建立本地数据库、安装 Codex Skill 与专属 launcher，并默认安装 Heartbeat 与 Dream 的后台任务。要跳过后台任务可加 `--no-schedule`；以后随时可运行 `meta-memory schedule install`。
 
 也可以一次接入多个内置 Agent：
 
@@ -71,14 +71,20 @@ meta-memory setup --agents codex
 meta-memory setup --agents codex claude-code openclaw
 ```
 
-完成后重启对应的 Agent 会话，再检查：
+`setup` 完成本地文件和 launcher 验证后仍会返回 `NEEDS_ACTION`，这是有意的：
+安装器不能冒充宿主宣称 Skill 已经加载。重启对应的 Agent 会话，完成一个普通
+对话回合，再检查：
 
 ```powershell
 meta-memory overview
 meta-memory agent status --all --verbose
 ```
 
-看到 `READY` 表示配置、Agent 和已启用的后台任务都已就绪。看到 `NEEDS_SETUP` 或 `NEEDS_ACTION` 时，不需要猜原因：复制 Overview 的第一条推荐命令即可。
+看到 `READY` 表示本地配置、当前版本的 Skill/launcher、一次发生在本次安装之后
+的完整 `before/after` 回合，以及已启用的后台任务都已验证。`agent status
+--all --verbose` 中 `lifecycle_state: active`、`last_before` 和 `last_after` 会给出
+对应证据；它只能证明已经观察到真实回合，不能保证宿主未来永远不会关闭 Skill。
+看到 `NEEDS_SETUP` 或 `NEEDS_ACTION` 时，按 Overview 的推荐命令和手工激活说明执行。
 
 ### 3. 验证一次写入和找回
 
@@ -88,13 +94,13 @@ meta-memory search --project demo "SQLite"
 meta-memory memory recent --project demo
 ```
 
-`remember` 用于你明确希望长期保存的内容。正常接入的 Agent 会在对话中自动完成上下文读取与回合写回；不需要每次手动调用 `before`/`after`。
+`remember` 用于你明确希望长期保存的内容。已加载生成 Skill 的 Agent 会在对话中执行上下文读取与回合写回；如果宿主不支持本地 Skill 或命令执行，请按 [Agent 接入契约](docs/agent-integration.md) 手动集成严格的 `before`/`after` 流程。
 
 ## 日常怎么用
 
 ### 与已接入的 Agent 对话
 
-直接正常使用 Agent 即可。Meta Memory 会在回答前读取有限、相关的上下文；在回答完成后保存回合并把可长期复用的内容放入审核或整理流程。
+确认宿主已加载生成的 Skill 后，直接正常使用 Agent 即可。它会在回答前读取有限、相关的上下文；在回答完成后保存回合并把可长期复用的内容放入审核或整理流程。安装本身不等于宿主已启用每回合执行；验证方法见 [Agent 接入契约](docs/agent-integration.md)。
 
 遇到这些情况时再打开终端：
 
@@ -243,25 +249,18 @@ meta-memory <command> --help
 
 ## 给自定义 Agent 集成者
 
-普通用户不需要使用这一节。自定义 Agent 需要遵循真实的回合生命周期：先 `before`，把返回的 `turn_id` 保留到同一轮完成，再在把回答发给用户前调用 `after`。
+任何能加载本地 Skill、执行 launcher、保存同一回合 `turn_id` 并写 UTF-8
+临时文件的 CLI Agent 都可接入：
 
 ```powershell
-# 回答前：持久化用户请求并读取有限相关上下文。
-meta-memory before --project auto --session auto --query-file request.txt
-
-# 将上一步返回的 turn_id 和即将发送的完整回答写回。
-meta-memory after --turn <turn-id> --assistant-file response.txt
+meta-memory install-agent custom --agent-id my-cli-agent --skill-dir "$HOME/.my-agent/skills" --host-file "$HOME/.my-agent/AGENTS.md"
+meta-memory agent verify my-cli-agent
 ```
 
-`after` 只负责可靠落盘和排队，不在用户等待时执行重型整理。重复同一个 `turn_id` 和回答是安全的；暂时无法写入时会进入 spool，随后由 `maintain`、Heartbeat 或 `recovery replay` 处理。
-
-要安装一个自定义 Agent：
-
-```powershell
-meta-memory install-agent custom --agent-id hermes --skill-dir ~/.hermes/skills --host-file ~/.hermes/AGENTS.md
-```
-
-若宿主没有说明文件，改用 `--no-host-file`。安装器会生成固定 Python、配置和 Agent id 的 launcher；升级或移动环境后用 `meta-memory agent sync --all` 刷新。
+严格顺序始终是 `before → draft → after → send`。只有 `after` 返回 `ok` 或
+`spooled` 才发送原回答；`spooled` 是可重放的暂态失败，Turn/Agent 不匹配等
+语义错误则不能当作 spool，必须先修复。完整的能力判断、路径、custom 无说明
+文件接入、验证和恢复说明见 [Agent 接入契约](docs/agent-integration.md)。
 
 ## 工作原理（简版）
 
@@ -296,6 +295,10 @@ meta-memory overview
 
 `overview` is the home screen. It reports the active project, setup readiness, Agent integration, background schedules, pending work, recent activity, and copyable next commands.
 
+After setup, restart the Agent and complete one normal conversation. `NEEDS_ACTION`
+is expected until `agent status --all --verbose` observes a post-install
+`before`/`after` lifecycle; only then does Overview report `READY`.
+
 ## Everyday commands
 
 ```bash
@@ -317,7 +320,7 @@ meta-memory import notes.md --project auto
 meta-memory resource list
 ```
 
-Connected Agents normally perform the durable `before`/`after` lifecycle automatically. Custom integrations can use `meta-memory before --query-file request.txt`, retain the returned `turn_id`, then call `meta-memory after --turn <turn-id> --assistant-file response.txt` before sending that exact response.
+An installed Agent performs the durable lifecycle only when its host loads the generated Skill. The strict order is `before → draft → after → send`; send the exact response only after `ok` or a deferred `spooled` completion. See [Agent integration](docs/agent-integration.md) for custom installation, capability checks, and failure handling.
 
 ## Operations
 

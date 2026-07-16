@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,24 +21,111 @@ def _ready(config: AppConfig):
 
 
 def _agent_readiness(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Normalize the Agent status API into a small, actionable summary."""
-    installed = [row for row in rows if bool(row.get("installed"))]
-    usable = [
-        row for row in installed
-        if row.get("skill") == "ok" and row.get("launcher") == "ok"
-        and bool(row.get("shared_config")) and bool(row.get("shared_store"))
-    ]
-    broken = [row for row in installed if row not in usable]
-    if not installed:
+    """Normalize independent integration facts into an actionable summary.
+
+    A launcher pass is intentionally not enough for ``ready``.  The overview
+    becomes ready only after current integration files, a recorded launcher
+    verification, and a real completed host lifecycle have all been observed.
+    Missing newer fields default to the former ready semantics so third-party
+    callers that still supply the old minimal status shape remain compatible.
+    """
+
+    def name(row: dict[str, Any]) -> str:
+        return str(row.get("agent") or "unknown")
+
+    def files_present(row: dict[str, Any]) -> bool:
+        return bool(row.get("files_installed", row.get("installed")))
+
+    def partially_present(row: dict[str, Any]) -> bool:
+        return files_present(row) or str(row.get("installation_state") or "") == "partial"
+
+    def contract_current(row: dict[str, Any]) -> bool:
+        value = row.get("template_contract")
+        if isinstance(value, dict):
+            return bool(value.get("current", value.get("state") == "current"))
+        if "template_contract_current" in row:
+            return bool(row.get("template_contract_current"))
+        return True
+
+    def verification_current(row: dict[str, Any]) -> bool:
+        # Old callers did not report verification.  Treat their known-good
+        # launcher shape as compatible, while new status rows must be explicit.
+        if "launcher_verified" not in row:
+            return True
+        return bool(row.get("launcher_verified"))
+
+    def lifecycle(row: dict[str, Any]) -> str:
+        return str(row.get("lifecycle_state") or "active")
+
+    present = [row for row in rows if partially_present(row)]
+    installed = [row for row in present if files_present(row)]
+    names = [name(row) for row in present]
+    if not present:
         return {"status": "not_installed", "installed": 0, "usable": 0, "agents": []}
+
+    # A partial/manual copy without an installation registry cannot be
+    # repaired by ``agent sync --all`` because there is no recorded source
+    # path to regenerate. Report reinstall explicitly instead of offering a
+    # command that is guaranteed to do nothing.
+    unregistered = [
+        row for row in present
+        if isinstance(row.get("template_contract"), dict)
+        and str(row["template_contract"].get("state") or "") == "not_installed"
+    ]
+    if unregistered:
+        return {
+            "status": "needs_install", "installed": len(installed), "usable": 0,
+            "agents": names,
+            "needs_install": [name(row) for row in unregistered],
+            "reason": "partial_files_without_installation_registry",
+        }
+
+    broken = [
+        row for row in present
+        if not files_present(row)
+        or row.get("skill") != "ok" or row.get("launcher") != "ok"
+        or not bool(row.get("shared_config")) or not bool(row.get("shared_store"))
+        or not contract_current(row)
+    ]
     if broken:
         return {
-            "status": "needs_sync", "installed": len(installed), "usable": len(usable),
-            "agents": [str(row.get("agent") or "unknown") for row in installed],
+            "status": "needs_sync", "installed": len(installed), "usable": 0,
+            "agents": names,
+            "needs_sync": [name(row) for row in broken],
+            "reason": "integration_files_or_template_contract_not_current",
+        }
+
+    unverified = [row for row in installed if not verification_current(row)]
+    if unverified:
+        return {
+            "status": "needs_verification", "installed": len(installed), "usable": 0,
+            "agents": names, "needs_verification": [name(row) for row in unverified],
+            "reason": "launcher_not_verified",
+        }
+
+    errored = [row for row in installed if lifecycle(row) == "error"]
+    if errored:
+        return {
+            "status": "error", "installed": len(installed), "usable": 0,
+            "agents": names, "errors": [name(row) for row in errored],
+            "reason": "host_lifecycle_reported_error",
+        }
+
+    awaiting_activation = [row for row in installed if lifecycle(row) in {"never_seen", "before_only"}]
+    if awaiting_activation:
+        pending = [name(row) for row in awaiting_activation]
+        return {
+            "status": "needs_activation", "installed": len(installed), "usable": len(installed) - len(awaiting_activation),
+            "agents": names, "awaiting_activation": pending,
+            "manual_steps": [
+                "Start one real conversation through the listed Agent host so it runs the before/after lifecycle.",
+                "Then run meta-memory agent status --all --verbose and confirm lifecycle_state is active.",
+            ],
+            "reason": "awaiting_first_real_host_turn",
         }
     return {
-        "status": "ready", "installed": len(installed), "usable": len(usable),
-        "agents": [str(row.get("agent") or "unknown") for row in usable],
+        "status": "ready", "installed": len(installed), "usable": len(installed),
+        "agents": names,
     }
 
 
@@ -80,6 +168,19 @@ def _short_time(value: Any) -> str:
     return text.replace("+00:00", " UTC")
 
 
+def _at_or_after(value: Any, baseline: Any) -> bool:
+    if not value:
+        return False
+    if not baseline:
+        return True
+    try:
+        left = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        right = datetime.fromisoformat(str(baseline).replace("Z", "+00:00"))
+        return left >= right
+    except (TypeError, ValueError):
+        return str(value) >= str(baseline)
+
+
 def overview(
     config: AppConfig,
     *,
@@ -120,10 +221,31 @@ def overview(
             "SELECT COUNT(*) FROM resource_imports WHERE profile_id=? AND workspace_id=? AND subject_id=?",
             scope,
         ).fetchone()[0])
-        latest = conn.execute(
-            "SELECT last_before_at,last_after_at,last_error_message FROM agent_runtime_state WHERE profile_id=? AND workspace_id=? AND agent_id=?",
-            (config.profile_id, project.workspace_id, origin_agent_id(agent_id)),
-        ).fetchone()
+        requested_agent = str(agent_id or "").strip()
+        if requested_agent:
+            latest = conn.execute(
+                """
+                SELECT agent_id,last_before_at,last_after_at,last_error_at,last_error_message
+                FROM agent_runtime_state
+                WHERE profile_id=? AND workspace_id=? AND agent_id=?
+                LIMIT 1
+                """,
+                (config.profile_id, project.workspace_id, origin_agent_id(requested_agent)),
+            ).fetchone()
+        else:
+            # A terminal overview has no launcher identity. Show the most
+            # recently active real Agent instead of a permanently empty
+            # generic-agent row.
+            latest = conn.execute(
+                """
+                SELECT agent_id,last_before_at,last_after_at,last_error_at,last_error_message
+                FROM agent_runtime_state
+                WHERE profile_id=? AND workspace_id=?
+                ORDER BY max(coalesce(last_before_at,''),coalesce(last_after_at,''),coalesce(last_error_at,'')) DESC
+                LIMIT 1
+                """,
+                (config.profile_id, project.workspace_id),
+            ).fetchone()
     finally:
         conn.close()
 
@@ -159,7 +281,11 @@ def overview(
         agent_summary = {"status": "unknown", "installed": 0, "usable": 0, "agents": [], "error": agent_error}
     scheduler_summary = _scheduler_readiness(scheduler)
     config_exists = Path(config.path).expanduser().is_file()
-    last_error = str(latest[2] or "") if latest else ""
+    last_error = (
+        str(latest[4] or "")
+        if latest and latest[4] and _at_or_after(latest[3], latest[2])
+        else ""
+    )
     actions: list[dict[str, Any]] = []
 
     if spool:
@@ -174,6 +300,8 @@ def overview(
         actions.append(_action("run_heartbeat", "meta-memory dream heartbeat", "Process queued consolidation work now.", priority=50))
     if agent_summary["status"] == "unknown":
         actions.append(_action("inspect_agent_integration", "meta-memory agent status --all --verbose", "Inspect why the Agent integration could not be read.", priority=55))
+    elif agent_summary["status"] == "error":
+        actions.append(_action("inspect_agent_error", "meta-memory agent status --all --verbose", "Inspect the Agent lifecycle error before relying on automatic memory.", priority=55))
     if scheduler_summary["status"] == "unknown":
         actions.append(_action("inspect_schedule", "meta-memory schedule status", "Inspect why the local scheduler could not be read.", priority=55))
 
@@ -181,8 +309,24 @@ def overview(
         actions.append(_action("save_initial_setup", "meta-memory setup --agents codex", "Save configuration and connect your first Agent.", priority=60))
     elif agent_summary["status"] == "not_installed":
         actions.append(_action("install_agent", "meta-memory install-agent codex", "Connect an Agent so conversations use memory automatically.", priority=70))
+    elif agent_summary["status"] == "needs_install":
+        names = [str(name) for name in agent_summary.get("needs_install", [])]
+        builtin = {"codex", "claude-code", "openclaw"}
+        if names and all(name in builtin for name in names):
+            command = "meta-memory install-agent " + " ".join(names)
+            detail = "Reinstall the partially copied built-in Agent integration and recreate its registry."
+        else:
+            command = "meta-memory agent status --all --verbose"
+            detail = "Inspect the partial custom integration, then rerun install-agent custom with its original Skill path."
+        actions.append(_action("reinstall_agent", command, detail, priority=70))
     elif agent_summary["status"] == "needs_sync":
         actions.append(_action("sync_agent", "meta-memory agent sync --all", "Refresh an installed Agent integration after an upgrade or move.", priority=70))
+    elif agent_summary["status"] == "needs_verification":
+        names = [str(name) for name in agent_summary.get("needs_verification", [])]
+        command = f"meta-memory agent verify {names[0]}" if len(names) == 1 else "meta-memory agent verify <agent-id>"
+        actions.append(_action("verify_agent_launcher", command, "Verify each installed Agent launcher before its first real host turn.", priority=70))
+    elif agent_summary["status"] == "needs_activation":
+        actions.append(_action("activate_agent_lifecycle", "meta-memory agent status --all --verbose", "Start one real conversation through the Agent host, then confirm its lifecycle is active.", priority=70))
 
     # First-time setup installs enabled schedules by default, so presenting a
     # second schedule command before setup would be redundant and confusing.
@@ -190,9 +334,11 @@ def overview(
         actions.append(_action("install_schedule", "meta-memory schedule install", "Install enabled background heartbeat and Dream tasks.", priority=80))
 
     actions.sort(key=lambda item: (int(item["priority"]), str(item["code"])))
-    if last_error or agent_summary["status"] == "unknown" or scheduler_summary["status"] == "unknown":
+    if last_error or agent_summary["status"] in {"unknown", "error"} or scheduler_summary["status"] == "unknown":
         status = "degraded"
     elif spool or unfinished or inbox or review or projections:
+        status = "needs_action"
+    elif agent_summary["status"] in {"needs_verification", "needs_activation"}:
         status = "needs_action"
     elif not config_exists or agent_summary["status"] != "ready" or scheduler_summary["status"] == "not_installed":
         status = "needs_setup"
@@ -208,8 +354,10 @@ def overview(
             "pending_review_jobs": review, "pending_projections": projections, "pending_spool": spool,
         },
         "agent": {
-            "id": origin_agent_id(agent_id), "last_before": latest[0] if latest else None,
-            "last_after": latest[1] if latest else None, "last_error": last_error or None,
+            "id": str(latest[0]) if latest else origin_agent_id(agent_id),
+            "last_before": latest[1] if latest else None,
+            "last_after": latest[2] if latest else None,
+            "last_error": last_error or None,
         },
         "agents": agents,
         "dream": dream,
@@ -264,6 +412,10 @@ def human_text(value: Any) -> str:
         f"  last context load: {_short_time(agent.get('last_before'))}",
         f"  last saved reply: {_short_time(agent.get('last_after'))}",
     ]
+    manual_steps = agent_state.get("manual_steps") if isinstance(agent_state.get("manual_steps"), list) else []
+    if manual_steps:
+        lines.extend(["  Agent activation:"])
+        lines.extend(f"    - {step}" for step in manual_steps)
     actions = overview_value.get("actions") if isinstance(overview_value.get("actions"), list) else []
     if actions:
         lines.extend(["", "Recommended actions"])

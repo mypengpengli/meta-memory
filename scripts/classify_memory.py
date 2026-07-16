@@ -341,7 +341,7 @@ def classify(title: str, content: str, subject_id: str, subject_name: str, llm_f
         },
     }
     if (llm_fallback or bool(get("llm.enable_fallback"))) and confidence < 0.62:
-        prompt_file = Path(__file__).resolve().parent.parent / "prompts" / "classify_memory.md"
+        prompt_file = Path(__file__).resolve().parent / "resources" / "classify_memory.md"
         try:
             fallback = complete(prompt_file.read_text(encoding="utf-8"), {"title": title, "content": content, "rule_result": result})
         except Exception as exc:

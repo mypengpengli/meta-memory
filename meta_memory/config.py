@@ -22,6 +22,11 @@ def default_config_path() -> Path:
     return Path(override).expanduser() if override else Path.home() / ".meta-memory" / "config.toml"
 
 
+def _absolute_path(value: str | Path, *, relative_to: Path) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (relative_to / path).resolve()
+
+
 @dataclass
 class AppConfig:
     path: Path
@@ -125,7 +130,7 @@ def _interval(value: Any, default: int = 10) -> int:
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
-    config_path = Path(path).expanduser() if path else default_config_path()
+    config_path = (Path(path).expanduser() if path else default_config_path()).resolve()
     if not config_path.exists():
         return AppConfig(path=config_path)
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -146,11 +151,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     deep_enabled = _bool(dream_section.get("deep_enabled", dream_section.get("enabled", True)), True)
     deep_schedule = str(dream_section.get("deep_schedule", dream_section.get("schedule", "23:30")))
     deep_scan_days = max(1, int(dream_section.get("deep_scan_days", dream_section.get("scan_days", 7))))
+    raw_store = Path(str(_value(data, "storage", "path", Path.home() / ".meta-memory" / "data")))
     return AppConfig(
         path=config_path,
         user_name=name,
         user_id=slug(str(_value(data, "user", "id", slug(name, "user"))), "user"),
-        store=Path(str(_value(data, "storage", "path", Path.home() / ".meta-memory" / "data"))).expanduser(),
+        store=_absolute_path(raw_store, relative_to=config_path.parent),
         memory_mode=memory_mode,
         default_project=slug(str(_value(data, "behavior", "default_project", "general")), "general"),
         search_depth=normalize_search_depth(_value(data, "behavior", "search_depth", "auto")),
@@ -201,6 +207,8 @@ def _quote(value: str) -> str:
 
 
 def save_config(config: AppConfig) -> Path:
+    config.path = Path(config.path).expanduser().resolve()
+    config.store = _absolute_path(config.store, relative_to=config.path.parent)
     config.path.parent.mkdir(parents=True, exist_ok=True)
     # ``dream_enabled`` is the public legacy switch; either it or the newer
     # deep-specific switch can disable deep Dream.  Normal CLI setters keep

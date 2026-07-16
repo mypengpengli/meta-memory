@@ -204,6 +204,7 @@ class SessionIdentityAndPolicyTests(unittest.TestCase):
         installed = install_agent(
             "custom",
             config=self.config,
+            custom_agent_id="test-custom",
             custom_skill_dir=self.root / "custom-skills",
             home=self.root / "agent-home",
             verify=False,
@@ -213,8 +214,17 @@ class SessionIdentityAndPolicyTests(unittest.TestCase):
         skill = Path(str(installed["skill"])).read_text(encoding="utf-8")
         self.assertIn("before", skill)
         self.assertIn("after", skill)
-        self.assertIn("Keep the returned `turn_id`", skill)
+        self.assertIn("Retain `turn_id`", skill)
         self.assertIn("after --turn <turn_id>", skill)
+
+        with self.assertRaisesRegex(ValueError, "non-empty --skill-dir"):
+            install_agent(
+                "custom",
+                config=self.config,
+                custom_agent_id="blank-path-agent",
+                custom_skill_dir="   ",
+                verify=False,
+            )
 
     def test_unbound_git_projects_use_a_portable_remote_fingerprint(self) -> None:
         with patch("meta_memory.project_detection.project_root", return_value=self.project_root), patch(

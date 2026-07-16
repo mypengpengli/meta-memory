@@ -1,4 +1,4 @@
 interface:
-  display_name: "Meta Memory / 记忆编排"
-  short_description: "Load only relevant scoped memories, record turns, and conservatively write back durable facts"
-  default_prompt: "Use $memory-orchestrator to initialize a frozen hot-memory snapshot and run scripts/memory_runtime.py before answering. Pass a stable subject-id scope, inject static_hot_context once plus fenced context_markdown per turn, then record the turn after answering. Long-term memory must come through a sourced semantic consolidation plan; high-risk corrections and all skills require approval, and deterministic field/BM25/chunk/entity/edge retrieval remains the default without embeddings."
+  display_name: "Meta Memory"
+  short_description: "Durable before/after memory lifecycle for local CLI Agents"
+  default_prompt: "Use $meta-memory to recall bounded context before drafting and save the exact final answer before sending it."

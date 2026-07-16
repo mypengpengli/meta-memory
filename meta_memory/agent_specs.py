@@ -48,7 +48,7 @@ def normalize_agent_id(agent_id: str, *, allow_builtin: bool = True) -> str:
 
 
 def _home_path(home: str | Path | None = None) -> Path:
-    return Path(home).expanduser() if home is not None else Path.home()
+    return (Path(home).expanduser() if home is not None else Path.home()).resolve()
 
 
 def agent_specs(
@@ -92,7 +92,7 @@ def agent_specs(
         ),
     }
     if custom_skill_dir is not None:
-        custom_root = Path(custom_skill_dir).expanduser()
+        custom_root = Path(custom_skill_dir).expanduser().resolve()
         specs["custom"] = custom_agent_spec("custom", custom_root)
     return specs
 
@@ -107,10 +107,12 @@ def custom_agent_spec(
     """Build a generic Skill integration for any CLI-capable Agent host."""
 
     normalized = normalize_agent_id(agent_id, allow_builtin=False)
-    root = Path(skill_dir).expanduser()
-    if not str(root).strip():
-        raise ValueError("custom agent installation requires --skill-dir")
-    host = None if not install_host_file else (Path(host_file).expanduser() if host_file is not None else root.parent / "AGENTS.md")
+    if skill_dir is None or (isinstance(skill_dir, str) and not skill_dir.strip()):
+        raise ValueError("custom agent installation requires a non-empty --skill-dir")
+    if isinstance(host_file, str) and not host_file.strip():
+        raise ValueError("--host-file must be a non-empty path; use --no-host-file when it is not required")
+    root = Path(skill_dir).expanduser().resolve()
+    host = None if not install_host_file else (Path(host_file).expanduser().resolve() if host_file is not None else root.parent / "AGENTS.md")
     return AgentSpec(
         agent_id=normalized,
         display_name=normalized,
@@ -136,8 +138,10 @@ def get_agent_spec(
     if name == "custom":
         if custom_skill_dir is None:
             raise ValueError("custom agent installation requires --skill-dir")
+        if not str(custom_agent_id or "").strip():
+            raise ValueError("custom agent installation requires --agent-id")
         return custom_agent_spec(
-            "custom" if custom_agent_id is None else custom_agent_id,
+            custom_agent_id,
             custom_skill_dir,
             custom_host_file,
             install_host_file=not no_host_file,

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from meta_memory.config import AppConfig
-from meta_memory.skill_installer import install_agent
+from meta_memory.skill_installer import install_agent, install_agents
 
 
 class CrossAgentLauncherTests(unittest.TestCase):
@@ -77,6 +77,34 @@ class CrossAgentLauncherTests(unittest.TestCase):
             for agent_id in ("", "../escape", "system", "meta-memory", "claude_code", "Too Upper"):
                 with self.assertRaises(ValueError):
                     install_agent("custom", config=config, custom_agent_id=agent_id, custom_skill_dir=Path(temp) / "skills", verify=False)
+
+    def test_builtin_and_custom_agents_can_be_installed_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = AppConfig(path=root / "config.toml", store=root / "store")
+            installed = install_agents(
+                ["codex", "custom"],
+                config=config,
+                home=root / "home",
+                custom_agent_id="portable-agent",
+                custom_skill_dir=root / "portable" / "skills",
+                no_host_file=True,
+                verify=False,
+            )
+
+            self.assertEqual([item["agent"] for item in installed], ["codex", "portable-agent"])
+            self.assertTrue(all(item["skill_installed"] for item in installed))
+
+    def test_custom_agent_requires_a_stable_explicit_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = AppConfig(path=Path(temp) / "config.toml", store=Path(temp) / "store")
+            with self.assertRaisesRegex(ValueError, "requires --agent-id"):
+                install_agent(
+                    "custom",
+                    config=config,
+                    custom_skill_dir=Path(temp) / "skills",
+                    verify=False,
+                )
 
 
 if __name__ == "__main__":

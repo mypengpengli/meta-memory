@@ -70,7 +70,7 @@ def _parse_scalar(value: str) -> object:
 @lru_cache(maxsize=1)
 def load_defaults() -> dict[str, object]:
     values = dict(DEFAULTS)
-    path = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
+    path = Path(__file__).resolve().parent / "resources" / "default.yaml"
     if not path.exists():
         return values
     sections: list[tuple[int, str]] = []
