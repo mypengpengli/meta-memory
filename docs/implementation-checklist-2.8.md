@@ -112,4 +112,4 @@ freeze and must not be marked green before the corresponding command succeeds.
 - [x] Source and generated remote Skills pass the Skill validator.
 - [x] Installed-wheel smoke runs outside the checkout with packaged migrations/templates and server-config generation.
 - [x] A fresh Agent blind-reads the final generated Skill and follows its protocol without repository context.
-- [ ] Verify full cross-platform CI passes after the final `main` push.
+- [x] Verify full cross-platform CI passes after the final `main` push.
