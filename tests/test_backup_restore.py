@@ -10,6 +10,7 @@ from pathlib import Path
 from meta_memory.backup import backup_app, backup_store, restore_app, restore_store
 from meta_memory.config import AppConfig, load_config, save_config
 from meta_memory.legacy import bootstrap
+from meta_memory.spatial import read_asset, store_asset
 
 bootstrap()
 from _common import ensure_store_ready, open_db
@@ -130,6 +131,31 @@ class PortableBackupRestoreTests(unittest.TestCase):
         self.assertEqual(old_result["status"], "ok")
         self.assertIn("Legacy store-only", old_result["warnings"][0])
         self.assertTrue((old_destination / "db" / "memory_index.sqlite").is_file())
+
+    def test_backup_copies_exact_active_asset_snapshot_and_ignores_orphans(self) -> None:
+        content = b"binary-room-scan" * 4096
+        asset = store_asset(
+            self.config.store,
+            content,
+            profile_id=self.config.profile_id,
+            media_type="application/octet-stream",
+            original_name="room.scan",
+        )
+        orphan = self.config.store / "assets" / "objects" / "ff" / "orphan"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        orphan.write_bytes(b"not referenced by the database snapshot")
+        archive = self._portable_archive()
+        with zipfile.ZipFile(archive) as package:
+            names = set(package.namelist())
+        expected_member = f"store/{asset['object_path']}"
+        self.assertIn(expected_member, names)
+        self.assertNotIn("store/assets/objects/ff/orphan", names)
+        restored = self.root / "asset-restored"
+        restore_store(archive, restored)
+        self.assertEqual(
+            read_asset(restored, profile_id=self.config.profile_id, asset_id=str(asset["asset_id"])),
+            content,
+        )
 
 
 if __name__ == "__main__":

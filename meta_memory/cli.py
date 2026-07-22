@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -173,11 +174,330 @@ def _setup(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _json_file(value: str, *, default: Any) -> Any:
+    if not str(value or "").strip():
+        return default
+    path = Path(value).expanduser().resolve()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON file is invalid: {path}: {exc}") from exc
+
+
+def _local_world_identity(config: AppConfig, args: argparse.Namespace) -> tuple[str, str, str]:
+    from .project_detection import resolve_project
+    from .runtime import origin_agent_id
+
+    project = resolve_project(config, getattr(args, "project", "auto"), getattr(args, "cwd", None))
+    subject = str(getattr(args, "subject_id", "") or config.subject_id)
+    return project.workspace_id, subject, origin_agent_id(getattr(args, "agent_id", ""))
+
+
+def _dispatch_shared(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
+    from .shared_memory import (
+        ensure_audience,
+        ensure_channel,
+        expire_time_bounded,
+        grant_audience_member,
+        list_activity_feed,
+        list_channels,
+        list_temporal_states,
+        publish_activity,
+        publish_temporal_state,
+        revoke_audience_member,
+    )
+
+    workspace, subject, agent = _local_world_identity(config, args)
+    action = args.shared_command
+    if action == "init":
+        audience = ensure_audience(
+            config.store,
+            profile_id=config.profile_id,
+            audience_type=args.type,
+            audience_key=args.key,
+            label=args.label,
+            metadata=_json_file(args.metadata_file, default={}),
+            profile_wide=not args.restricted,
+        )
+        channel = ensure_channel(
+            config.store,
+            profile_id=config.profile_id,
+            channel_type=args.channel_type or args.type,
+            channel_key=args.channel_key or args.key,
+            audience_id=str(audience["audience_id"]),
+            subject_id=subject,
+            workspace_id=workspace,
+            owner_agent_id=agent,
+            label=args.label,
+        )
+        members = list(args.member_agent or [])
+        if args.restricted and agent not in members:
+            members.append(agent)
+        revoked_profile_wide = False
+        if args.restricted:
+            revoked_profile_wide = revoke_audience_member(
+                config.store,
+                profile_id=config.profile_id,
+                audience_id=str(audience["audience_id"]),
+                member_type="profile",
+                member_id=config.profile_id,
+            )
+        grants = [
+            grant_audience_member(
+                config.store,
+                profile_id=config.profile_id,
+                audience_id=str(audience["audience_id"]),
+                member_type="agent",
+                member_id=member,
+            )
+            for member in members
+        ]
+        return {
+            "status": "ok",
+            "audience": audience,
+            "channel": channel,
+            "grants": grants,
+            "profile_wide_membership_revoked": revoked_profile_wide,
+        }
+    if action == "grant":
+        result = grant_audience_member(
+            config.store,
+            profile_id=config.profile_id,
+            audience_id=args.audience_id,
+            member_type=args.member_type,
+            member_id=args.member_id,
+        )
+        return {"status": "ok", "grant": result}
+    if action == "revoke":
+        removed = revoke_audience_member(
+            config.store,
+            profile_id=config.profile_id,
+            audience_id=args.audience_id,
+            member_type=args.member_type,
+            member_id=args.member_id,
+        )
+        return {
+            "status": "ok",
+            "revoked": removed,
+            "audience_id": args.audience_id,
+            "member_type": args.member_type,
+            "member_id": args.member_id,
+        }
+    if action == "channels":
+        return {
+            "status": "ok",
+            "channels": list_channels(
+                config.store,
+                profile_id=config.profile_id,
+                audience_id=args.audience_id,
+                channel_type=args.type,
+                member_type=args.member_type,
+                member_id=args.member_id,
+            ),
+        }
+    if action == "publish":
+        result = publish_activity(
+            config.store,
+            profile_id=config.profile_id,
+            channel_id=args.channel_id,
+            summary=args.summary,
+            source_workspace_id=workspace,
+            subject_id=subject,
+            source_agent_id=agent,
+            source_session_id=args.session_id,
+            source_ref=args.source_ref,
+            confidence=args.confidence,
+            activity_kind=args.kind,
+            title=args.title,
+            payload=_json_file(args.payload_file, default={}),
+            importance=args.importance,
+            occurred_at=args.occurred_at or None,
+            valid_until=args.valid_until or None,
+            idempotency_key=args.idempotency_key,
+        )
+        return {"status": "ok", "activity": result}
+    if action == "feed":
+        return {
+            "status": "ok",
+            "activities": list_activity_feed(
+                config.store,
+                profile_id=config.profile_id,
+                channel_id=args.channel_id,
+                subject_id=args.subject_id,
+                include_history=args.include_history,
+                limit=args.limit,
+            ),
+        }
+    if action == "state-set":
+        value = _json_file(args.value_file, default={"summary": args.summary})
+        result = publish_temporal_state(
+            config.store,
+            profile_id=config.profile_id,
+            channel_id=args.channel_id,
+            subject_id=subject,
+            state_key=args.state_key,
+            value=value,
+            summary=args.summary,
+            source_workspace_id=workspace,
+            source_agent_id=agent,
+            source_ref=args.source_ref,
+            confidence=args.confidence,
+            observed_at=args.observed_at or None,
+            valid_from=args.valid_from or None,
+            valid_until=args.valid_until or None,
+            idempotency_key=args.idempotency_key,
+        )
+        return {"status": "ok", "state": result}
+    if action == "states":
+        return {
+            "status": "ok",
+            "states": list_temporal_states(
+                config.store,
+                profile_id=config.profile_id,
+                channel_id=args.channel_id,
+                subject_id=args.subject_id,
+                state_key=args.state_key,
+                current_only=not args.include_history,
+                limit=args.limit,
+            ),
+        }
+    return {"status": "ok", "expired": expire_time_bounded(config.store, profile_id=config.profile_id)}
+
+
+def _dispatch_spatial(config: AppConfig, args: argparse.Namespace) -> dict[str, Any]:
+    from .spatial import (
+        create_map_version,
+        get_asset,
+        get_map,
+        get_spatial_observation,
+        list_assets,
+        list_maps,
+        list_spatial_observations,
+        read_asset,
+        record_spatial_observation,
+        remove_asset,
+        search_spatial_observations,
+        store_asset,
+    )
+
+    workspace, subject, agent = _local_world_identity(config, args)
+    if args.command == "asset":
+        if args.asset_command == "add":
+            source = Path(args.file).expanduser().resolve()
+            if not source.is_file():
+                raise ValueError(f"Asset file does not exist: {source}")
+            with source.open("rb") as stream:
+                item = store_asset(
+                    config.store,
+                    stream,
+                    profile_id=config.profile_id,
+                    media_type=args.media_type,
+                    original_name=source.name,
+                    metadata=_json_file(args.metadata_file, default={}),
+                    max_bytes=max(1, args.max_mb) * 1024 * 1024,
+                )
+            return {"status": "ok", "asset": item}
+        if args.asset_command == "list":
+            return {"status": "ok", "assets": list_assets(config.store, profile_id=config.profile_id, media_type=args.media_type, limit=args.limit)}
+        if args.asset_command == "show":
+            item = get_asset(config.store, profile_id=config.profile_id, asset_id=args.asset_id)
+            if not item:
+                raise ValueError("Asset not found.")
+            return {"status": "ok", "asset": item}
+        if args.asset_command == "export":
+            content = read_asset(config.store, profile_id=config.profile_id, asset_id=args.asset_id, max_bytes=max(1, args.max_mb) * 1024 * 1024)
+            target = Path(args.output).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            return {"status": "ok", "asset_id": args.asset_id, "output": str(target), "byte_size": len(content)}
+        return {"status": "ok", "asset": remove_asset(config.store, profile_id=config.profile_id, asset_id=args.asset_id, force=args.force)}
+    if args.command == "map":
+        if args.map_command == "add":
+            item = create_map_version(
+                config.store,
+                profile_id=config.profile_id,
+                channel_id=args.channel_id,
+                map_id=args.map_id,
+                coordinate_frame=args.coordinate_frame,
+                version=args.version,
+                name=args.name,
+                asset_id=args.asset_id,
+                source_workspace_id=workspace,
+                source_agent_id=agent,
+                captured_at=args.captured_at or None,
+                metadata=_json_file(args.metadata_file, default={}),
+                idempotency_key=args.idempotency_key,
+            )
+            return {"status": "ok", "map": item}
+        if args.map_command == "list":
+            return {"status": "ok", "maps": list_maps(config.store, profile_id=config.profile_id, channel_id=args.channel_id, latest_only=not args.include_history, limit=args.limit)}
+        item = get_map(config.store, profile_id=config.profile_id, map_id=args.map_id, version=args.version)
+        if not item:
+            raise ValueError("Map not found.")
+        return {"status": "ok", "map": item}
+    if args.spatial_command == "add":
+        objects = _json_file(args.objects_file, default=[])
+        if not isinstance(objects, list):
+            raise ValueError("--objects-file must contain a JSON array")
+        item = record_spatial_observation(
+            config.store,
+            profile_id=config.profile_id,
+            channel_id=args.channel_id,
+            workspace_id=workspace,
+            subject_id=subject,
+            source_agent_id=agent,
+            map_id=args.map_id,
+            map_version=args.map_version,
+            asset_id=args.asset_id,
+            location_id=args.location_id,
+            location_text=args.location_text,
+            caption=args.caption,
+            ocr_text=args.ocr_text,
+            objects=objects,
+            confidence=args.confidence,
+            observed_at=args.observed_at or None,
+            valid_until=args.valid_until or None,
+            visibility_scope=args.visibility_scope,
+            idempotency_key=args.idempotency_key,
+            metadata=_json_file(args.metadata_file, default={}),
+        )
+        return {"status": "ok", "observation": item}
+    if args.spatial_command == "show":
+        item = get_spatial_observation(config.store, profile_id=config.profile_id, observation_id=args.observation_id)
+        if not item:
+            raise ValueError("Spatial observation not found.")
+        return {"status": "ok", "observation": item}
+    if args.spatial_command == "search":
+        rows = search_spatial_observations(
+            config.store,
+            profile_id=config.profile_id,
+            query=args.query,
+            channel_id=args.channel_id,
+            map_id=args.map_id,
+            workspace_id=workspace,
+            viewer_agent_id=agent,
+            current_only=not args.include_history,
+            limit=args.limit,
+        )
+    else:
+        rows = list_spatial_observations(
+            config.store,
+            profile_id=config.profile_id,
+            channel_id=args.channel_id,
+            map_id=args.map_id,
+            workspace_id=workspace,
+            viewer_agent_id=agent,
+            current_only=not args.include_history,
+            limit=args.limit,
+        )
+    return {"status": "ok", "observations": rows}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="meta-memory",
         usage="meta-memory [GLOBAL OPTION] COMMAND [OPTION]",
-        description="A local, durable memory runtime for AI agents. Start with setup, then use overview as your home screen.",
+        description="A local or hosted durable memory runtime for AI agents. Start locally with setup; use serve for remote Agents.",
         epilog="""Start here:
   meta-memory setup --agents codex
   meta-memory overview
@@ -190,6 +510,13 @@ Everyday tasks:
 Discover a command:
   meta-memory COMMAND --help
   meta-memory memory --help
+
+Remote and robot use:
+  meta-memory init-agents-file --help
+  meta-memory serve --help
+  meta-memory install-remote-agent --help
+  meta-memory shared --help
+  meta-memory spatial --help
 """,
         formatter_class=_HelpFormatter,
     )
@@ -223,6 +550,38 @@ Discover a command:
     install_host = install.add_mutually_exclusive_group()
     install_host.add_argument("--host-file", help="Host instruction file to update for a custom Agent")
     install_host.add_argument("--no-host-file", action="store_true", help="Generate the Skill without modifying a host instruction file")
+
+    install_remote = commands.add_parser("install-remote-agent", help="Generate a Skill for an Agent that reaches a hosted Meta Memory server")
+    install_remote.add_argument("--agent-id", required=True, help="Stable lowercase identity bound to this Agent's server token")
+    install_remote.add_argument("--skill-dir", required=True, help="Parent directory where the host loads Skills")
+    install_remote.add_argument("--server-url", required=True, help="HTTPS origin of the central service; HTTP is accepted only on localhost")
+    install_remote.add_argument("--workspace-id", required=True, help="Stable workspace id; never derive this from the server cwd")
+    install_remote.add_argument("--subject-id", required=True, help="Stable primary person or subject id")
+    install_remote.add_argument("--audience-id", default="", help="Optional household/person/device audience id")
+    install_remote.add_argument("--channel-id", default="", help="Optional shared activity/state/spatial channel id")
+    install_remote.add_argument("--token-env", default="META_MEMORY_TOKEN", help="Environment-variable name containing the bearer token")
+    install_remote.add_argument("--outbox-dir", help="Durable local retry directory; defaults below ~/.meta-memory/remote")
+    install_remote.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
+
+    serve_cmd = commands.add_parser("serve", help="Run the central API for remote Agents and shared memory")
+    serve_cmd.add_argument("--agents-file", required=True, help="Private token-to-Agent bindings JSON")
+    serve_cmd.add_argument("--store", help="Central memory-data directory; defaults to the configured store")
+    serve_cmd.add_argument("--host", default="127.0.0.1", help="Bind address")
+    serve_cmd.add_argument("--port", type=int, default=8765, help="Bind port")
+    serve_cmd.add_argument("--max-asset-mb", type=int, default=64, help="Maximum raw asset size")
+    serve_cmd.add_argument("--asset-chunk-mb", type=int, default=2, help="Resumable-upload chunk size")
+    serve_cmd.add_argument("--tls-cert", help="PEM certificate for native HTTPS")
+    serve_cmd.add_argument("--tls-key", help="PEM private key used with --tls-cert")
+
+    init_agents = commands.add_parser("init-agents-file", help="Create or extend the server binding file for a remote Agent")
+    init_agents.add_argument("--output", required=True, help="Destination agents.json path used by `meta-memory serve`")
+    init_agents.add_argument("--agent-id", required=True, help="Stable identity that must match install-remote-agent")
+    init_agents.add_argument("--profile-id", default="", help="Profile from `shared init`; defaults to the configured profile")
+    init_agents.add_argument("--workspace-id", action="append", required=True, help="Allowed stable workspace id; repeat to allow more")
+    init_agents.add_argument("--subject-id", action="append", required=True, help="Allowed person/subject id; repeat for family members")
+    init_agents.add_argument("--audience-id", action="append", default=[], help="Allowed audience or channel id; repeat as needed")
+    init_agents.add_argument("--token-env", default="META_MEMORY_TOKEN", help="Environment variable holding the same token on server and Agent")
+    init_agents.add_argument("--replace-agent", action="store_true", help="Replace this Agent entry while preserving all other entries")
 
     project = commands.add_parser("project", help="Bind the current directory to a project")
     project_commands = project.add_subparsers(dest="project_command", required=True)
@@ -312,6 +671,8 @@ Discover a command:
     overview_cmd = commands.add_parser("overview", help="Show one-screen readiness and next action")
     overview_cmd.add_argument("--project", default="auto", help="Project name, or auto for the current directory")
     overview_cmd.add_argument("--cwd", help="Directory used to resolve the project")
+    overview_cmd.add_argument("--server", action="store_true", help="Evaluate hosted-server readiness instead of local Agent installation")
+    overview_cmd.add_argument("--agents-file", default="", help="With --server, validate this token-to-Agent bindings file")
     status_cmd = commands.add_parser("status", help="Show local store status plus an operational overview")
     status_cmd.add_argument("--project", default="auto", help="Project name, or auto for the current directory")
     status_cmd.add_argument("--cwd", help="Directory used to resolve the project")
@@ -406,9 +767,193 @@ Discover a command:
     resource_remove_cmd.add_argument("resource_id"); resource_remove_cmd.add_argument("--project", default="auto"); resource_remove_cmd.add_argument("--cwd"); resource_remove_cmd.add_argument("--all-projects", action="store_true")
     resource_export_cmd = resource_commands.add_parser("export", help="Export resource metadata as JSON or Markdown")
     resource_export_cmd.add_argument("--project", default="auto"); resource_export_cmd.add_argument("--cwd"); resource_export_cmd.add_argument("--output"); resource_export_cmd.add_argument("--format", choices=["json", "markdown"], default="json"); resource_export_cmd.add_argument("--all-projects", action="store_true")
+
+    shared_cmd = commands.add_parser("shared", help="Manage household/person/device channels, activity, and expiring state")
+    shared_commands = shared_cmd.add_subparsers(dest="shared_command", required=True)
+    shared_init = shared_commands.add_parser("init", help="Create one audience and its shared channel")
+    world_types = ["user", "household", "person", "project", "device", "agent", "session", "event"]
+    shared_init.add_argument("--type", required=True, choices=world_types, help="Audience type, usually household, person, or device")
+    shared_init.add_argument("--key", required=True, help="Stable audience key such as family-home; reuse it to get the same audience")
+    shared_init.add_argument("--channel-type", choices=world_types, help="Optional channel type when it differs from the audience")
+    shared_init.add_argument("--channel-key", default="", help="Stable channel key; defaults to --key")
+    shared_init.add_argument("--label", default="", help="Human-readable label")
+    shared_init.add_argument("--restricted", action="store_true", help="Grant only listed/current Agents instead of the whole profile")
+    shared_init.add_argument("--member-agent", action="append", default=[], help="Agent allowed in a restricted audience; repeat as needed")
+    shared_init.add_argument("--metadata-file", default="", help="UTF-8 JSON object with optional audience metadata")
+    shared_init.add_argument("--subject-id", default="", help="Optional primary subject; defaults to the configured user")
+    shared_init.add_argument("--project", default="auto", help="Source project/workspace for the channel")
+    shared_init.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_grant = shared_commands.add_parser("grant", help="Grant an Agent or subject access to an audience")
+    shared_grant.add_argument("--audience-id", required=True, help="Audience id returned by shared init")
+    shared_grant.add_argument("--member-type", required=True, choices=["profile", "agent", "subject"], help="Kind of member receiving access")
+    shared_grant.add_argument("--member-id", required=True, help="Stable profile, Agent, or subject id")
+    shared_grant.add_argument("--project", default="auto", help="Project context for the operation")
+    shared_grant.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_revoke = shared_commands.add_parser("revoke", help="Remove one profile, Agent, or subject from an audience")
+    shared_revoke.add_argument("--audience-id", required=True, help="Audience id returned by shared init")
+    shared_revoke.add_argument("--member-type", required=True, choices=["profile", "agent", "subject"], help="Kind of membership to remove")
+    shared_revoke.add_argument("--member-id", required=True, help="Stable profile, Agent, or subject id")
+    shared_revoke.add_argument("--project", default="auto", help="Project context for the operation")
+    shared_revoke.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_channels = shared_commands.add_parser("channels", help="List active shared channels")
+    shared_channels.add_argument("--audience-id", default="", help="Limit results to one audience")
+    shared_channels.add_argument("--type", default="", choices=["", *world_types], help="Limit results to one channel type")
+    shared_channels.add_argument("--member-type", default="", choices=["", "profile", "agent", "subject"], help="Filter channels visible to this member kind")
+    shared_channels.add_argument("--member-id", default="", help="Member id used with --member-type")
+    shared_channels.add_argument("--project", default="auto", help="Project context for the operation")
+    shared_channels.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_publish = shared_commands.add_parser("publish", help="Publish one curated cross-workspace activity")
+    shared_publish.add_argument("--channel-id", required=True, help="Destination channel id returned by shared init")
+    shared_publish.add_argument("--summary", required=True, help="Short curated event summary; do not paste a raw transcript")
+    shared_publish.add_argument("--title", default="", help="Optional display title")
+    shared_publish.add_argument("--kind", default="update", help="Stable event kind such as repair-alert or family-update")
+    shared_publish.add_argument("--importance", type=float, default=0.5, help="Retrieval importance from 0 to 1")
+    shared_publish.add_argument("--occurred-at", default="", help="ISO 8601 event time with offset; defaults to now")
+    shared_publish.add_argument("--valid-until", default="", help="Optional ISO 8601 expiry later than occurred-at")
+    shared_publish.add_argument("--source-ref", default="", help="Inspectable source/event reference")
+    shared_publish.add_argument("--confidence", type=float, help="Optional source confidence from 0 to 1")
+    shared_publish.add_argument("--payload-file", default="", help="UTF-8 JSON object with small structured details")
+    shared_publish.add_argument("--idempotency-key", default="", help="Stable retry key; reuse only for the same event")
+    shared_publish.add_argument("--session-id", default="", help="Optional source session id")
+    shared_publish.add_argument("--subject-id", default="", help="Person/subject this event concerns; blank means channel-wide")
+    shared_publish.add_argument("--project", default="auto", help="Source project/workspace")
+    shared_publish.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_feed = shared_commands.add_parser("feed", help="Read a bounded shared activity feed")
+    shared_feed.add_argument("--channel-id", required=True, help="Channel to read")
+    shared_feed.add_argument("--subject-id", default="", help="Include channel-wide and this subject's activities")
+    shared_feed.add_argument("--include-history", action="store_true", help="Include expired and superseded activities")
+    shared_feed.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    shared_feed.add_argument("--project", default="auto", help="Project context for the request")
+    shared_feed.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_state = shared_commands.add_parser("state-set", help="Publish a current value that supersedes older state")
+    shared_state.add_argument("--channel-id", required=True, help="Destination channel id")
+    shared_state.add_argument("--state-key", required=True, help="Stable key such as last_seen, device.health, or repair.status")
+    shared_state.add_argument("--summary", required=True, help="Short human-readable current state")
+    shared_state.add_argument("--value-file", default="", help="UTF-8 JSON value; defaults to an object containing summary")
+    shared_state.add_argument("--source-ref", required=True, help="Evidence reference such as camera:event-42")
+    shared_state.add_argument("--confidence", type=float, help="Optional confidence from 0 to 1")
+    shared_state.add_argument("--observed-at", default="", help="ISO 8601 observation time with offset; defaults to now")
+    shared_state.add_argument("--valid-from", default="", help="Optional future start; scheduled state does not replace current state early")
+    shared_state.add_argument("--valid-until", default="", help="Optional ISO 8601 expiry later than valid-from")
+    shared_state.add_argument("--idempotency-key", default="", help="Stable retry key for exactly this update")
+    shared_state.add_argument("--subject-id", default="", help="Stable person/device subject; defaults to the configured user")
+    shared_state.add_argument("--project", default="auto", help="Source project/workspace")
+    shared_state.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_states = shared_commands.add_parser("states", help="List current or historical shared state")
+    shared_states.add_argument("--channel-id", default="", help="Optional channel filter")
+    shared_states.add_argument("--subject-id", default="", help="Optional stable person/device subject filter")
+    shared_states.add_argument("--state-key", default="", help="Optional state key filter")
+    shared_states.add_argument("--include-history", action="store_true", help="Include scheduled, expired, and superseded rows")
+    shared_states.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    shared_states.add_argument("--project", default="auto", help="Project context for the request")
+    shared_states.add_argument("--cwd", help="Directory used when --project is auto")
+    shared_expire = shared_commands.add_parser("expire", help="Materialize expired activity, state, and observations now")
+    shared_expire.add_argument("--project", default="auto", help="Project context for the operation")
+    shared_expire.add_argument("--cwd", help="Directory used when --project is auto")
+
+    asset_cmd = commands.add_parser("asset", help="Store, inspect, export, or remove binary image/map assets")
+    asset_commands = asset_cmd.add_subparsers(dest="asset_command", required=True)
+    asset_add = asset_commands.add_parser("add", help="Stream one local binary into content-addressed storage")
+    asset_add.add_argument("file", help="Local image, map, point cloud, or other binary file")
+    asset_add.add_argument("--media-type", default="application/octet-stream", help="MIME type such as image/jpeg")
+    asset_add.add_argument("--metadata-file", default="", help="UTF-8 JSON object with capture/source metadata")
+    asset_add.add_argument("--max-mb", type=int, default=64, help="Reject files larger than this many MiB")
+    asset_add.add_argument("--project", default="auto", help="Source project/workspace")
+    asset_add.add_argument("--cwd", help="Directory used when --project is auto")
+    asset_list = asset_commands.add_parser("list", help="List stored binary assets")
+    asset_list.add_argument("--media-type", default="", help="Optional exact MIME-type filter")
+    asset_list.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    asset_list.add_argument("--project", default="auto", help="Project context for the request")
+    asset_list.add_argument("--cwd", help="Directory used when --project is auto")
+    asset_show = asset_commands.add_parser("show", help="Show immutable asset metadata")
+    asset_show.add_argument("asset_id", help="Asset id returned by asset add")
+    asset_show.add_argument("--project", default="auto", help="Project context for the request")
+    asset_show.add_argument("--cwd", help="Directory used when --project is auto")
+    asset_export = asset_commands.add_parser("export", help="Verify and copy raw asset bytes to a file")
+    asset_export.add_argument("asset_id", help="Asset id to verify and copy")
+    asset_export.add_argument("--output", required=True, help="Destination file path")
+    asset_export.add_argument("--max-mb", type=int, default=64, help="Refuse to read more than this many MiB")
+    asset_export.add_argument("--project", default="auto", help="Project context for the request")
+    asset_export.add_argument("--cwd", help="Directory used when --project is auto")
+    asset_remove = asset_commands.add_parser("remove", help="Retire one asset; referenced assets require --force")
+    asset_remove.add_argument("asset_id", help="Asset id to retire")
+    asset_remove.add_argument("--force", action="store_true", help="Also retire map/observation references to this asset")
+    asset_remove.add_argument("--project", default="auto", help="Project context for the operation")
+    asset_remove.add_argument("--cwd", help="Directory used when --project is auto")
+
+    map_cmd = commands.add_parser("map", help="Manage stable map identities and immutable versions")
+    map_commands = map_cmd.add_subparsers(dest="map_command", required=True)
+    map_add = map_commands.add_parser("add", help="Create the next immutable version of a map")
+    map_add.add_argument("--channel-id", required=True, help="Channel that permanently owns this stable map id")
+    map_add.add_argument("--map-id", required=True, help="Stable map identity such as home-floor-1")
+    map_add.add_argument("--coordinate-frame", required=True, help="Coordinate frame such as map, odom, or floor-plan-pixels")
+    map_add.add_argument("--version", type=int, help="Explicit increasing version; defaults to latest + 1")
+    map_add.add_argument("--name", default="", help="Human-readable version name")
+    map_add.add_argument("--asset-id", default="", help="Optional raw occupancy-grid/image/point-cloud asset")
+    map_add.add_argument("--captured-at", default="", help="ISO 8601 capture time with offset; defaults to now")
+    map_add.add_argument("--metadata-file", default="", help="UTF-8 JSON object with topology, dimensions, or transform metadata")
+    map_add.add_argument("--idempotency-key", default="", help="Stable retry key for this exact version")
+    map_add.add_argument("--subject-id", default="", help="Optional source subject; defaults to configured user")
+    map_add.add_argument("--project", default="auto", help="Source project/workspace")
+    map_add.add_argument("--cwd", help="Directory used when --project is auto")
+    map_list = map_commands.add_parser("list", help="List latest or all map versions")
+    map_list.add_argument("--channel-id", default="", help="Optional owning-channel filter")
+    map_list.add_argument("--include-history", action="store_true", help="Show every immutable version instead of latest only")
+    map_list.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    map_list.add_argument("--project", default="auto", help="Project context for the request")
+    map_list.add_argument("--cwd", help="Directory used when --project is auto")
+    map_show = map_commands.add_parser("show", help="Show one map version or the latest")
+    map_show.add_argument("map_id", help="Stable map id")
+    map_show.add_argument("--version", type=int, help="Specific immutable version; defaults to latest")
+    map_show.add_argument("--project", default="auto", help="Project context for the request")
+    map_show.add_argument("--cwd", help="Directory used when --project is auto")
+
+    spatial_cmd = commands.add_parser("spatial", help="Record and search semantic observations linked to maps/assets")
+    spatial_commands = spatial_cmd.add_subparsers(dest="spatial_command", required=True)
+    spatial_add = spatial_commands.add_parser("add", help="Record one timestamped spatial observation")
+    spatial_add.add_argument("--channel-id", required=True, help="Shared channel that owns this observation")
+    spatial_add.add_argument("--map-id", default="", help="Optional stable map id; latest version is used unless --map-version is set")
+    spatial_add.add_argument("--map-version", type=int, help="Optional immutable map version")
+    spatial_add.add_argument("--asset-id", default="", help="Optional raw image/scan asset id")
+    spatial_add.add_argument("--location-id", default="", help="Stable semantic location such as room:kitchen")
+    spatial_add.add_argument("--location-text", default="", help="Human-readable location description")
+    spatial_add.add_argument("--caption", default="", help="Agent-produced visual/spatial description")
+    spatial_add.add_argument("--ocr-text", default="", help="Agent/tool-produced OCR text; Meta Memory does not run OCR")
+    spatial_add.add_argument("--objects-file", default="", help="UTF-8 JSON array of recognized objects")
+    spatial_add.add_argument("--confidence", type=float, help="Optional confidence from 0 to 1")
+    spatial_add.add_argument("--observed-at", default="", help="ISO 8601 observation time with offset; defaults to now")
+    spatial_add.add_argument("--valid-until", default="", help="Optional expiry later than observed-at")
+    spatial_add.add_argument("--visibility-scope", choices=["channel", "workspace", "agent", "global"], default="channel", help="Who may retrieve the semantic observation")
+    spatial_add.add_argument("--metadata-file", default="", help="UTF-8 JSON object with transforms or sensor details")
+    spatial_add.add_argument("--idempotency-key", default="", help="Stable retry key for this exact observation")
+    spatial_add.add_argument("--subject-id", default="", help="Person/device concerned; blank/default may represent the shared environment")
+    spatial_add.add_argument("--project", default="auto", help="Source project/workspace")
+    spatial_add.add_argument("--cwd", help="Directory used when --project is auto")
+    spatial_list = spatial_commands.add_parser("list", help="List current semantic observations")
+    spatial_list.add_argument("--channel-id", default="", help="Optional channel filter")
+    spatial_list.add_argument("--map-id", default="", help="Optional stable map filter")
+    spatial_list.add_argument("--include-history", action="store_true", help="Include expired and superseded observations")
+    spatial_list.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    spatial_list.add_argument("--project", default="auto", help="Project context for the request")
+    spatial_list.add_argument("--cwd", help="Directory used when --project is auto")
+    spatial_show = spatial_commands.add_parser("show", help="Show one observation with provenance and links")
+    spatial_show.add_argument("observation_id", help="Observation id returned by spatial add/search")
+    spatial_show.add_argument("--project", default="auto", help="Project context for the request")
+    spatial_show.add_argument("--cwd", help="Directory used when --project is auto")
+    spatial_search = spatial_commands.add_parser("search", help="Search captions, OCR, objects, and locations")
+    spatial_search.add_argument("query", help="Whitespace-separated terms matched across location, caption, OCR, and objects")
+    spatial_search.add_argument("--channel-id", default="", help="Optional channel filter")
+    spatial_search.add_argument("--map-id", default="", help="Optional stable map filter")
+    spatial_search.add_argument("--include-history", action="store_true", help="Include expired and superseded observations")
+    spatial_search.add_argument("--limit", type=int, default=50, help="Maximum rows, bounded to 1000")
+    spatial_search.add_argument("--project", default="auto", help="Project context for the request")
+    spatial_search.add_argument("--cwd", help="Directory used when --project is auto")
     _rename_subcommand_help(commands, {
         "setup": "First-time setup: save config, connect Agents, and install schedules",
         "install-agent": "Connect an Agent after setup or install one explicitly",
+        "install-remote-agent": "Generate a Skill for an Agent on another computer",
+        "init-agents-file": "Create or extend the hosted server Agent bindings",
+        "serve": "Run the central HTTP/HTTPS service for remote Agents",
         "overview": "Start here: one-screen readiness, activity, and next actions",
         "status": "Detailed machine-readable status plus the overview dashboard",
         "doctor": "Read-only health check for the local store",
@@ -420,6 +965,10 @@ Discover a command:
         "project": "See or change the project boundary used for memory",
         "import": "Index local notes or documents as source evidence",
         "resource": "Browse and refresh imported source evidence",
+        "shared": "Manage household/person/device channels and expiring state",
+        "asset": "Store raw images, maps, and other binary assets",
+        "map": "Manage stable maps and immutable map versions",
+        "spatial": "Record or search semantic map and image observations",
         "agent": "Check, repair, or refresh Agent integrations",
         "dream": "Run or inspect background memory consolidation",
         "schedule": "Install, inspect, or remove local background tasks",
@@ -494,6 +1043,16 @@ Discover a command:
   meta-memory install-agent custom --agent-id my-agent --skill-dir ~/.my-agent/skills --no-host-file
   meta-memory install-agent custom --agent-id my-agent --skill-dir ~/.my-agent/skills --host-file ~/.my-agent/AGENTS.md
 """)
+    _set_help(install_remote, description="Generate a non-secret Skill and launcher for an Agent on another device. The launcher pins stable identity and reads the bearer token only from an environment variable.", examples="""Example:
+  meta-memory install-remote-agent --agent-id home-robot --skill-dir ~/.robot/skills --server-url https://memory.example.com --workspace-id home --subject-id person:owner --audience-id <audience-id> --channel-id <channel-id> --token-env META_MEMORY_TOKEN_ROBOT
+""")
+    _set_help(serve_cmd, description="Run the one authoritative SQLite service. Bind localhost behind a TLS reverse proxy, or supply a certificate/key for native HTTPS.", examples="""Examples:
+  meta-memory serve --agents-file ~/.meta-memory/agents.json
+  meta-memory serve --agents-file ~/.meta-memory/agents.json --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem
+""")
+    _set_help(init_agents, description="Create a usable agents.json from the installed package. It stores only token environment-variable names, never bearer-token values.", examples="""Example:
+  meta-memory init-agents-file --output ~/.meta-memory/agents.json --agent-id home-robot --workspace-id home --subject-id person:owner --subject-id person:child --audience-id <audience-id> --audience-id <channel-id> --token-env META_MEMORY_TOKEN_ROBOT
+""")
     _set_help(before_cmd, description="Begin and durably record a Turn, then return bounded relevant context. Agent integrations must run this before drafting.", examples="""Examples:
   meta-memory before --query "What did we decide?"
   meta-memory before --query-file request.txt --turn stable-turn-id
@@ -505,6 +1064,7 @@ Discover a command:
     _set_help(overview_cmd, description="Show the current project, setup readiness, memory queue, recent activity, and exact next commands.", examples="""Examples:
   meta-memory overview
   meta-memory overview --project my-project
+  meta-memory overview --server --agents-file ~/.meta-memory/agents.json
   meta-memory --json overview
 """)
     _set_help(memory_cmd, description="Manage durable Claims. Use `memory show` before correcting, archiving, or forgetting a Claim.", examples="""Examples:
@@ -564,6 +1124,24 @@ Discover a command:
   meta-memory history "deployment"
   meta-memory history show <session-id>
 """)
+    _set_help(shared_cmd, description="Publish only useful shared summaries and current state. Raw conversations and device diagnostics remain in their original workspace/Agent scope.", examples="""Examples:
+  meta-memory shared init --type household --key home --label "Family home" --restricted --member-agent home-robot --member-agent family-planner
+  meta-memory shared publish --channel-id <id> --summary "Refrigerator is not cooling"
+  meta-memory shared state-set --channel-id <id> --state-key last_seen --subject-id person:child --summary "Last seen at playground" --source-ref robot:event-42 --valid-until <future-ISO8601-with-offset>
+""")
+    _set_help(asset_cmd, description="Store raw bytes outside SQLite with SHA-256 deduplication. SQLite retains immutable metadata and map/observation links.", examples="""Examples:
+  meta-memory asset add room.jpg --media-type image/jpeg
+  meta-memory asset show <asset-id>
+  meta-memory asset export <asset-id> --output recovered.jpg
+""")
+    _set_help(map_cmd, description="A stable map id has immutable increasing versions, a coordinate frame, capture time, and an optional raw asset.", examples="""Examples:
+  meta-memory map add --channel-id <id> --map-id home-floor-1 --coordinate-frame map --asset-id <asset-id>
+  meta-memory map list --channel-id <id>
+""")
+    _set_help(spatial_cmd, description="Store Agent/tool-produced captions, OCR, objects, locations, timestamps, confidence, and provenance; Meta Memory does not perform vision, OCR, SLAM, or route planning itself.", examples="""Examples:
+  meta-memory spatial add --channel-id <id> --map-id home-floor-1 --asset-id <asset-id> --location-text kitchen --caption "Water under sink"
+  meta-memory spatial search "water sink" --channel-id <id>
+""")
     _polish_help(parser)
     return parser
 
@@ -579,6 +1157,61 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if command in {"before", "after", "remember", "correct", "search", "history", "memory", "session", "overview", "status", "agent", "import", "resource", "turn", "recovery"}:
         from .runtime import after, before, correct, origin_agent_id, read_text, remember, search
     if args.command == "setup": return _setup(config, args)
+    if args.command == "serve":
+        from .http_api import serve
+
+        root = Path(args.store).expanduser().resolve() if args.store else config.store
+        serve(
+            host=args.host,
+            port=args.port,
+            store=root,
+            agents_file=args.agents_file,
+            config=config,
+            max_asset_bytes=max(1, int(args.max_asset_mb)) * 1024 * 1024,
+            asset_chunk_bytes=max(1, int(args.asset_chunk_mb)) * 1024 * 1024,
+            tls_cert=args.tls_cert,
+            tls_key=args.tls_key,
+        )
+        return {"status": "stopped"}
+    if args.command == "init-agents-file":
+        from .server_config import write_agent_binding
+
+        return write_agent_binding(
+            args.output,
+            profile_id=args.profile_id or config.profile_id,
+            agent_id=args.agent_id,
+            token_env=args.token_env,
+            workspaces=args.workspace_id,
+            subject_ids=args.subject_id,
+            audiences=args.audience_id,
+            replace_agent=args.replace_agent,
+        )
+    if args.command == "install-remote-agent":
+        from .remote_installer import install_remote_agent
+
+        result = install_remote_agent(
+            args.agent_id,
+            args.skill_dir,
+            args.server_url,
+            args.workspace_id,
+            args.subject_id,
+            audience_id=args.audience_id,
+            channel_id=args.channel_id,
+            token_env=args.token_env,
+            outbox_dir=args.outbox_dir,
+            timeout_seconds=args.timeout,
+        )
+        if os.environ.get(args.token_env, "").strip():
+            from .remote_client import RemoteConfig, RemoteMemoryClient
+
+            remote = RemoteConfig.load(str(result["config"]))
+            result["connectivity"] = RemoteMemoryClient(remote).status()
+        else:
+            result["connectivity"] = {
+                "status": "not_checked",
+                "reason": f"{args.token_env} is not set in this process",
+            }
+        return result
     if args.command == "install-agent":
         from .skill_installer import install_agents
         agents = (["all"] if args.all else []) + list(args.agent or [])
@@ -618,8 +1251,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.project_command == "rename": return project_rename(config, old=args.old, new=args.new)
         if args.project_command == "unbind": return project_unbind(config, start=args.cwd, all_bindings=args.all)
         return project_stats(config, project_name=args.project, start=args.cwd)
-    if args.command == "before": return before(config, query=read_text(args.query, args.query_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, turn_uid=args.turn)
-    if args.command == "after": return after(config, turn_uid=args.turn, user_text=read_text(args.user, args.user_file), assistant_text=read_text(args.assistant, args.assistant_file), session=args.session, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
+    if args.command == "before": return before(config, query=read_text(args.query, args.query_file, preserve=True), session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, turn_uid=args.turn)
+    if args.command == "after": return after(config, turn_uid=args.turn, user_text=read_text(args.user, args.user_file, preserve=True), assistant_text=read_text(args.assistant, args.assistant_file, preserve=True), session=args.session, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
     if args.command == "remember": return remember(config, content=read_text(args.content, args.content_file), title=args.title, session=args.session, project_name=args.project, start=args.cwd, agent_id=args.agent_id, scope=args.scope, source_kind=args.source_kind, source_ref=args.source_ref)
     if args.command == "correct": return correct(config, memory_id=args.memory, content=read_text(args.content, args.content_file), agent_id=args.agent_id)
     if args.command == "search":
@@ -685,7 +1318,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "overview":
         from .ux_overview import overview
 
-        return overview(config, project_name=args.project, start=args.cwd, agent_id=args.agent_id)
+        return overview(
+            config, project_name=args.project, start=args.cwd, agent_id=args.agent_id,
+            server=args.server, agents_file=args.agents_file,
+        )
     if args.command == "status":
         from .maintenance import status
         from .ux_overview import overview
@@ -750,7 +1386,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return list_turns(config, agent_id=stable_agent, workspace_id=project.workspace_id, statuses=statuses, limit=args.limit)
         if args.turn_command == "show": return get_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id))
         if args.turn_command == "touch": return touch_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id), note=args.note)
-        if args.turn_command == "complete": return complete_late_turn(config, turn_uid=args.turn_id, assistant_text=read_text(args.assistant, args.assistant_file), agent_id=origin_agent_id(args.agent_id))
+        if args.turn_command == "complete": return complete_late_turn(config, turn_uid=args.turn_id, assistant_text=read_text(args.assistant, args.assistant_file, preserve=True), agent_id=origin_agent_id(args.agent_id))
         return reopen_turn(config, turn_uid=args.turn_id, agent_id=origin_agent_id(args.agent_id), reason=args.reason)
     if args.command == "recovery":
         from .project_detection import resolve_project
@@ -788,6 +1424,10 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.resource_command == "refresh": return resource_refresh(config, resource_id=args.resource_id, project_name=args.project, start=args.cwd, agent_id=origin_agent_id(args.agent_id))
         if args.resource_command == "remove": return resource_remove(config, resource_id=args.resource_id, project_name=args.project, start=args.cwd, all_projects=args.all_projects)
         return resource_export(config, project_name=args.project, start=args.cwd, output=args.output, format=args.format, all_projects=args.all_projects)
+    if args.command == "shared":
+        return _dispatch_shared(config, args)
+    if args.command in {"asset", "map", "spatial"}:
+        return _dispatch_spatial(config, args)
     raise ValueError(f"Unsupported command: {args.command}")
 
 
@@ -826,7 +1466,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         parsed = build_parser().parse_args(_normalise_output_args(raw))
         result = dispatch(parsed)
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, KeyError) as exc:
         _emit({"status": "error", "error": str(exc)})
         raise SystemExit(2) from exc
     output_format = "json" if bool(getattr(parsed, "output_format_json", False)) else str(getattr(parsed, "format", "auto"))

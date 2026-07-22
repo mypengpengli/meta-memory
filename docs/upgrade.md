@@ -1,39 +1,68 @@
-# 升级到 2.7
+# 升级到 2.8
 
-2.7 保持现有 `before`、`after`、`remember`、`search`、`history` 和 `correct`
-命令可用。此次升级重点修复源码目录之外的冷启动，并更新 Agent Skill 接入合同；
-现有本地库会在第一次访问时继续自动应用新增迁移。
+2.8 新增远端 Agent、家庭/人物/设备共享状态、二进制资产、版本化地图和空间语义。
+现有本地 Agent、Claim、Turn、备份和命令保持兼容；数据库会依次通过迁移
+`024`、`025`、`026` 前进，不会把现有 Claim 改写成新 channel 数据。当前最新
+迁移是 `026`。
 
 ## 推荐步骤
 
 ```bash
+git pull
 python -m pip install --upgrade .
-meta-memory agent upgrade-status
+meta-memory doctor
+meta-memory agent upgrade-status --all
 meta-memory agent sync --all
 meta-memory schedule install
 meta-memory overview
-meta-memory agent status --all --verbose
 ```
 
-`agent sync --all` 对 2.7 是必要步骤：它会重新生成引用当前 Python、配置文件和
-新版 Skill 合同的本地 launcher。仓库、虚拟环境或 Python 位置变化后也应再次执行；
-后台任务启用时再运行 `schedule install` 刷新其 launcher。
+`doctor` 应确认最新迁移为 `026`。Overview 会新增 shared activity、current state、
+asset、map 与 spatial observation 计数。原来的本地 Skill contract 不变，但建议
+sync，确保安装记录与当前包版本一致。
 
-## 需要注意的行为变化
+## 启用远端模式
 
-- 自动抽取会优先判断内容是忽略、仅会话保留还是长期候选；明确 `remember` 的内容不受该过滤影响。
-- 普通 `history` 返回受限的完成会话摘要。使用 `history show` 或 `--detail` 才读取有限的详细内容。
-- Deep Dream 使用 `meta-memory dream deep --scan-days 7`；先加 `--dry-run` 可预览。没有来源或来源未变化的 scope 会返回 `idle`。
-- `overview` 是人类优先的状态入口；已有脚本可继续使用 `--json` 和旧 JSON 字段。
-- 安装文件、launcher 验证和宿主实际执行回合现在是三个独立状态。重启 Agent 并完成
-  一个普通回合后，使用 `agent status --all --verbose` 确认 `last_before` 与
-  `last_after` 均已更新，才表示端到端自动接入生效。
-- 任意支持本地 Skill、命令执行、回合内保存 `turn_id` 和 UTF-8 临时文件的 CLI
-  Agent，都可以使用 `install-agent custom` 接入；具体步骤见
-  [Agent 接入契约](agent-integration.md)。
+远端服务不会因升级自动暴露。管理员需要显式完成：
 
-## 数据和排程
+1. `meta-memory shared init` 创建 audience/channel；
+2. 用 `meta-memory init-agents-file` 建立私有 agents 文件，并从上一步复制真实
+   `profile_id`、`audience_id`、`channel_id`；
+3. 为每个 Agent 设置不同 Token 环境变量；
+4. 用 `meta-memory serve` 启动唯一中央服务并通过 HTTPS 发布；
+5. 在远端电脑运行 `install-remote-agent` 并重启宿主；
+6. 完成一个真实 Turn，再确认远端 `status` 为 active。
 
-运行数据保留与可选 compact 只清理已完成的运行性队列、日志和过期 Dream 报告，
-不会默认删除原始会话证据或活动 Claim。保留期可通过
-`meta-memory config list` 查看和修改。
+完整流程见 [Hosted Meta Memory](advanced-http.md)。不要让多个设备通过共享盘直接
+打开同一个 SQLite 文件；它们应全部调用中央服务。Heartbeat/Dream 也只在服务器
+安装一次。
+
+纯服务器请用下面的检查方式；普通 Overview 会检查本地 Agent Skill，因此在没有
+本地 Agent 的服务器上可能有意显示 `NEEDS_ACTION`：
+
+```bash
+meta-memory overview --server --agents-file "$HOME/.meta-memory/agents.json"
+```
+
+## 数据、备份和资产
+
+资产字节存放在 store 下的 `assets/objects`，所以普通 `meta-memory backup` 会连同
+SQLite 和资产一起备份。上传中的分块位于 `assets/uploads`；完成后只保留幂等完成
+凭据。恢复后执行：
+
+```bash
+meta-memory doctor
+meta-memory overview
+meta-memory shared expire
+```
+
+如果使用远端 Agent，升级客户端包后重新运行 `install-remote-agent` 以刷新 Skill
+和 launcher；Token 值仍只留在环境变量，不会写入生成文件。
+
+## 2.7 升级行为仍适用
+
+- Agent 文件安装、launcher 验证和真实 host lifecycle 是三件独立事实；
+- `before → draft → after → send` 顺序不变；
+- 自动建议仍进入可审核 inbox；
+- Heartbeat 默认做增量整理，Deep Dream 保持可追溯；
+- 已完成跨 Agent 摘要只在延续意图下有界召回。

@@ -13,10 +13,20 @@ from .legacy import bootstrap
 from .project_detection import ProjectContext, resolve_project
 
 
-def read_text(value: str | None = None, path: str | Path | None = None) -> str:
+def read_text(
+    value: str | None = None,
+    path: str | Path | None = None,
+    *,
+    preserve: bool = False,
+) -> str:
     if path:
-        return Path(path).expanduser().read_text(encoding="utf-8-sig").strip()
-    return str(value or "").strip()
+        # Decode bytes directly so an exact assistant answer keeps CRLF and
+        # leading/trailing whitespace.  Callers validate emptiness with
+        # ``.strip()`` without mutating the persisted text.
+        text = Path(path).expanduser().read_bytes().decode("utf-8-sig")
+    else:
+        text = str(value or "")
+    return text if preserve else text.strip()
 
 
 def origin_agent_id(explicit: str | None = None) -> str:

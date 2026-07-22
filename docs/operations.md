@@ -1,14 +1,13 @@
 # Meta Memory 实际操作指南
 
 这份文档面向准备日常使用 Meta Memory 的人。它以“要完成什么”组织命令；
-所有命令都可附加 `--json` 获取机器可读输出。
+需要机器可读输出时，把全局开关放在子命令前，例如
+`meta-memory --json overview`，不要写成 `meta-memory overview --json`。
 
 ## 第一次使用
 
 ```bash
-meta-memory setup
-meta-memory install-agent codex
-meta-memory agent sync --all
+meta-memory setup --agents codex
 meta-memory overview
 ```
 
@@ -124,3 +123,66 @@ meta-memory inbox list
 ```
 
 优先根据 `next_action` 处理，不要靠重复发送同一段对话来赌后台是否会整理成功。
+
+## 远端 Agent、家庭状态和空间资产
+
+服务器是唯一 SQLite 写入者；远端电脑只运行生成的 Skill/launcher：
+
+```bash
+# 服务器：记录返回的 profile_id、audience_id 和 channel_id。
+meta-memory --json shared init --type household --key home --restricted \
+  --member-agent home-robot
+
+# 用上一步真实 ID 生成绑定文件；subject-id 和 audience-id 可重复。
+PROFILE_ID='paste audience.profile_id here'
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory init-agents-file --output "$HOME/.meta-memory/agents.json" \
+  --agent-id home-robot --profile-id "$PROFILE_ID" \
+  --workspace-id home-robot-workspace \
+  --subject-id person:owner --subject-id person:child \
+  --audience-id "$AUDIENCE_ID" --audience-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+
+export META_MEMORY_TOKEN_HOME_ROBOT='<one-token-value>'
+meta-memory overview --server --agents-file "$HOME/.meta-memory/agents.json"
+meta-memory serve --agents-file "$HOME/.meta-memory/agents.json"
+
+# 远端电脑：环境变量必须使用服务器上的同一个 Token 值。
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory install-remote-agent --agent-id home-robot \
+  --skill-dir "$HOME/.robot/skills" --server-url https://memory.example.com \
+  --workspace-id home-robot-workspace --subject-id person:owner \
+  --audience-id "$AUDIENCE_ID" --channel-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+export META_MEMORY_TOKEN_HOME_ROBOT='<the-same-token-value>'
+```
+
+远端日常检查使用生成 launcher 的 `status` 和 `recovery`。服务器上的 Overview
+使用 `--server --agents-file ...` 后会检查服务端配置和 shared activity、current
+state、asset、map、spatial observation；普通 `overview` 检查的是本地 Agent，纯
+服务器没有本地 Skill 时显示 `NEEDS_ACTION` 并不代表 HTTP 服务坏了。
+
+PowerShell 用反引号换行，并用
+`$env:META_MEMORY_TOKEN_HOME_ROBOT = '<the-same-token-value>'` 设置 Token；要手工
+复制示例文件时使用 `Copy-Item`，不是 `cp`。完整 Windows 与 Bash 流程见
+[Hosted Meta Memory](advanced-http.md)。
+
+家庭共享只发布有用摘要。人物位置等易变事实用 `shared state-set` 并设置过期时间；
+图片/视频/点云先用 `asset` 保存，地图用稳定 `map_id` 建版本，最后用 `spatial`
+记录可检索说明和链接。远端可直接读取：
+
+```text
+<launcher> shared channels
+<launcher> shared feed --limit 20
+<launcher> shared states --subject-id person:child --limit 20
+<launcher> spatial search "water sink" --limit 10
+<launcher> spatial get --observation-id <observation-id>
+```
+
+不配置 channel 时，普通 Turn 和 workspace 记忆仍可使用，但 `shared_context` 为空，
+也不能发布 activity/state/map/spatial；请重新安装真实 channel，不要让 Agent 猜 ID。
+上传中断时保留未修改的原文件并重复同一条 `asset upload` 命令续传。Meta Memory
+只存上游 Agent 得到的图片说明、OCR、对象和地图结果，不执行视觉识别、SLAM 或
+路径规划。完整模型与操作见 [家庭和空间记忆](shared-world-memory.md)。

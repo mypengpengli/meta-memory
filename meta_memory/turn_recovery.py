@@ -40,22 +40,47 @@ def unfinished_warnings(config: AppConfig, *, agent_id: str, workspace_id: str, 
     ]
 
 
-def recover_expired_turns(config: AppConfig, *, limit: int = 50) -> dict[str, object]:
-    """Replayable completions win; otherwise preserve user evidence and abandon."""
+def recover_expired_turns(
+    config: AppConfig,
+    *,
+    limit: int = 50,
+    agent_id: str = "",
+    workspace_id: str = "",
+) -> dict[str, object]:
+    """Recover expired turns, optionally bounded to one remote principal.
+
+    Local maintenance intentionally leaves both filters empty and processes the
+    whole profile.  An authenticated HTTP request supplies both filters so it
+    can never inspect or age another Agent's work.
+    """
 
     from _common import open_db
     from .turn_service import abandon_turn, complete_turn
 
     conn = open_db(Path(config.store))
     try:
+        clauses = [
+            "profile_id=?", "status='started'",
+            "julianday(COALESCE(NULLIF(last_active_at,''),started_at))<=julianday('now', ?)",
+        ]
+        params: list[object] = [
+            config.profile_id,
+            f"-{max(1, int(config.turns_abandon_after_minutes))} minutes",
+        ]
+        if agent_id:
+            clauses.append("origin_agent_id=?")
+            params.append(str(agent_id))
+        if workspace_id:
+            clauses.append("workspace_id=?")
+            params.append(str(workspace_id))
+        params.append(max(1, int(limit)))
         rows = conn.execute(
-            """
+            f"""
             SELECT turn_uid,origin_agent_id,assistant_event_id FROM turns
-            WHERE profile_id=? AND status='started'
-              AND julianday(COALESCE(NULLIF(last_active_at,''),started_at))<=julianday('now', ?)
+            WHERE {' AND '.join(clauses)}
             ORDER BY COALESCE(NULLIF(last_active_at,''),started_at) LIMIT ?
             """,
-            (config.profile_id, f"-{max(1, int(config.turns_abandon_after_minutes))} minutes", max(1, limit)),
+            tuple(params),
         ).fetchall()
         assistant_text = {
             str(row[0]): str(

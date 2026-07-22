@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from unittest.mock import patch
 
 from meta_memory.config import AppConfig
 from meta_memory.legacy import bootstrap
-from meta_memory.runtime import after, before
+from meta_memory.runtime import after, before, read_text
 
 bootstrap()
 from _common import open_db
@@ -108,6 +109,31 @@ class TurnLifecycleTests(unittest.TestCase):
             conn.close()
         self.assertEqual(row[0], "degraded")
         self.assertIn("offline retrieval", row[1])
+
+    def test_answer_file_preserves_exact_whitespace_and_crlf(self) -> None:
+        answer_file = Path(self.temp.name) / "answer.txt"
+        answer_file.write_bytes(b"\xef\xbb\xbf  exact answer\r\nsecond line  \r\n")
+        exact = read_text(path=answer_file, preserve=True)
+        self.assertEqual(exact, "  exact answer\r\nsecond line  \r\n")
+        started = before(
+            self.config,
+            query="Preserve the exact answer bytes after UTF-8 decoding.",
+            session="session-exact",
+            start=self.temp.name,
+            agent_id="codex",
+            turn_uid="turn-exact-answer",
+        )
+        completed = after(self.config, turn_uid=str(started["turn_id"]), assistant_text=exact)
+        self.assertEqual(completed["answer_sha256"], hashlib.sha256(exact.encode("utf-8")).hexdigest())
+        conn = open_db(self.config.store)
+        try:
+            stored = conn.execute(
+                "SELECT content FROM raw_events WHERE id=?",
+                (int(completed["assistant_event_id"]),),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(stored, exact)
 
 
 if __name__ == "__main__":

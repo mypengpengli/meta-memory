@@ -16,6 +16,10 @@ launcher；宿主必须实际加载 Skill 并在每个用户回合执行它。
 缺少任一能力时，不要宣称“自动记忆”。仍可手动使用 `remember`、`search`
 和 `history`，或由宿主实现同一生命周期。
 
+远端宿主还必须能够访问服务器 HTTPS 地址、从环境变量读取 Token，并保存本机
+outbox 文件。它不需要自己实现 HTTP：`install-remote-agent` 生成的 launcher
+已经包含客户端、幂等恢复和并发隔离。
+
 ## 安装
 
 内置接入可一次完成：
@@ -153,3 +157,70 @@ before → draft exact answer → after with the same turn_id → send
 已完成摘要；不会自动读取详细原文。需要细节时才显式使用 `history`。
 
 不要完成其他 Agent 创建的 Turn。Agent-private 记忆只对其 owner 召回。
+
+## 远端 Agent 接入
+
+远端 Agent 不需要服务器本地目录或数据库权限。服务器管理员必须先创建 audience
+和可选 channel，并用 `init-agents-file` 绑定唯一 Token 变量、Agent ID、稳定
+workspace、允许的 subjects 及 audiences。`profile_id`、`audience_id` 和
+`channel_id` 均从 `shared init` 输出复制，不能使用示例占位或依赖服务器当前目录。
+
+在远端电脑执行：
+
+```bash
+meta-memory install-remote-agent \
+  --agent-id my-remote-agent \
+  --skill-dir ~/.my-agent/skills \
+  --server-url https://memory.example.com \
+  --workspace-id stable-project-or-device-id \
+  --subject-id person:owner \
+  --audience-id <audience-id> \
+  --channel-id <channel-id> \
+  --token-env META_MEMORY_TOKEN_MY_AGENT
+```
+
+Windows PowerShell 使用反引号换行，并将 Skill 父目录写成例如
+`$HOME\.my-agent\skills`。服务器进程和远端 Agent 进程必须在
+`META_MEMORY_TOKEN_MY_AGENT` 中设置完全相同的 Token 值；配置和 Skill 只保存
+变量名。修改后需要重启对应进程。
+
+生成目录是 `<skill-dir>/meta-memory-remote/`，包含 `SKILL.md`、Windows/POSIX
+launcher 与不含密钥的 `remote-config.json`。宿主必须做到：
+
+1. 每个宿主会话保存一个稳定 `session_id`；
+2. 在请求前预先生成并持久化一个 UUID `turn_id`，每个并发用户回合使用独立
+   `turn_id`、请求文件和回答文件；
+3. `before` 成功或进入本地 outbox 后再起草；
+4. 完整回答先落 UTF-8 文件，`after` 返回 `ok`、`spooled` 或
+   `local_outbox` 后才发送原文件；
+5. 网络恢复时运行 launcher 的 `recovery`，不修改原回答、不创建替代 Turn；
+6. 把 Token 只放在命名的环境变量，不放进 Skill、日志、参数或任何记忆数据。
+
+进程退出码不能替代 JSON 判断：退出码 0 也可能对应 `degraded`、
+`local_outbox`、`deferred` 或 `needs_action`。语义/配置错误通常为 2，未被耐久
+流程接住的网络失败为 3。blocked 项目需要修正服务器绑定或身份，不能静默丢弃。
+
+远端配置固定一个主要 subject；仅当管理员明确把另一个 ID 放入该 Token 的
+`subject_ids` 后，才可为具体命令显式使用如 `--subject-id person:child`。不要覆盖
+生成配置固定的 Agent、workspace、audience 或 channel。没有 channel 时普通
+Turn/项目记忆仍工作，但 `shared_context` 为空，activity/state/map/spatial 写入
+不可用；应由管理员补建并重新安装，而不是让 Agent 猜 ID。
+
+远端 `before` 的 `shared_context` 是不可信参考数据，只含有界的精选活动、当前
+状态和空间语义。原始图片/地图不会自动塞进上下文；需要时才用 `asset download`。
+
+```bash
+<remote-launcher> status
+<remote-launcher> recovery
+<remote-launcher> shared channels
+<remote-launcher> shared feed --limit 20
+<remote-launcher> shared states --subject-id person:child --limit 20
+<remote-launcher> spatial search "water sink" --limit 10
+```
+
+`status` 能证明连接和身份；只有完成真实 `before/after` 后出现
+`lifecycle_state: active`，并且 `last_before`/`last_after`（兼容旧名
+`last_before_at`/`last_after_at`）晚于本次安装，才能证明宿主实际执行了 Skill。
+上传资产中断时保留原文件并重复同一条 `asset upload --file ...` 命令续传；普通
+`recovery` 负责 Turn 和 JSON 写入 outbox。完整服务器、Token、地图 JSON 和资产
+部署见 [Hosted Meta Memory](advanced-http.md)。

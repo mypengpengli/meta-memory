@@ -116,6 +116,7 @@ def begin_turn(
     agent_id: str,
     cwd: str | Path | None = None,
     requested_turn_uid: str = "",
+    project_context: ProjectContext | None = None,
 ) -> dict[str, Any]:
     """Persist the user request before attempting retrieval.
 
@@ -133,7 +134,10 @@ def begin_turn(
     from session_archive import ensure_session
     from .session_manager import resolve_session
 
-    project = resolve_project(config, project_name, cwd)
+    # Remote transports must supply a stable workspace directly: resolving it
+    # from the HTTP server's cwd would silently collapse unrelated clients into
+    # the server checkout.  Local callers keep the existing auto-detection.
+    project = project_context or resolve_project(config, project_name, cwd)
     stable_agent = _agent(agent_id)
     session_resolution = resolve_session(
         config,
@@ -382,6 +386,7 @@ def complete_turn(
                 "queued": bool(row[8]),
                 "idempotent": True,
                 "late_completion": previous_status == "completed_late",
+                "answer_sha256": response_hash,
             }
         if not row[6]:
             raise ValueError("Turn has no persisted user event and cannot be completed.")
@@ -461,6 +466,7 @@ def complete_turn(
             "queued": True,
             "idempotent": False,
             "late_completion": late_completion,
+            "answer_sha256": response_hash,
         }
     except Exception:
         conn.rollback()

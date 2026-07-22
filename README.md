@@ -1,10 +1,10 @@
 # Meta Memory
 
-> Local, durable memory for AI agents — with inspectable evidence, reviewable changes, and a CLI that tells you what to do next.
+> Local or hosted durable memory for AI agents — with inspectable evidence, reviewable changes, and a CLI that tells you what to do next.
 
-Meta Memory gives your local AI agents a shared memory store without turning every conversation into an opaque database. It remembers durable facts and project decisions, keeps source evidence, lets you correct or retire a memory, and continuously consolidates completed work in the background.
+Meta Memory gives AI agents on one computer—or remote Agents using one central server—a shared memory store without turning every conversation into an opaque database. It remembers durable facts and project decisions, keeps source evidence, lets you correct or retire a memory, and continuously consolidates completed work in the background. Household activity, time-bounded person/device state, images, maps, and robot observations have explicit storage and sharing boundaries.
 
-Useful companion documents: [practical operations](docs/operations.md), [Agent integration](docs/agent-integration.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
+Useful companion documents: [practical operations](docs/operations.md), [Agent integration](docs/agent-integration.md), [hosted deployment](docs/advanced-http.md), [household and spatial memory](docs/shared-world-memory.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
 
 # 中文
 
@@ -239,6 +239,8 @@ meta-memory restore "$HOME/meta-memory-backup.zip" --destination "$HOME/.meta-me
 | 找回了错误的内容 | `meta-memory memory show <claim-id>` | `memory correct` 或 `memory archive` |
 | 后台整理看起来没有运行 | `meta-memory schedule status` | `schedule install`，再看 `dream status` |
 | 回复过程中发生中断 | `meta-memory recovery replay` | `turn list --unfinished` |
+| 远端 Agent 连不上 | 远端 launcher 的 `status` | 检查 HTTPS、Token 环境变量和稳定 workspace id |
+| 远端回复待重试 | 远端 launcher 的 `recovery` | 保留原回答文件，不新建 Turn、不改写回答 |
 
 完整排错流程在 [troubleshooting](docs/troubleshooting.md)。命令本身的可发现性入口始终是：
 
@@ -246,6 +248,143 @@ meta-memory restore "$HOME/meta-memory-backup.zip" --destination "$HOME/.meta-me
 meta-memory --help
 meta-memory <command> --help
 ```
+
+## 远端 Agent、家庭机器人与共享记忆
+
+远端 Agent 不直接读写 SQLite。选择一台服务器作为唯一数据所有者，服务器运行
+`meta-memory serve`；其他电脑、云 Agent 或机器人安装生成的远端 Skill，通过
+HTTPS 使用同一个完整生命周期。
+
+远端宿主除了能够加载 Skill，还必须能执行 launcher、读取 JSON、写 UTF-8 文件、
+在同一会话保存 `session_id`、在同一回合保存 `turn_id`，并从环境变量读取 Token。
+HTTP、重试、幂等和分块续传由生成客户端负责。
+
+### 服务器端：完整最小路径
+
+```bash
+# 1. 初始化中央存储与唯一后台整理任务。
+meta-memory setup --name "Family memory" --maintenance yes --dream yes --non-interactive
+
+# 2. 建立受限家庭共享边界。
+meta-memory --json shared init --type household --key home --label "家庭" \
+  --restricted --member-agent home-robot --member-agent family-planner
+
+# 3. 从输出复制真实 profile_id、audience_id、channel_id，生成服务器绑定。
+PROFILE_ID='paste audience.profile_id here'
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory init-agents-file --output "$HOME/.meta-memory/agents.json" \
+  --agent-id home-robot --profile-id "$PROFILE_ID" \
+  --workspace-id home-robot-workspace \
+  --subject-id person:owner --subject-id person:child \
+  --audience-id "$AUDIENCE_ID" --audience-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+
+# 4. Token 值只放环境变量；agents.json 只保存变量名。
+export META_MEMORY_TOKEN_HOME_ROBOT='<one-generated-token-value>'
+
+# 5. 纯服务器使用 server Overview，然后启动唯一服务。
+meta-memory overview --server --agents-file "$HOME/.meta-memory/agents.json"
+meta-memory serve --agents-file "$HOME/.meta-memory/agents.json" \
+  --host 127.0.0.1 --port 8765
+```
+
+PowerShell 使用反引号续行和
+`$env:META_MEMORY_TOKEN_HOME_ROBOT = '<one-generated-token-value>'`。需要人工复制
+示例配置时，Windows 使用
+`Copy-Item extras\http\agents.example.json "$HOME\.meta-memory\agents.json"`；示例中的
+`profile_id` 必须替换为 `shared init` 输出，不能自行写 `family-profile`。
+
+生产环境推荐由反向代理把 `https://memory.example.com` 转发到本机 8765；也可给
+`serve` 传 `--tls-cert/--tls-key`。只有服务器安装 Heartbeat/Dream 计划任务，
+不要让多个远端设备各自整理同一中央库。
+
+### 远端 Agent 电脑
+
+```bash
+# 先安装到持久 Python 环境；launcher 会固定这个解释器。
+python -m pip install "git+https://github.com/mypengpengli/meta-memory.git"
+
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory install-remote-agent \
+  --agent-id home-robot \
+  --skill-dir "$HOME/.robot/skills" \
+  --server-url https://memory.example.com \
+  --workspace-id home-robot-workspace \
+  --subject-id person:owner \
+  --audience-id "$AUDIENCE_ID" \
+  --channel-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+
+# 必须与服务器对应变量使用完全相同的 Token 值。
+export META_MEMORY_TOKEN_HOME_ROBOT='<the-same-token-value>'
+```
+
+设置 Token 环境变量并重启 Agent，然后用安装结果中的 launcher 执行 `status`。
+完成一个真实对话回合后，`lifecycle_state: active`、新的 `last_before/last_after`
+（兼容旧名 `last_before_at/last_after_at`）和 `local_outbox_pending: 0` 才表示端到端
+可用。
+
+远端 Skill 会要求每个回合在网络请求前预先保存 UUID `turn_id`，并处理稳定
+`session_id`、回答发送前的完整缓冲、精确回答 SHA-256、并发回合独立文件和网络
+中断 outbox。断网后运行 launcher 的 `recovery`；必须读取 JSON `status`，因为
+退出码 0 也可能是 `degraded`、`local_outbox`、`deferred` 或 `needs_action`。保留
+原回答，不要新建第二个 Turn 或在同一 Turn 下改写答案。
+
+`channel_id` 可省略：普通 Turn、workspace Claim 和资产仍可使用，但
+`shared_context` 为空，不能发布 activity/state/map/spatial。需要共享信息时让
+管理员创建真实 channel 并重新安装；不要让 Agent 猜 ID。服务器允许多个
+`subject_ids` 时，机器人可显式为例如 `person:child` 记录状态；未在白名单内的
+subject 会被拒绝。
+
+### 机器人发现的事情、人物位置和地图
+
+不要把所有机器人日志广播给所有 Agent。内部诊断留在 device/Agent 范围；只有
+其他 Agent 真正需要的结果才发布到 household/person channel：
+
+```bash
+# 可共享事件：某物损坏。
+meta-memory shared publish --channel-id <channel-id> \
+  --kind household --summary "冰箱不制冷，需要维修"
+
+# 会变化的短时事实：必须有时间、来源、置信度和过期时间。
+meta-memory shared state-set --channel-id <channel-id> \
+  --subject-id person:child --state-key last_seen \
+  --summary "最后看到孩子在小区游乐场入口" \
+  --source-ref robot-camera:event-42 --confidence 0.92 \
+  --observed-at <ISO-8601-observed-at> \
+  --valid-until <ISO-8601-short-expiry>
+
+# 图片/点云/栅格原始字节独立保存；语义观察只保存说明和链接。
+meta-memory asset add room.jpg --media-type image/jpeg
+meta-memory map add --channel-id <channel-id> --map-id home-floor-1 \
+  --coordinate-frame map --asset-id <asset-id>
+meta-memory spatial add --channel-id <channel-id> --map-id home-floor-1 \
+  --asset-id <asset-id> --location-text kitchen --caption "水槽下方有积水"
+```
+
+远端 Agent 可以直接读取共享结果：
+
+```text
+<launcher> shared channels
+<launcher> shared feed --limit 20
+<launcher> shared states --subject-id person:child --state-key last_seen --limit 20
+<launcher> spatial search "water sink" --limit 10
+<launcher> spatial get --observation-id <observation-id>
+```
+
+远端 launcher 的 `asset upload` 使用分块、哈希、去重和可恢复上传；中断后保留
+未修改的原文件，重复同一条上传命令即可续传。实际可用的 `map put` JSON 应包含
+稳定 `map_id`、`coordinate_frame`、采集时间和对象类型 `metadata`；识别对象文件
+必须是 JSON 数组。其他 Agent 在 `before` 中只收到有界活动、当前未过期状态和
+空间语义，确实需要原图时才调用 `asset download`。
+
+Meta Memory 不做图片理解、OCR、物体识别、SLAM、地图融合或路径规划；机器人或
+上游模型先完成这些计算，再同步语义结果、来源、时间、置信度和原始资产链接。
+完整首次部署、Windows/Bash 命令和 map JSON 见
+[Hosted Meta Memory](docs/advanced-http.md)，模型与操作见
+[家庭和空间记忆](docs/shared-world-memory.md)。
 
 ## 给自定义 Agent 集成者
 
@@ -320,7 +459,50 @@ meta-memory import notes.md --project auto
 meta-memory resource list
 ```
 
-An installed Agent performs the durable lifecycle only when its host loads the generated Skill. The strict order is `before → draft → after → send`; send the exact response only after `ok` or a deferred `spooled` completion. See [Agent integration](docs/agent-integration.md) for custom installation, capability checks, and failure handling.
+An installed Agent performs the durable lifecycle only when its host loads the generated Skill. The strict order is `before → draft → after → send`; send the exact response only after `ok` or a deferred `spooled`/remote `local_outbox` completion. See [Agent integration](docs/agent-integration.md) for custom installation, capability checks, and failure handling.
+
+## Hosted remote Agents
+
+Run one central service for Agents on other computers or robots:
+
+```bash
+# Server: retain profile/audience/channel IDs from this JSON result.
+meta-memory --json shared init --type household --key home --restricted \
+  --member-agent home-robot
+PROFILE_ID='paste audience.profile_id here'
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory init-agents-file --output "$HOME/.meta-memory/agents.json" \
+  --agent-id home-robot --profile-id "$PROFILE_ID" \
+  --workspace-id home-robot-workspace \
+  --subject-id person:owner --subject-id person:child \
+  --audience-id "$AUDIENCE_ID" --audience-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+export META_MEMORY_TOKEN_HOME_ROBOT='<one-token-value>'
+meta-memory overview --server --agents-file "$HOME/.meta-memory/agents.json"
+meta-memory serve --agents-file "$HOME/.meta-memory/agents.json"
+
+# Remote computer: set the exact same token value, then restart the Agent host.
+python -m pip install "git+https://github.com/mypengpengli/meta-memory.git"
+AUDIENCE_ID='paste audience.audience_id here'
+CHANNEL_ID='paste channel.channel_id here'
+meta-memory install-remote-agent --agent-id home-robot \
+  --skill-dir "$HOME/.robot/skills" --server-url https://memory.example.com \
+  --workspace-id home-robot-workspace --subject-id person:owner \
+  --audience-id "$AUDIENCE_ID" --channel-id "$CHANNEL_ID" \
+  --token-env META_MEMORY_TOKEN_HOME_ROBOT
+export META_MEMORY_TOKEN_HOME_ROBOT='<the-same-token-value>'
+```
+
+The remote Skill manages exact-answer buffering, per-Turn identity, concurrent
+receipts, and a durable local outbox. A channel is optional: ordinary Turns and
+workspace memory still work without one, but shared context and world writes
+do not. Hosted `before` returns bounded shared activity, current time-bounded
+state, and spatial semantics only when a real channel is configured. Binary
+images/maps use resumable asset upload and are fetched only on demand. Meta
+Memory stores upstream perception/map results; it is not a vision, SLAM, or
+navigation engine. See [hosted deployment](docs/advanced-http.md) and
+[shared-world memory](docs/shared-world-memory.md).
 
 ## Operations
 

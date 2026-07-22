@@ -319,8 +319,8 @@ def add_shared_record_args(parser: argparse.ArgumentParser) -> None:
 
 def read_text_arg(value: str | None, path: str | None) -> str:
     if path:
-        return Path(path).read_text(encoding="utf-8-sig").strip()
-    return (value or "").strip()
+        return Path(path).read_bytes().decode("utf-8-sig")
+    return value or ""
 
 
 def write_json_file(path: str | None, payload: dict[str, object]) -> None:
@@ -468,7 +468,7 @@ def prepare_context(args: argparse.Namespace) -> dict[str, object]:
     root = store_root(args.store)
     bootstrap = ensure_store_ready(root)
     query = read_text_arg(args.query, args.query_file)
-    if not query:
+    if not query.strip():
         raise SystemExit("Query is required via --query or --query-file.")
 
     from build_hot_memory import freeze_hot_snapshot
@@ -585,7 +585,7 @@ def capture_reply_artifact(
     if not args.capture_artifact or not reply.strip():
         return None
 
-    title = read_text_arg(args.artifact_title, args.artifact_title_file) or reply.splitlines()[0][:60].strip() or "Reply Artifact"
+    title = read_text_arg(args.artifact_title, args.artifact_title_file).strip() or reply.splitlines()[0][:60].strip() or "Reply Artifact"
     payload: dict[str, object] = {}
     artifact_args = argparse.Namespace(
         subject_id=args.subject_id,
@@ -806,7 +806,7 @@ def remember_memory(args: argparse.Namespace) -> dict[str, object]:
 def record_event(args: argparse.Namespace) -> dict[str, object]:
     payload = load_memory_payload(args.payload_file)
     content = read_text_arg(args.content, args.content_file) or str(payload.get("content", "")).strip()
-    if not content:
+    if not content.strip():
         raise SystemExit("Content is required via --content, --content-file, or --payload-file.")
     root = store_root(args.store)
     bootstrap = ensure_store_ready(root)
@@ -835,7 +835,7 @@ def finalize_turn(args: argparse.Namespace) -> dict[str, object]:
     root = store_root(args.store)
     bootstrap = ensure_store_ready(root)
     reply = read_text_arg(args.reply, args.reply_file)
-    if not reply and not args.skip_record_reply:
+    if not reply.strip() and not args.skip_record_reply:
         raise SystemExit("Reply is required via --reply or --reply-file unless --skip-record-reply is set.")
 
     recorded = None

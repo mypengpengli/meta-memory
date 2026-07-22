@@ -1,4 +1,4 @@
 interface:
   display_name: "Meta Memory"
-  short_description: "Durable before/after memory lifecycle for local CLI Agents"
+  short_description: "Durable local or hosted memory lifecycle for AI Agents"
   default_prompt: "Use $meta-memory to recall bounded context before drafting and save the exact final answer before sending it."

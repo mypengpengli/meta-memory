@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -148,6 +149,25 @@ def cleanup_operational_data(config: AppConfig, *, force: bool = False) -> dict[
         conn.commit()
     finally:
         conn.close()
+
+    # Hosted resumable uploads keep a tiny completion receipt so an ambiguous
+    # final HTTP acknowledgement can be retried idempotently.  Remove only
+    # upload directories that have been untouched beyond the operational
+    # retention window; authoritative completed assets live elsewhere.
+    upload_root = (root / "assets" / "uploads").resolve()
+    removed_uploads = 0
+    upload_cutoff = datetime.now(timezone.utc) - timedelta(days=operational_days)
+    if upload_root.is_dir():
+        for directory in upload_root.iterdir():
+            try:
+                resolved = directory.resolve()
+                modified = datetime.fromtimestamp(directory.stat().st_mtime, timezone.utc)
+                if directory.is_dir() and resolved.is_relative_to(upload_root) and modified < upload_cutoff:
+                    shutil.rmtree(resolved)
+                    removed_uploads += 1
+            except OSError:
+                continue
+    result["asset_upload_receipts"] = removed_uploads
 
     # These operations are intentionally outside the write transaction.
     conn = open_db(root)

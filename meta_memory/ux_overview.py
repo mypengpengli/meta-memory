@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +187,8 @@ def overview(
     project_name: str = "auto",
     start: str | Path | None = None,
     agent_id: str = "",
+    server: bool = False,
+    agents_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return a stable dashboard with explicit readiness and next actions.
 
@@ -220,6 +222,33 @@ def overview(
         resources = int(conn.execute(
             "SELECT COUNT(*) FROM resource_imports WHERE profile_id=? AND workspace_id=? AND subject_id=?",
             scope,
+        ).fetchone()[0])
+        # Shared-world tables are introduced by migration 024.  They are
+        # profile-wide on purpose: a household activity or map may originate
+        # in another workspace and still be useful to the current Agent.
+        moment = datetime.now(timezone.utc).isoformat()
+        activities = int(conn.execute(
+            "SELECT COUNT(*) FROM shared_activities WHERE profile_id=? AND status='active' "
+            "AND (valid_until IS NULL OR valid_until>?)",
+            (config.profile_id, moment),
+        ).fetchone()[0])
+        temporal_states = int(conn.execute(
+            "SELECT COUNT(*) FROM temporal_states WHERE profile_id=? AND status='active' "
+            "AND valid_from<=? AND (valid_until IS NULL OR valid_until>?)",
+            (config.profile_id, moment, moment),
+        ).fetchone()[0])
+        assets = int(conn.execute(
+            "SELECT COUNT(*) FROM binary_assets WHERE profile_id=? AND status='active'",
+            (config.profile_id,),
+        ).fetchone()[0])
+        maps = int(conn.execute(
+            "SELECT COUNT(DISTINCT map_id) FROM spatial_maps WHERE profile_id=? AND status='active'",
+            (config.profile_id,),
+        ).fetchone()[0])
+        observations = int(conn.execute(
+            "SELECT COUNT(*) FROM spatial_observations WHERE profile_id=? AND status='active' "
+            "AND (valid_until IS NULL OR valid_until>?)",
+            (config.profile_id, moment),
         ).fetchone()[0])
         requested_agent = str(agent_id or "").strip()
         if requested_agent:
@@ -265,21 +294,43 @@ def overview(
     except (OSError, RuntimeError) as exc:
         scheduler = {"status": "warning", "error": str(exc), "expected": []}
     agent_error = ""
-    try:
-        from .agent_status import agent_status
-
-        agents = agent_status(
-            config, agent_id=origin_agent_id(agent_id), installed_default=True,
-            project_name=project_name, start=start,
-        ).get("agents", [])
-    except (OSError, RuntimeError) as exc:
+    if server:
         agents = []
-        agent_error = str(exc)
+    else:
+        try:
+            from .agent_status import agent_status
+
+            agents = agent_status(
+                config, agent_id=origin_agent_id(agent_id), installed_default=True,
+                project_name=project_name, start=start,
+            ).get("agents", [])
+        except (OSError, RuntimeError) as exc:
+            agents = []
+            agent_error = str(exc)
 
     agent_summary = _agent_readiness([row for row in agents if isinstance(row, dict)])
     if agent_error:
         agent_summary = {"status": "unknown", "installed": 0, "usable": 0, "agents": [], "error": agent_error}
     scheduler_summary = _scheduler_readiness(scheduler)
+    hosted_readiness: dict[str, Any] | None = None
+    if server:
+        selected_agents = Path(agents_file).expanduser().resolve() if agents_file else None
+        if selected_agents is None:
+            hosted_readiness = {"status": "not_configured", "agents_file": "", "agents": 0}
+        else:
+            try:
+                from .http_api import load_principals
+
+                principals = load_principals(selected_agents)
+                hosted_readiness = {
+                    "status": "ready", "agents_file": str(selected_agents),
+                    "agents": len(principals),
+                }
+            except (OSError, ValueError) as exc:
+                hosted_readiness = {
+                    "status": "error", "agents_file": str(selected_agents),
+                    "agents": 0, "error": str(exc),
+                }
     config_exists = Path(config.path).expanduser().is_file()
     last_error = (
         str(latest[4] or "")
@@ -298,18 +349,28 @@ def overview(
         actions.append(_action("review_memory_proposals", "meta-memory inbox list", "Review pending memory proposals.", priority=40))
     if review or projections:
         actions.append(_action("run_heartbeat", "meta-memory dream heartbeat", "Process queued consolidation work now.", priority=50))
-    if agent_summary["status"] == "unknown":
+    if not server and agent_summary["status"] == "unknown":
         actions.append(_action("inspect_agent_integration", "meta-memory agent status --all --verbose", "Inspect why the Agent integration could not be read.", priority=55))
-    elif agent_summary["status"] == "error":
+    elif not server and agent_summary["status"] == "error":
         actions.append(_action("inspect_agent_error", "meta-memory agent status --all --verbose", "Inspect the Agent lifecycle error before relying on automatic memory.", priority=55))
     if scheduler_summary["status"] == "unknown":
         actions.append(_action("inspect_schedule", "meta-memory schedule status", "Inspect why the local scheduler could not be read.", priority=55))
 
-    if not config_exists:
+    if server and hosted_readiness and hosted_readiness["status"] == "not_configured":
+        actions.append(_action(
+            "create_server_agents_file", "meta-memory init-agents-file --help",
+            "Create the server binding for at least one remote Agent.", priority=60,
+        ))
+    elif server and hosted_readiness and hosted_readiness["status"] == "error":
+        actions.append(_action(
+            "repair_server_agents_file", "meta-memory overview --server --agents-file <path>",
+            "Set every token_env on the server and repair the Agent binding file.", priority=60,
+        ))
+    elif not config_exists:
         actions.append(_action("save_initial_setup", "meta-memory setup --agents codex", "Save configuration and connect your first Agent.", priority=60))
-    elif agent_summary["status"] == "not_installed":
+    elif not server and agent_summary["status"] == "not_installed":
         actions.append(_action("install_agent", "meta-memory install-agent codex", "Connect an Agent so conversations use memory automatically.", priority=70))
-    elif agent_summary["status"] == "needs_install":
+    elif not server and agent_summary["status"] == "needs_install":
         names = [str(name) for name in agent_summary.get("needs_install", [])]
         builtin = {"codex", "claude-code", "openclaw"}
         if names and all(name in builtin for name in names):
@@ -319,22 +380,30 @@ def overview(
             command = "meta-memory agent status --all --verbose"
             detail = "Inspect the partial custom integration, then rerun install-agent custom with its original Skill path."
         actions.append(_action("reinstall_agent", command, detail, priority=70))
-    elif agent_summary["status"] == "needs_sync":
+    elif not server and agent_summary["status"] == "needs_sync":
         actions.append(_action("sync_agent", "meta-memory agent sync --all", "Refresh an installed Agent integration after an upgrade or move.", priority=70))
-    elif agent_summary["status"] == "needs_verification":
+    elif not server and agent_summary["status"] == "needs_verification":
         names = [str(name) for name in agent_summary.get("needs_verification", [])]
         command = f"meta-memory agent verify {names[0]}" if len(names) == 1 else "meta-memory agent verify <agent-id>"
         actions.append(_action("verify_agent_launcher", command, "Verify each installed Agent launcher before its first real host turn.", priority=70))
-    elif agent_summary["status"] == "needs_activation":
+    elif not server and agent_summary["status"] == "needs_activation":
         actions.append(_action("activate_agent_lifecycle", "meta-memory agent status --all --verbose", "Start one real conversation through the Agent host, then confirm its lifecycle is active.", priority=70))
 
     # First-time setup installs enabled schedules by default, so presenting a
     # second schedule command before setup would be redundant and confusing.
-    if config_exists and scheduler_summary["status"] == "not_installed":
+    if not server and config_exists and scheduler_summary["status"] == "not_installed":
         actions.append(_action("install_schedule", "meta-memory schedule install", "Install enabled background heartbeat and Dream tasks.", priority=80))
 
     actions.sort(key=lambda item: (int(item["priority"]), str(item["code"])))
-    if last_error or agent_summary["status"] in {"unknown", "error"} or scheduler_summary["status"] == "unknown":
+    if server and hosted_readiness and hosted_readiness["status"] == "error":
+        status = "degraded"
+    elif server and (not config_exists or not hosted_readiness or hosted_readiness["status"] != "ready"):
+        status = "needs_setup"
+    elif server and (spool or unfinished or inbox or review or projections):
+        status = "needs_action"
+    elif server:
+        status = "ready"
+    elif last_error or agent_summary["status"] in {"unknown", "error"} or scheduler_summary["status"] == "unknown":
         status = "degraded"
     elif spool or unfinished or inbox or review or projections:
         status = "needs_action"
@@ -348,10 +417,13 @@ def overview(
     issue = actions[0]["code"] if actions else None
     return {
         "status": status,
+        "mode": "hosted_server" if server else "local_agent",
         "project": {"id": project.project_id, "workspace_id": project.workspace_id, "root": str(project.root)},
         "counts": {
             "active_claims": claims, "resources": resources, "inbox": inbox, "unfinished_turns": unfinished,
             "pending_review_jobs": review, "pending_projections": projections, "pending_spool": spool,
+            "shared_activities": activities, "current_states": temporal_states,
+            "binary_assets": assets, "spatial_maps": maps, "spatial_observations": observations,
         },
         "agent": {
             "id": str(latest[0]) if latest else origin_agent_id(agent_id),
@@ -366,6 +438,7 @@ def overview(
             "configuration": {"status": "ready" if config_exists else "not_saved", "path": str(config.path)},
             "agent": agent_summary,
             "scheduler": scheduler_summary,
+            **({"hosted_server": hosted_readiness} if hosted_readiness is not None else {}),
         },
         "actions": actions,
         "issue": issue,
@@ -391,6 +464,7 @@ def human_text(value: Any) -> str:
     config_state = readiness.get("configuration") if isinstance(readiness.get("configuration"), dict) else {}
     agent_state = readiness.get("agent") if isinstance(readiness.get("agent"), dict) else {}
     scheduler_state = readiness.get("scheduler") if isinstance(readiness.get("scheduler"), dict) else {}
+    hosted_state = readiness.get("hosted_server") if isinstance(readiness.get("hosted_server"), dict) else None
     agent_names = ", ".join(str(name) for name in agent_state.get("agents", [])) or "none"
     expected_schedule = ", ".join(str(name) for name in scheduler_state.get("expected", [])) or "disabled"
     lines = [
@@ -399,11 +473,25 @@ def human_text(value: Any) -> str:
         "",
         "Readiness",
         f"  configuration: {config_state.get('status') or 'unknown'}",
-        f"  agent: {agent_state.get('status') or 'unknown'} ({agent_names})",
-        f"  schedule: {scheduler_state.get('status') or 'unknown'} ({expected_schedule})",
+    ]
+    if hosted_state is not None:
+        lines.append(
+            f"  hosted server: {hosted_state.get('status') or 'unknown'} "
+            f"({hosted_state.get('agents', 0)} Agent bindings)"
+        )
+        if hosted_state.get("agents_file"):
+            lines.append(f"  agents file: {hosted_state.get('agents_file')}")
+    else:
+        lines.extend([
+            f"  agent: {agent_state.get('status') or 'unknown'} ({agent_names})",
+            f"  schedule: {scheduler_state.get('status') or 'unknown'} ({expected_schedule})",
+        ])
+    lines.extend([
         "",
         "Memory",
         f"  active claims: {counts.get('active_claims', 0)}  imported resources: {counts.get('resources', 0)}",
+        f"  shared activity: {counts.get('shared_activities', 0)}  current states: {counts.get('current_states', 0)}",
+        f"  spatial: {counts.get('spatial_maps', 0)} maps, {counts.get('spatial_observations', 0)} observations, {counts.get('binary_assets', 0)} assets",
         f"  pending review: {counts.get('inbox', 0)}  unfinished turns: {counts.get('unfinished_turns', 0)}",
         f"  queued work: review jobs {counts.get('pending_review_jobs', 0)}, projections {counts.get('pending_projections', 0)}, spool {counts.get('pending_spool', 0)}",
         "",
@@ -411,7 +499,7 @@ def human_text(value: Any) -> str:
         f"  agent: {agent.get('id') or 'generic-agent'}",
         f"  last context load: {_short_time(agent.get('last_before'))}",
         f"  last saved reply: {_short_time(agent.get('last_after'))}",
-    ]
+    ])
     manual_steps = agent_state.get("manual_steps") if isinstance(agent_state.get("manual_steps"), list) else []
     if manual_steps:
         lines.extend(["  Agent activation:"])
@@ -424,6 +512,12 @@ def human_text(value: Any) -> str:
                 continue
             lines.append(f"  {index}. {action.get('summary') or action.get('code')}")
             lines.append(f"     {action.get('command')}")
+    elif hosted_state is not None:
+        lines.extend([
+            "",
+            "Hosted server is ready. Keep the API and maintenance schedule running, then verify each remote Agent with:",
+            "  <remote-launcher> status",
+        ])
     else:
         lines.extend(["", "Ready for normal use. Talk to a connected Agent, or save a fact with:", "  meta-memory remember --content \"...\""])
     return "\n".join(lines)

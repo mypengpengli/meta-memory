@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.8.0 — 2026-07-22
+
+### Hosted and remote Agents
+
+- Added a package-native HTTP service with token-bound Agent identities and a
+  complete remote Turn lifecycle: before, after, touch, status, and recovery.
+- Added a dependency-free remote client, durable per-Turn receipts and outbox,
+  plus a generated remote Skill/launcher that never stores the bearer token.
+- Made remote workspaces and subjects explicit, so server working directories
+  cannot accidentally merge unrelated projects.
+
+### Shared-world memory
+
+- Added explicit audiences and channels for user, household, person, project,
+  device, session, and event memory without weakening existing Claim or Turn
+  isolation.
+- Added a curated cross-workspace activity feed and superseding, expiring
+  temporal state for facts such as repairs and last-seen locations.
+- Added binary asset storage, immutable map versions, and searchable spatial
+  observations that link captions, OCR, objects, coordinates, provenance, and
+  raw image/map assets.
+
+### Ready-to-use operations
+
+- Added server, remote-Agent, shared-memory, asset, map, and spatial CLI flows,
+  practical deployment documentation, and richer Overview counts.
+- Added end-to-end remote and installed-wheel coverage for the lifecycle,
+  identity boundaries, outbox recovery, shared context, and spatial assets.
+
 ## 2.7.0 — 2026-07-16
 
 ### Portable Agent integrations

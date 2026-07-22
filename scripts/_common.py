@@ -27,6 +27,8 @@ DEFAULT_DIRS = [
     "archive/raw",
     "archive/imports",
     "resources",
+    "assets/objects",
+    "assets/uploads",
     "db",
 ]
 

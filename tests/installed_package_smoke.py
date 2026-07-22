@@ -48,7 +48,9 @@ def check_packaged_runtime_resources(*, cwd: Path, env: dict[str, str]) -> None:
         "root=Path(scripts.__file__).resolve().parent/'resources'; "
         "required={'classify_memory.md','extract_memory_units.md','default.yaml'}; "
         "missing=sorted(name for name in required if not (root/name).is_file()); "
-        "assert not missing, f'missing packaged runtime resources: {missing}'"
+        "assert not missing, f'missing packaged runtime resources: {missing}'; "
+        "import meta_memory; templates=Path(meta_memory.__file__).resolve().parent/'templates'; "
+        "assert (templates/'remote-skill.md.template').is_file(), 'missing remote Skill template'"
     )
     completed = subprocess.run(
         [sys.executable, "-c", code],
@@ -123,6 +125,55 @@ def main() -> None:
         if str(installed.get("shared_store") or "") != expected_store:
             raise RuntimeError(f"relative store was not pinned at setup: {installed}")
 
+        remote_root = root / "remote-skill-host"
+        remote = run(
+            [
+                *base,
+                "install-remote-agent",
+                "--agent-id", "remote-smoke",
+                "--skill-dir", str(remote_root),
+                "--server-url", "http://127.0.0.1:9",
+                "--workspace-id", "stable-remote-workspace",
+                "--subject-id", "person:installed-smoke",
+                "--token-env", "META_MEMORY_INSTALLED_REMOTE_TOKEN",
+            ],
+            cwd=agent_cwd,
+            env=env,
+        )
+        remote_config = Path(str(remote.get("config") or ""))
+        remote_skill = Path(str(remote.get("skill") or ""))
+        if not remote_config.is_file() or not remote_skill.is_file():
+            raise RuntimeError(f"installed package did not generate the remote Skill: {remote}")
+        config_text = remote_config.read_text(encoding="utf-8")
+        if "META_MEMORY_INSTALLED_REMOTE_TOKEN" not in config_text or "bearer_token" in config_text:
+            raise RuntimeError("remote config did not preserve the token-env-only contract")
+
+        agents_file = root / "agents.json"
+        env["META_MEMORY_INSTALLED_SERVER_TOKEN"] = "installed-server-secret"
+        server_binding = run(
+            [
+                *base,
+                "init-agents-file",
+                "--output", str(agents_file),
+                "--agent-id", "remote-smoke",
+                "--workspace-id", "stable-remote-workspace",
+                "--subject-id", "person:installed-smoke",
+                "--token-env", "META_MEMORY_INSTALLED_SERVER_TOKEN",
+            ],
+            cwd=agent_cwd,
+            env=env,
+        )
+        if server_binding.get("status") != "ok" or not agents_file.is_file():
+            raise RuntimeError(f"installed package did not create an agents file: {server_binding}")
+        hosted_overview = run(
+            [*base, "overview", "--server", "--agents-file", str(agents_file), "--project", "hosted-smoke"],
+            cwd=agent_cwd,
+            env=env,
+        )
+        hosted_readiness = hosted_overview.get("readiness", {}).get("hosted_server", {})
+        if not isinstance(hosted_readiness, dict) or hosted_readiness.get("status") != "ready":
+            raise RuntimeError(f"installed hosted-server overview is not ready: {hosted_overview}")
+
         before = run(
             launcher_command(
                 launcher, "--json", "before", "--project", "installed-smoke", "--session", "smoke-session",
@@ -173,7 +224,7 @@ def main() -> None:
         if not isinstance(scheduler_readiness, dict) or scheduler_readiness.get("status") != "disabled":
             raise RuntimeError(f"disabled fresh scheduler was misreported: {overview}")
         doctor = run([*base, "doctor"], cwd=root, env=env)
-        if doctor.get("status") != "ok" or "023" not in list(doctor.get("migrations") or []):
+        if doctor.get("status") != "ok" or "026" not in list(doctor.get("migrations") or []):
             raise RuntimeError(f"installed migrations are incomplete: {doctor}")
 
         print(json.dumps({"status": "ok", "agent": "smoke-agent", "integration": "ready"}))

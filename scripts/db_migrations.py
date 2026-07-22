@@ -49,6 +49,69 @@ def checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# A pre-release 022 migration was applied on this project's original store
+# before the final three ``dream_nodes.last_run_uid`` lines were added.  The
+# exact predecessor hash is known and its only schema delta is repaired below.
+# Keeping this narrow allow-list preserves checksum protection for every other
+# mismatch while letting that real store upgrade normally.
+KNOWN_PREDECESSOR_CHECKSUMS = {
+    "022": frozenset(
+        {
+            "bf5b3f1442843d42bbfd8818c1cbfc23d9c7c087bbead9f88f17961fc653ff93",
+        }
+    ),
+}
+
+
+def repair_known_predecessor(
+    conn: sqlite3.Connection,
+    *,
+    version: str,
+    recorded_checksum: str,
+    canonical_checksum: str,
+) -> bool:
+    """Complete one explicitly-known predecessor and canonicalize its row."""
+
+    if recorded_checksum not in KNOWN_PREDECESSOR_CHECKSUMS.get(version, frozenset()):
+        return False
+    if version != "022":
+        return False
+
+    # Re-read after taking the write lock so two simultaneous upgrades remain
+    # idempotent.  All repair statements and the checksum replacement commit
+    # together; a crash cannot leave a canonical checksum on a partial schema.
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT checksum FROM schema_migrations WHERE version=?", (version,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        current = str(row[0])
+        if current == canonical_checksum:
+            conn.commit()
+            return True
+        if current not in KNOWN_PREDECESSOR_CHECKSUMS[version]:
+            conn.rollback()
+            return False
+        ensure_columns(conn, "dream_nodes", {"last_run_uid": "TEXT"})
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dream_nodes_last_run "
+            "ON dream_nodes(profile_id, last_run_uid, updated_at)"
+        )
+        conn.execute(
+            "UPDATE schema_migrations SET checksum=? WHERE version=?",
+            (canonical_checksum, version),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
 LEGACY_COLUMNS = {
     "documents": {
         "title": "TEXT", "subject_id": "TEXT", "subject_name": "TEXT", "memory_kind": "TEXT", "page_role": "TEXT",
@@ -312,7 +375,15 @@ def run_migrations(conn: sqlite3.Connection, *, repair_fts: bool = False) -> dic
         digest = checksum(path)
         if version in applied:
             if applied[version] != digest:
-                raise RuntimeError(f"Migration checksum mismatch for {path.name}; do not edit an applied migration.")
+                repaired = repair_known_predecessor(
+                    conn,
+                    version=version,
+                    recorded_checksum=applied[version],
+                    canonical_checksum=digest,
+                )
+                if not repaired:
+                    raise RuntimeError(f"Migration checksum mismatch for {path.name}; do not edit an applied migration.")
+                applied[version] = digest
             continue
         script = path.read_text(encoding="utf-8")
         try:

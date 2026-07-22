@@ -1,11 +1,22 @@
 {
   "agents": {
-    "codex": {
-      "token_env": "META_MEMORY_TOKEN_CODEX",
-      "profile_id": "li-peng",
-      "agent_id": "codex",
-      "workspaces": ["global", "project:meta-memory"],
-      "permissions": ["read", "record", "remember", "feedback", "proposals"]
+    "home-robot": {
+      "token_env": "META_MEMORY_TOKEN_HOME_ROBOT",
+      "profile_id": "replace-with-profile-id-from-shared-init",
+      "agent_id": "home-robot",
+      "workspaces": ["home-robot-workspace"],
+      "subject_ids": ["person:owner", "person:child"],
+      "audiences": ["replace-with-household-audience-id", "replace-with-household-channel-id"],
+      "permissions": ["turns", "status", "read", "record", "remember", "feedback", "proposals", "shared", "assets", "maps", "spatial"]
+    },
+    "family-planner": {
+      "token_env": "META_MEMORY_TOKEN_FAMILY_PLANNER",
+      "profile_id": "replace-with-profile-id-from-shared-init",
+      "agent_id": "family-planner",
+      "workspaces": ["family-dashboard"],
+      "subject_ids": ["person:owner", "person:child"],
+      "audiences": ["replace-with-household-audience-id", "replace-with-household-channel-id"],
+      "permissions": ["turns", "status", "read", "record", "remember", "feedback", "proposals", "shared", "assets", "maps", "spatial"]
     }
   }
 }

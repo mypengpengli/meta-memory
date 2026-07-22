@@ -32,7 +32,7 @@ CONFIG_NAME = "config.toml"
 DATABASE_RELATIVE_PATH = Path("store") / "db" / "memory_index.sqlite"
 MAX_ARCHIVE_MEMBERS = 50_000
 MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024  # two GiB; local backups should stay bounded
-MAX_MEMBER_BYTES = 512 * 1024 * 1024
+MAX_MEMBER_BYTES = MAX_ARCHIVE_BYTES
 
 
 def _utc_now() -> str:
@@ -290,12 +290,59 @@ def _is_transient(relative: Path) -> bool:
     return name.endswith(("-wal", "-shm", "-journal", ".tmp", ".temp", "~"))
 
 
+def _snapshot_assets(database: Path) -> dict[str, tuple[int, str]]:
+    """Read the exact active object set from the already-consistent DB copy."""
+
+    if not database.is_file():
+        return {}
+    connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='binary_assets'"
+        ).fetchone()
+        if not exists:
+            return {}
+        result: dict[str, tuple[int, str]] = {}
+        for object_path, byte_size, digest in connection.execute(
+            "SELECT object_path,byte_size,sha256 FROM binary_assets WHERE status='active'"
+        ):
+            relative = _normal_relative(str(object_path))
+            expected = (int(byte_size), str(digest))
+            if relative in result and result[relative] != expected:
+                raise RuntimeError("Active asset rows disagree about one object path.")
+            result[relative] = expected
+        return result
+    finally:
+        connection.close()
+
+
+def _copy_verified_asset(source: Path, destination: Path, *, size: int, digest: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    actual = hashlib.sha256()
+    copied = 0
+    try:
+        with source.open("rb") as input_file, destination.open("xb") as output_file:
+            while True:
+                block = input_file.read(1024 * 1024)
+                if not block:
+                    break
+                copied += len(block)
+                actual.update(block)
+                output_file.write(block)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Active asset bytes disappeared during backup: {source}") from exc
+    if copied != int(size) or actual.hexdigest() != str(digest):
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(f"Active asset changed or failed integrity verification during backup: {source}")
+
+
 def _stage_store(root: Path, stage: Path, *, target: Path) -> Path:
     staged_store = stage / STORE_PREFIX
     database = root / "db" / "memory_index.sqlite"
     snapshot = stage / "memory_index.sqlite"
     if database.exists():
         _snapshot_database(database, snapshot)
+    asset_manifest = _snapshot_assets(snapshot)
     for path in root.rglob("*"):
         if path.is_symlink():
             # Do not accidentally back up data outside the store.  Symlinks
@@ -306,12 +353,23 @@ def _stage_store(root: Path, stage: Path, *, target: Path) -> Path:
         relative = path.relative_to(root)
         if _is_transient(relative) or path.resolve() == target:
             continue
+        relative_posix = relative.as_posix()
+        if relative_posix.startswith("assets/objects/"):
+            # Copy only the object set referenced by the DB snapshot below.
+            continue
         destination = staged_store / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path == database and snapshot.exists():
             shutil.copy2(snapshot, destination)
         else:
             shutil.copy2(path, destination)
+    for relative, (size, digest) in sorted(asset_manifest.items()):
+        source = (root / relative).resolve()
+        try:
+            source.relative_to(root.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"Asset object path escapes the store: {relative}") from exc
+        _copy_verified_asset(source, staged_store / relative, size=size, digest=digest)
     for transient in (snapshot, Path(str(snapshot) + "-wal"), Path(str(snapshot) + "-shm"), Path(str(snapshot) + "-journal")):
         if transient.exists():
             transient.unlink()
@@ -358,6 +416,20 @@ def _write_checksums(stage: Path) -> dict[str, str]:
     return entries
 
 
+def _validate_stage_limits(stage: Path) -> None:
+    files = [path for path in stage.rglob("*") if path.is_file()]
+    if len(files) > MAX_ARCHIVE_MEMBERS:
+        raise ValueError("Backup contains too many files to restore.")
+    total = 0
+    for path in files:
+        size = path.stat().st_size
+        if size > MAX_MEMBER_BYTES:
+            raise ValueError(f"Backup member is too large to restore: {path.name}")
+        total += size
+        if total > MAX_ARCHIVE_BYTES:
+            raise ValueError("Backup payload is too large to restore.")
+
+
 def _build_backup(
     root: Path,
     destination: str | Path | None,
@@ -394,6 +466,7 @@ def _build_backup(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        _validate_stage_limits(stage)
         # Build the archive only after all payloads and checksums are final.
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
             for path in sorted(stage.rglob("*")):

@@ -247,6 +247,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
     from .spool import replay_spool
     from .runtime_audit import cleanup_error_log
     from .operational_maintenance import cleanup_operational_data
+    from .shared_memory import expire_time_bounded
     from .turn_recovery import recover_expired_turns
 
     root = Path(config.store)
@@ -264,11 +265,12 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
     try:
         heartbeat_work = {key: value for key, value in work_before.items() if key != "dream_scopes"}
         if not any(heartbeat_work.values()):
+            world_expiry = expire_time_bounded(root, profile_id=config.profile_id)
             operational = cleanup_operational_data(config)
             snapshot_gc = garbage_collect_snapshots(root) if operational.get("status") == "ok" else {"compacted": 0, "removed": 0}
             error_log_cleanup = cleanup_error_log(config) if operational.get("status") == "ok" else 0
             _record_heartbeat_state(config, status="idle", work=work_before)
-            return {"status": "idle", "dirty_scopes": sum(heartbeat_work.values()), "processed_turns": 0, "updated_claims": 0, "updated_sessions": 0, "new_snapshots": 0, "work": work_before, "operational_cleanup": operational, "snapshot_gc": snapshot_gc, "error_log_cleanup": error_log_cleanup}
+            return {"status": "idle", "dirty_scopes": sum(heartbeat_work.values()), "processed_turns": 0, "updated_claims": 0, "updated_sessions": 0, "new_snapshots": 0, "work": work_before, "world_expiry": world_expiry, "operational_cleanup": operational, "snapshot_gc": snapshot_gc, "error_log_cleanup": error_log_cleanup}
         spool = replay_spool(config, limit=max(20, job_limit * 2))
         renew(root, lease)
         turn_recovery = recover_expired_turns(config, limit=job_limit)
@@ -283,6 +285,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
         projections = process_projection_outbox(root, limit=max(100, job_limit * 20))
         renew(root, lease)
         hot = _refresh_dirty_hot(config, max_scopes=scope_limit)
+        world_expiry = expire_time_bounded(root, profile_id=config.profile_id)
         operational = cleanup_operational_data(config)
         snapshot_gc = garbage_collect_snapshots(root) if operational.get("status") == "ok" else {"compacted": 0, "removed": 0}
         error_log_cleanup = cleanup_error_log(config) if operational.get("status") == "ok" else 0
@@ -311,6 +314,7 @@ def maintain(config: AppConfig, *, max_jobs: int = 20, max_scopes: int | None = 
             "refreshed_session_cards": refreshed_cards,
             "projections": projections,
             "hot_memory": hot,
+            "world_expiry": world_expiry,
             "snapshot_gc": snapshot_gc,
             "error_log_cleanup": error_log_cleanup,
             "operational_cleanup": operational,
@@ -341,6 +345,11 @@ def status(config: AppConfig) -> dict[str, Any]:
             "pending_projections": int(conn.execute("SELECT COUNT(*) FROM projection_outbox WHERE status IN ('pending','running','failed')").fetchone()[0]),
             "dirty_hot_scopes": int(conn.execute("SELECT COUNT(*) FROM workspace_runtime_state WHERE profile_id=? AND hot_dirty=1", (config.profile_id,)).fetchone()[0]),
             "dirty_dream_scopes": int(conn.execute("SELECT COUNT(*) FROM workspace_runtime_state WHERE profile_id=? AND dream_dirty=1", (config.profile_id,)).fetchone()[0]),
+            "shared_activities": int(conn.execute("SELECT COUNT(*) FROM shared_activities WHERE profile_id=? AND status='active'", (config.profile_id,)).fetchone()[0]),
+            "current_states": int(conn.execute("SELECT COUNT(*) FROM temporal_states WHERE profile_id=? AND status='active'", (config.profile_id,)).fetchone()[0]),
+            "binary_assets": int(conn.execute("SELECT COUNT(*) FROM binary_assets WHERE profile_id=? AND status='active'", (config.profile_id,)).fetchone()[0]),
+            "spatial_maps": int(conn.execute("SELECT COUNT(DISTINCT map_id) FROM spatial_maps WHERE profile_id=? AND status='active'", (config.profile_id,)).fetchone()[0]),
+            "spatial_observations": int(conn.execute("SELECT COUNT(*) FROM spatial_observations WHERE profile_id=? AND status='active'", (config.profile_id,)).fetchone()[0]),
         }
     finally:
         conn.close()
