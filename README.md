@@ -533,9 +533,22 @@ docker compose --profile https up -d
 curl --fail https://memory.example.com/readyz
 ```
 
+For a first deployment, you supply only two things: point DNS at the server and
+set the real `MEMORY_DOMAIN` in `.env`, then securely place the generated
+`META_MEMORY_TOKEN` in the client Agent's environment. `bootstrap.sh` already
+creates the persistent directories, server configuration, and default
+`local-codex` binding, so the first Codex using the defaults below does **not**
+need a manual `agents.json` edit. `docker compose config --quiet` remains an
+optional preflight check.
+
 See [Docker cloud deployment](docs/container-deployment.md) for the Windows
 Codex client, additional Agents, backup/restore, upgrades, and the acceptance
 checklist.
+
+Do not copy only a `SKILL.md` or Skill folder from another computer. Run
+`install-remote-agent` once on every client instead: it creates that machine's
+Skill, launcher, remote configuration, and durable outbox. A copied launcher
+can still point at the other machine's Python, paths, or retry directory.
 
 Without Docker, use the following manual deployment instead. Do not run this
 second API or its local schedules against a store already owned by Compose:
