@@ -1371,15 +1371,22 @@ class MemoryAPI(BaseHTTPRequestHandler):
             payload_turn = str(payload.get("turn_id") or "").strip()
             if payload_turn and payload_turn != turn_uid:
                 raise ValueError("payload turn_id conflicts with request path")
+            assistant = str(payload.get("assistant") or payload.get("assistant_text") or "")
+            if action != "touch":
+                answer_sha256 = hashlib.sha256(assistant.encode("utf-8")).hexdigest()
+                declared_hash = str(payload.get("answer_sha256") or "").strip().casefold()
+                if declared_hash and not hmac.compare_digest(declared_hash, answer_sha256):
+                    raise ValueError("answer_sha256 does not match assistant_text")
+            # Reject an internally inconsistent response before opening
+            # SQLite.  Besides being cheaper, this prevents a bad client
+            # payload from waiting behind an unrelated writer for the full DB
+            # busy timeout.  Authentication and fixed identity validation have
+            # already run above; the actual Turn scope is still checked before
+            # any touch or completion.
             _turn_scope(self.server, request, turn_uid)
             config = _bound_config(self.server, request)
             if action == "touch":
                 return touch_turn(config, turn_uid=turn_uid, agent_id=request.agent_id, note=str(payload.get("note") or ""))
-            assistant = str(payload.get("assistant") or payload.get("assistant_text") or "")
-            answer_sha256 = hashlib.sha256(assistant.encode("utf-8")).hexdigest()
-            declared_hash = str(payload.get("answer_sha256") or "").strip().casefold()
-            if declared_hash and not hmac.compare_digest(declared_hash, answer_sha256):
-                raise ValueError("answer_sha256 does not match assistant_text")
             return runtime_after(config, assistant_text=assistant, turn_uid=turn_uid, agent_id=request.agent_id)
 
         if path == "/v1/recovery/replay":

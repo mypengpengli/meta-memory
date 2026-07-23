@@ -9,6 +9,7 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from meta_memory.config import AppConfig
@@ -318,11 +319,18 @@ class RemoteHTTPAPITests(unittest.TestCase):
         )
         self.assertEqual(status, 200, result)
         answer = "  preserved answer\r\n"
-        status, rejected = self.request(
-            "POST",
-            f"/v1/turns/{turn_id}/after",
-            self.turn_payload(turn_id, assistant_text=answer, answer_sha256="0" * 64),
-        )
+        # A self-inconsistent response must be rejected before any SQLite scope
+        # lookup.  This keeps the validation path bounded even when another
+        # request temporarily owns the database writer lock.
+        with patch(
+            "meta_memory.http_api._turn_scope",
+            side_effect=AssertionError("invalid hash reached the database"),
+        ):
+            status, rejected = self.request(
+                "POST",
+                f"/v1/turns/{turn_id}/after",
+                self.turn_payload(turn_id, assistant_text=answer, answer_sha256="0" * 64),
+            )
         self.assertEqual(status, 400, rejected)
         expected = hashlib.sha256(answer.encode("utf-8")).hexdigest()
         status, completed = self.request(

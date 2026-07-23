@@ -30,7 +30,10 @@ if [ "$(id -u)" = "0" ] && [ "${META_MEMORY_PRIVILEGES_DROPPED:-0}" != "1" ]; th
     positive_integer "$runtime_uid" || die "META_MEMORY_UID must be a positive integer"
     positive_integer "$runtime_gid" || die "META_MEMORY_GID must be a positive integer"
     install -d -m 0750 "$store_parent" "$store" "$(dirname "$config")" "$backup_dir" "$state_dir"
-    for directory in "$store_parent" "$(dirname "$config")" "$backup_dir" "$state_dir"; do
+    # `install -d` can create the leaf store as root inside an otherwise
+    # writable host-owned parent.  Check both parent and leaf so a fresh Linux
+    # bind mount never leaves /data/store inaccessible after privilege drop.
+    for directory in "$store_parent" "$store" "$(dirname "$config")" "$backup_dir" "$state_dir"; do
         if ! setpriv --reuid "$runtime_uid" --regid "$runtime_gid" --clear-groups test -w "$directory"; then
             chown -R "$runtime_uid:$runtime_gid" "$directory"
         fi
