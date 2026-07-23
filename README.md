@@ -108,7 +108,6 @@ git clone https://github.com/mypengpengli/meta-memory.git
 cd meta-memory
 sh docker/bootstrap.sh              # 生成 Token、宿主 UID/GID 和持久目录
 # 公网使用时编辑 .env，填写真实 MEMORY_DOMAIN。
-docker compose config --quiet
 docker compose up -d --build meta-memory worker
 curl --fail http://127.0.0.1:8765/readyz
 
@@ -116,6 +115,12 @@ curl --fail http://127.0.0.1:8765/readyz
 docker compose --profile https up -d
 curl --fail https://memory.example.com/readyz
 ```
+
+第一次部署只有两项必须由你自己提供：把域名 DNS 指向服务器并在 `.env` 填入
+`MEMORY_DOMAIN`，以及把 `.env` 中自动生成的 `META_MEMORY_TOKEN` 安全地设置到本机
+Agent 的环境变量。`bootstrap.sh` 已经自动创建数据目录、服务器配置和默认
+`local-codex` Agent 绑定；第一台按下面默认命令接入的 Codex **不需要**手工编辑
+`agents.json`。`docker compose config --quiet` 是可选的部署前检查。
 
 本机安装生成的远端 Skill；下面三项身份必须与服务器 `.env` 一致：
 
@@ -130,6 +135,11 @@ meta-memory install-remote-agent `
   --token-env META_MEMORY_TOKEN
 setx META_MEMORY_TOKEN "<与服务器相同的值>"
 ```
+
+不要只把一个 `SKILL.md` 或 Skill 文件夹从另一台电脑复制过来。每台电脑都应运行一次
+`install-remote-agent`：它会为该机器生成匹配的 Skill、launcher、远端配置和断网
+outbox；复制出来的 launcher 可能仍指向原机器的 Python、路径或重试目录。设置 Token
+后重开终端并重启 Codex 即可。
 
 重开终端并重启 Codex 后，用安装结果里的 launcher 运行 `recovery` 和 `status`，再完成
 一个真实回合。只有 `lifecycle_state: active`、新的 `last_before/last_after` 和
