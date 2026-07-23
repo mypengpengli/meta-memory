@@ -128,6 +128,11 @@ meta-memory inbox list
 
 服务器是唯一 SQLite 写入者；远端电脑只运行生成的 Skill/launcher：
 
+下面是**非 Docker 部署**的裸 Python 流程。使用仓库 Compose 的服务器不要再在宿主机
+启动第二套 `serve` 或 `schedule`，也不要直接操作 `runtime/data`；请改用
+[Docker 云端部署](container-deployment.md) 中的 `docker/admin.sh` 和专用备份、恢复、
+升级脚本。
+
 ```bash
 # 服务器：记录返回的 profile_id、audience_id 和 channel_id。
 meta-memory --json shared init --type household --key home --restricted \
@@ -167,7 +172,7 @@ state、asset、map、spatial observation；普通 `overview` 检查的是本地
 PowerShell 用反引号换行，并用
 `$env:META_MEMORY_TOKEN_HOME_ROBOT = '<the-same-token-value>'` 设置 Token；要手工
 复制示例文件时使用 `Copy-Item`，不是 `cp`。完整 Windows 与 Bash 流程见
-[Hosted Meta Memory](advanced-http.md)。
+[Docker 云端部署](container-deployment.md) 和 [Hosted Meta Memory](advanced-http.md)。
 
 家庭共享只发布有用摘要。人物位置等易变事实用 `shared state-set` 并设置过期时间；
 图片/视频/点云先用 `asset` 保存，地图用稳定 `map_id` 建版本，最后用 `spatial`

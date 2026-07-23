@@ -4,3 +4,5 @@ memory-data/
 build/
 dist/
 *.egg-info/
+.env
+runtime/

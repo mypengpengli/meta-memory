@@ -157,6 +157,26 @@ class PortableBackupRestoreTests(unittest.TestCase):
             content,
         )
 
+    def test_nested_upload_manifests_are_checksummed_and_restorable(self) -> None:
+        upload = self.config.store / "assets" / "uploads" / "upload-1"
+        upload.mkdir(parents=True)
+        (upload / "manifest.json").write_text('{"status":"complete"}\n', encoding="utf-8")
+        (upload / "checksums.sha256").write_text("nested control-name payload\n", encoding="utf-8")
+
+        archive = self._portable_archive()
+        with zipfile.ZipFile(archive) as package:
+            checksums = package.read("checksums.sha256").decode("utf-8")
+        self.assertIn("store/assets/uploads/upload-1/manifest.json", checksums)
+        self.assertIn("store/assets/uploads/upload-1/checksums.sha256", checksums)
+
+        restored = self.root / "upload-restored"
+        result = restore_store(archive, restored)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            (restored / "assets" / "uploads" / "upload-1" / "manifest.json").read_text(encoding="utf-8"),
+            '{"status":"complete"}\n',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

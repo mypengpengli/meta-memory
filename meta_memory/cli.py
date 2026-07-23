@@ -497,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="meta-memory",
         usage="meta-memory [GLOBAL OPTION] COMMAND [OPTION]",
-        description="A local or hosted durable memory runtime for AI agents. Start locally with setup; use serve for remote Agents.",
+        description="A local or hosted durable memory runtime for AI agents. Start locally with setup; deploy hosted service with the included Compose stack or serve.",
         epilog="""Start here:
   meta-memory setup --agents codex
   meta-memory overview
@@ -517,6 +517,11 @@ Remote and robot use:
   meta-memory install-remote-agent --help
   meta-memory shared --help
   meta-memory spatial --help
+
+Hosted Docker deployment (from a repository checkout):
+  sh docker/bootstrap.sh
+  docker compose up -d --build meta-memory worker
+  Guide: docs/container-deployment.md
 """,
         formatter_class=_HelpFormatter,
     )
@@ -572,6 +577,18 @@ Remote and robot use:
     serve_cmd.add_argument("--asset-chunk-mb", type=int, default=2, help="Resumable-upload chunk size")
     serve_cmd.add_argument("--tls-cert", help="PEM certificate for native HTTPS")
     serve_cmd.add_argument("--tls-key", help="PEM private key used with --tls-cert")
+    serve_cmd.add_argument(
+        "--access-log",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write one safe JSON access-log record per request (default: enabled; env META_MEMORY_HTTP_ACCESS_LOG)",
+    )
+    serve_cmd.add_argument(
+        "--shutdown-timeout",
+        type=float,
+        default=None,
+        help="Seconds to drain active requests after SIGINT/SIGTERM (default: 10; env META_MEMORY_HTTP_SHUTDOWN_TIMEOUT)",
+    )
 
     init_agents = commands.add_parser("init-agents-file", help="Create or extend the server binding file for a remote Agent")
     init_agents.add_argument("--output", required=True, help="Destination agents.json path used by `meta-memory serve`")
@@ -750,9 +767,11 @@ Remote and robot use:
     recovery_replay_cmd.add_argument("--limit", type=int, default=100)
 
     backup = commands.add_parser("backup", help="Create a consistent ZIP backup")
-    backup.add_argument("--output")
+    backup.add_argument("--output", help="Destination ZIP path; defaults to a timestamped file beside the configured store")
     restore = commands.add_parser("restore", help="Restore a portable backup and update the local configuration")
-    restore.add_argument("archive"); restore.add_argument("--destination"); restore.add_argument("--force", action="store_true")
+    restore.add_argument("archive", help="Portable ZIP created by `meta-memory backup`")
+    restore.add_argument("--destination", help="New or replaceable store directory; defaults to the configured store")
+    restore.add_argument("--force", action="store_true", help="Allow replacement of an existing destination after validation")
     imported = commands.add_parser("import", help="Import a local file or directory as source evidence")
     imported.add_argument("file"); imported.add_argument("--project", default="auto"); imported.add_argument("--cwd"); imported.add_argument("--recursive", action="store_true"); imported.add_argument("--changed-only", action="store_true")
     resource_cmd = commands.add_parser("resource", help="List, inspect, refresh, remove, or export imported sources")
@@ -1046,9 +1065,10 @@ Remote and robot use:
     _set_help(install_remote, description="Generate a non-secret Skill and launcher for an Agent on another device. The launcher pins stable identity and reads the bearer token only from an environment variable.", examples="""Example:
   meta-memory install-remote-agent --agent-id home-robot --skill-dir ~/.robot/skills --server-url https://memory.example.com --workspace-id home --subject-id person:owner --audience-id <audience-id> --channel-id <channel-id> --token-env META_MEMORY_TOKEN_ROBOT
 """)
-    _set_help(serve_cmd, description="Run the one authoritative SQLite service. Bind localhost behind a TLS reverse proxy, or supply a certificate/key for native HTTPS.", examples="""Examples:
+    _set_help(serve_cmd, description="Run the one authoritative SQLite service. /healthz is liveness; /readyz verifies bindings, schema, and persistent directories. Bind localhost behind a TLS reverse proxy, or supply a certificate/key for native HTTPS.", examples="""Examples:
   meta-memory serve --agents-file ~/.meta-memory/agents.json
   meta-memory serve --agents-file ~/.meta-memory/agents.json --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem
+  meta-memory serve --agents-file ~/.meta-memory/agents.json --no-access-log --shutdown-timeout 30
 """)
     _set_help(init_agents, description="Create a usable agents.json from the installed package. It stores only token environment-variable names, never bearer-token values.", examples="""Example:
   meta-memory init-agents-file --output ~/.meta-memory/agents.json --agent-id home-robot --workspace-id home --subject-id person:owner --subject-id person:child --audience-id <audience-id> --audience-id <channel-id> --token-env META_MEMORY_TOKEN_ROBOT
@@ -1061,11 +1081,25 @@ Remote and robot use:
   meta-memory after --turn <turn-id> --assistant-file response.txt
   meta-memory after --turn <turn-id> --assistant "Exact final answer"
 """)
-    _set_help(overview_cmd, description="Show the current project, setup readiness, memory queue, recent activity, and exact next commands.", examples="""Examples:
+    _set_help(overview_cmd, description="Show the current project, setup readiness, memory queue, recent activity, and exact next commands. Server mode validates the on-disk store and Agent bindings; use the running service's /readyz endpoint for live container readiness.", examples="""Examples:
   meta-memory overview
   meta-memory overview --project my-project
   meta-memory overview --server --agents-file ~/.meta-memory/agents.json
   meta-memory --json overview
+""")
+    _set_help(backup, description="Create a self-verifying portable ZIP of the configured local store. Docker operators should use `docker compose run --rm --no-deps worker meta-memory-backup` so the matching Agent-binding sidecars and retention policy are included.", examples="""Examples:
+  meta-memory backup --output ~/meta-memory-backup.zip
+  meta-memory --json backup --output ./backups/manual.zip
+
+Docker deployment:
+  docker compose run --rm --no-deps worker meta-memory-backup
+""")
+    _set_help(restore, description="Validate a portable ZIP, restore it through a staging directory, and update the selected local configuration. Restoring can replace an existing destination only with --force. Docker operators should use `sh docker/restore.sh <filename.zip>` so services, the protection backup, and Agent bindings are handled together.", examples="""Examples:
+  meta-memory restore ~/meta-memory-backup.zip --destination ~/.meta-memory-restored
+  meta-memory restore ~/meta-memory-backup.zip --destination ~/.meta-memory --force
+
+Docker deployment:
+  sh docker/restore.sh meta-memory-YYYYMMDDTHHMMSSZ.zip
 """)
     _set_help(memory_cmd, description="Manage durable Claims. Use `memory show` before correcting, archiving, or forgetting a Claim.", examples="""Examples:
   meta-memory memory recent
@@ -1171,6 +1205,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             asset_chunk_bytes=max(1, int(args.asset_chunk_mb)) * 1024 * 1024,
             tls_cert=args.tls_cert,
             tls_key=args.tls_key,
+            access_log=args.access_log,
+            shutdown_timeout=args.shutdown_timeout,
         )
         return {"status": "stopped"}
     if args.command == "init-agents-file":

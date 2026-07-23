@@ -1,9 +1,14 @@
-# 升级到 2.8
+# 升级到 2.8.x
 
 2.8 新增远端 Agent、家庭/人物/设备共享状态、二进制资产、版本化地图和空间语义。
 现有本地 Agent、Claim、Turn、备份和命令保持兼容；数据库会依次通过迁移
 `024`、`025`、`026` 前进，不会把现有 Claim 改写成新 channel 数据。当前最新
 迁移是 `026`。
+
+2.8.1 不新增数据库迁移；它补充了正式 Docker/Compose 部署、`/readyz`、唯一
+Heartbeat/Dream/backup worker、Agent 绑定 sidecar、原子恢复和升级脚本。已有 Docker
+部署按 [Docker 云端部署](container-deployment.md) 执行 `sh docker/upgrade.sh`；裸
+Python/本地 Agent 继续使用下面的通用步骤。
 
 ## 推荐步骤
 

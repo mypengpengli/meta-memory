@@ -4,7 +4,7 @@
 
 Meta Memory gives AI agents on one computer—or remote Agents using one central server—a shared memory store without turning every conversation into an opaque database. It remembers durable facts and project decisions, keeps source evidence, lets you correct or retire a memory, and continuously consolidates completed work in the background. Household activity, time-bounded person/device state, images, maps, and robot observations have explicit storage and sharing boundaries.
 
-Useful companion documents: [practical operations](docs/operations.md), [Agent integration](docs/agent-integration.md), [hosted deployment](docs/advanced-http.md), [household and spatial memory](docs/shared-world-memory.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
+Useful companion documents: [Docker cloud deployment](docs/container-deployment.md), [practical operations](docs/operations.md), [Agent integration](docs/agent-integration.md), [hosted protocol](docs/advanced-http.md), [household and spatial memory](docs/shared-world-memory.md), [upgrade guide](docs/upgrade.md), [architecture](docs/architecture.md), and [troubleshooting](docs/troubleshooting.md).
 
 # 中文
 
@@ -95,6 +95,46 @@ meta-memory memory recent --project demo
 ```
 
 `remember` 用于你明确希望长期保存的内容。已加载生成 Skill 的 Agent 会在对话中执行上下文读取与回合写回；如果宿主不支持本地 Skill 或命令执行，请按 [Agent 接入契约](docs/agent-integration.md) 手动集成严格的 `before`/`after` 流程。
+
+## 云服务器 Docker + 本机 Codex
+
+这是让多台电脑或远端 Agent 共用记忆的推荐部署方式。服务器只运行一个 API 和一个
+串行 worker；本机 Codex 只安装远端 Skill，不直接接触服务器上的 SQLite。
+
+服务器首次启动：
+
+```bash
+git clone https://github.com/mypengpengli/meta-memory.git
+cd meta-memory
+sh docker/bootstrap.sh              # 生成 Token、宿主 UID/GID 和持久目录
+# 公网使用时编辑 .env，填写真实 MEMORY_DOMAIN。
+docker compose config --quiet
+docker compose up -d --build meta-memory worker
+curl --fail http://127.0.0.1:8765/readyz
+
+# 域名已解析并开放 80/443 后，启用自动 HTTPS。
+docker compose --profile https up -d
+curl --fail https://memory.example.com/readyz
+```
+
+本机安装生成的远端 Skill；下面三项身份必须与服务器 `.env` 一致：
+
+```powershell
+python -m pip install "git+https://github.com/mypengpengli/meta-memory.git"
+meta-memory install-remote-agent `
+  --agent-id local-codex `
+  --skill-dir "$HOME\.codex\skills" `
+  --server-url https://memory.example.com `
+  --workspace-id personal-workspace `
+  --subject-id person:user `
+  --token-env META_MEMORY_TOKEN
+setx META_MEMORY_TOKEN "<与服务器相同的值>"
+```
+
+重开终端并重启 Codex 后，用安装结果里的 launcher 运行 `recovery` 和 `status`，再完成
+一个真实回合。只有 `lifecycle_state: active`、新的 `last_before/last_after` 和
+`local_outbox_pending: 0` 才表示端到端接入完成。首次部署、多 Agent 独立 Token、
+家庭频道、自动备份、升级、恢复和上线验收见 [Docker 云端部署](docs/container-deployment.md)。
 
 ## 日常怎么用
 
@@ -260,6 +300,10 @@ HTTPS 使用同一个完整生命周期。
 HTTP、重试、幂等和分块续传由生成客户端负责。
 
 ### 服务器端：完整最小路径
+
+生产部署优先使用上面的 Docker Compose；它已经包含持久目录、`/readyz`、唯一
+Heartbeat/Dream worker、自动备份、正常停机和可选 Caddy HTTPS。下面的裸 CLI
+流程适合不使用 Docker 或需要自行接入 systemd/现有反向代理的环境。
 
 ```bash
 # 1. 初始化中央存储与唯一后台整理任务。
@@ -463,7 +507,28 @@ An installed Agent performs the durable lifecycle only when its host loads the g
 
 ## Hosted remote Agents
 
-Run one central service for Agents on other computers or robots:
+For a production server, the shortest supported path is the included Compose
+deployment. It runs one API, one serialized maintenance/Dream/backup worker,
+persists data/config/backups, exposes `/readyz`, and optionally terminates HTTPS
+with Caddy:
+
+```bash
+git clone https://github.com/mypengpengli/meta-memory.git
+cd meta-memory
+sh docker/bootstrap.sh               # token, host uid/gid, persistent directories
+# Set the real MEMORY_DOMAIN in .env before enabling HTTPS.
+docker compose config --quiet
+docker compose up -d --build meta-memory worker
+docker compose --profile https up -d
+curl --fail https://memory.example.com/readyz
+```
+
+See [Docker cloud deployment](docs/container-deployment.md) for the Windows
+Codex client, additional Agents, backup/restore, upgrades, and the acceptance
+checklist.
+
+Without Docker, use the following manual deployment instead. Do not run this
+second API or its local schedules against a store already owned by Compose:
 
 ```bash
 # Server: retain profile/audience/channel IDs from this JSON result.

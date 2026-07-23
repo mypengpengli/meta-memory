@@ -29,3 +29,27 @@ jobs:
       - run: python scripts/evaluate_retrieval.py --strict --store test-store --cases-file tests/fixtures/retrieval-cases.json
       - run: python scripts/evaluate_writeback.py --strict --store test-store --cases-file tests/fixtures/writeback-cases.json
       - run: python scripts/evaluate_temporal.py --strict --store test-store --cases-file tests/fixtures/temporal-cases.json
+
+  container-e2e:
+    name: Docker hosted-service E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      META_MEMORY_TOKEN: container-compose-contract-only
+      MEMORY_DOMAIN: memory.example.test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install .
+      - name: Validate the Compose deployment contract
+        run: docker compose config --quiet
+      - name: Build the production image once
+        run: docker build --tag meta-memory:container-e2e .
+      - name: Exercise hosted lifecycle, recovery, assets, backup, and restore
+        run: python tests/container_e2e.py --image meta-memory:container-e2e
+      - name: Exercise the Compose worker, host restore, and upgrade scripts
+        env:
+          META_MEMORY_IMAGE: meta-memory:container-e2e
+        run: sh tests/compose_stack_e2e.sh

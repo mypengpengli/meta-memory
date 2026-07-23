@@ -4,6 +4,10 @@ Hosted 模式适合运行在其他电脑、云环境、手机或机器人上的 
 服务器直接拥有 SQLite 和资产目录；其他设备通过 HTTPS 使用生成的 Skill 和
 launcher，不挂载、不复制、也不直接打开数据库文件。
 
+要在云服务器直接使用仓库提供的 Docker/Compose、唯一 worker、自动备份和 Caddy
+HTTPS，请从 [Docker 云端部署](container-deployment.md) 开始；本文继续说明协议、
+身份边界和所有远端命令。
+
 ## Agent 与服务器分别需要什么
 
 远端 Agent 宿主必须能够：
@@ -43,7 +47,11 @@ launcher，不挂载、不复制、也不直接打开数据库文件。
 
 ## 1. 在唯一服务器上初始化
 
-安装 Python 3.10+ 和 Meta Memory，然后初始化服务端存储：
+本节是**非 Docker 部署**的裸 Python 替代流程。已经使用 Compose 的服务器应跳过
+本节，不要在宿主机再启动第二个 API 或计划任务，也不要直接打开 `runtime/data`；
+管理方式见 [Docker 云端部署](container-deployment.md)。
+
+不使用 Docker 时，安装 Python 3.10+ 和 Meta Memory，然后初始化服务端存储：
 
 ```bash
 git clone https://github.com/mypengpengli/meta-memory.git

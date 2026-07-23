@@ -1,0 +1,130 @@
+name: ${COMPOSE_PROJECT_NAME:-meta-memory}
+
+x-meta-memory-environment: &meta-memory-environment
+  META_MEMORY_CONFIG: /config/config.toml
+  META_MEMORY_STORE: /data/store
+  META_MEMORY_CONTAINER_STATE_DIR: /data/.container-runtime
+  META_MEMORY_AGENTS_FILE: /config/agents.json
+  META_MEMORY_BACKUP_DIR: /backups
+  META_MEMORY_PROFILE_NAME: ${META_MEMORY_PROFILE_NAME:-User}
+  META_MEMORY_UID: ${META_MEMORY_UID:-10001}
+  META_MEMORY_GID: ${META_MEMORY_GID:-10001}
+  TZ: ${TZ:-Asia/Shanghai}
+
+x-meta-memory-service: &meta-memory-service
+  image: ${META_MEMORY_IMAGE:-meta-memory:local}
+  restart: unless-stopped
+  init: true
+  volumes:
+    - ${META_MEMORY_DATA_DIR:-./runtime/data}:/data
+    - ${META_MEMORY_CONFIG_DIR:-./runtime/config}:/config
+    - ${META_MEMORY_BACKUP_DIR_HOST:-./runtime/backups}:/backups
+
+services:
+  meta-memory:
+    <<: *meta-memory-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim-bookworm}
+    stop_grace_period: 30s
+    env_file:
+      - path: ${META_MEMORY_ENV_FILE:-.env}
+        required: false
+    environment:
+      <<: *meta-memory-environment
+      META_MEMORY_TOKEN: ${META_MEMORY_TOKEN:?Set META_MEMORY_TOKEN in .env before starting the server}
+      META_MEMORY_TOKEN_ENV: META_MEMORY_TOKEN
+      META_MEMORY_HTTP_SHUTDOWN_TIMEOUT: ${META_MEMORY_HTTP_SHUTDOWN_TIMEOUT:-20}
+      META_MEMORY_BOOTSTRAP_AGENT_ID: ${META_MEMORY_BOOTSTRAP_AGENT_ID:-local-codex}
+      META_MEMORY_BOOTSTRAP_WORKSPACE_ID: ${META_MEMORY_BOOTSTRAP_WORKSPACE_ID:-personal-workspace}
+      META_MEMORY_BOOTSTRAP_SUBJECT_ID: ${META_MEMORY_BOOTSTRAP_SUBJECT_ID:-person:user}
+      META_MEMORY_BOOTSTRAP_AUDIENCE_IDS: ${META_MEMORY_BOOTSTRAP_AUDIENCE_IDS:-}
+    command:
+      - meta-memory
+      - --config
+      - /config/config.toml
+      - serve
+      - --store
+      - /data/store
+      - --agents-file
+      - /config/agents.json
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --max-asset-mb
+      - ${META_MEMORY_MAX_ASSET_MB:-64}
+      - --asset-chunk-mb
+      - ${META_MEMORY_ASSET_CHUNK_MB:-2}
+    ports:
+      - ${META_MEMORY_BIND_ADDRESS:-127.0.0.1}:${META_MEMORY_PORT:-8765}:8765
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/readyz', timeout=2).read()"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    deploy:
+      replicas: 1
+
+  worker:
+    <<: *meta-memory-service
+    stop_grace_period: 5m
+    environment:
+      <<: *meta-memory-environment
+      META_MEMORY_HEARTBEAT_INTERVAL_SECONDS: ${META_MEMORY_HEARTBEAT_INTERVAL_SECONDS:-600}
+      META_MEMORY_DREAM_TIME: ${META_MEMORY_DREAM_TIME:-23:30}
+      META_MEMORY_DREAM_RETRY_SECONDS: ${META_MEMORY_DREAM_RETRY_SECONDS:-3600}
+      META_MEMORY_BACKUP_INTERVAL_SECONDS: ${META_MEMORY_BACKUP_INTERVAL_SECONDS:-86400}
+      META_MEMORY_BACKUP_RETRY_SECONDS: ${META_MEMORY_BACKUP_RETRY_SECONDS:-3600}
+      META_MEMORY_BACKUP_RETENTION_DAYS: ${META_MEMORY_BACKUP_RETENTION_DAYS:-30}
+      META_MEMORY_BACKUP_RETENTION_COUNT: ${META_MEMORY_BACKUP_RETENTION_COUNT:-14}
+      META_MEMORY_WORKER_POLL_SECONDS: ${META_MEMORY_WORKER_POLL_SECONDS:-30}
+    command: ["meta-memory-maintenance-loop"]
+    depends_on:
+      meta-memory:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      disable: true
+    deploy:
+      replicas: 1
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      MEMORY_DOMAIN: ${MEMORY_DOMAIN:-}
+      MAX_REQUEST_BODY: ${MAX_REQUEST_BODY:-70MB}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ -n "$$MEMORY_DOMAIN" ] || {
+          echo "MEMORY_DOMAIN must name a real DNS host before enabling the https profile." >&2
+          exit 2
+        }
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    ports:
+      - ${CADDY_HTTP_PORT:-80}:80
+      - ${CADDY_HTTPS_PORT:-443}:443
+      - ${CADDY_HTTPS_PORT:-443}:443/udp
+    volumes:
+      - ./docker/Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      meta-memory:
+        condition: service_healthy
+        restart: true
+
+volumes:
+  caddy-data:
+  caddy-config:

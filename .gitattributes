@@ -1,0 +1,8 @@
+Dockerfile text eol=lf
+compose.yaml text eol=lf
+.dockerignore text eol=lf
+.env.example text eol=lf
+docker/*.sh text eol=lf
+docker/*.json text eol=lf
+docker/Caddyfile.example text eol=lf
+tests/*_e2e.sh text eol=lf

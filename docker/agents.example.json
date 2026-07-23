@@ -1,0 +1,25 @@
+{
+  "agents": {
+    "local-codex": {
+      "token_env": "META_MEMORY_TOKEN",
+      "profile_id": "user",
+      "agent_id": "local-codex",
+      "workspaces": ["personal-workspace"],
+      "subject_ids": ["person:user"],
+      "audiences": [],
+      "permissions": [
+        "turns",
+        "status",
+        "read",
+        "record",
+        "remember",
+        "feedback",
+        "proposals",
+        "shared",
+        "assets",
+        "maps",
+        "spatial"
+      ]
+    }
+  }
+}

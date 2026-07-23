@@ -515,7 +515,7 @@ def human_text(value: Any) -> str:
     elif hosted_state is not None:
         lines.extend([
             "",
-            "Hosted server is ready. Keep the API and maintenance schedule running, then verify each remote Agent with:",
+            "Hosted configuration is ready. Confirm the live API with /readyz, keep exactly one maintenance worker/schedule running, then verify each remote Agent with:",
             "  <remote-launcher> status",
         ])
     else:

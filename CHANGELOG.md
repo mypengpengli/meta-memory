@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.8.1 — 2026-07-23
+
+### One-command hosted deployment
+
+- Added a production Docker image and Compose stack with persistent data,
+  configuration, and backup directories, non-root runtime, readiness probes,
+  optional automatic Caddy HTTPS, and explicit single-instance guards.
+- Added a single serialized worker for Heartbeat, Deep Dream, and verified ZIP
+  backups, plus documented upgrade, rollback, retention, and atomic restore
+  scripts. Each Docker backup now carries checksummed non-secret Agent-binding
+  sidecars for complete disaster recovery.
+- Added a host bootstrap and non-root administrative wrapper so Linux bind
+  mounts remain readable by the deploying account and ad-hoc commands cannot
+  leave root-owned runtime files.
+
+### Operable remote service
+
+- Added `/readyz`, request IDs, secret-safe structured access logs, and graceful
+  SIGINT/SIGTERM request draining to the hosted API.
+- Added a real-image end-to-end acceptance test covering remote Turns, exact
+  outbox recovery, container restart persistence, chunked assets, maps, and
+  spatial observations, backup, and restore; CI now runs it in a dedicated
+  Docker job.
+- Fixed portable backup checksums for nested resumable-upload `manifest.json`
+  and `checksums.sha256` files, which previously made such archives fail their
+  own restore validation.
+- Added a practical cloud-server-to-local-Codex guide and surfaced the Docker
+  route in README and CLI help.
+
 ## 2.8.0 — 2026-07-22
 
 ### Hosted and remote Agents

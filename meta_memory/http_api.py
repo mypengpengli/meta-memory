@@ -13,14 +13,20 @@ import hmac
 import json
 import os
 import re
+import signal
 import ssl
+import sys
+import tempfile
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping, TextIO
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .config import AppConfig, load_config
@@ -54,6 +60,10 @@ _OBSERVATION_PATH = re.compile(r"^/v1/spatial-observations/([^/]+)$")
 _UPLOAD_PART_PATH = re.compile(r"^/v1/assets/uploads/([^/]+)/parts/(\d+)$")
 _UPLOAD_COMPLETE_PATH = re.compile(r"^/v1/assets/uploads/([^/]+)/complete$")
 _STATUS_PATHS = frozenset({"/v1/agent/status", "/v1/agents/status"})
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+ACCESS_LOG_ENV = "META_MEMORY_HTTP_ACCESS_LOG"
+SHUTDOWN_TIMEOUT_ENV = "META_MEMORY_HTTP_SHUTDOWN_TIMEOUT"
+DEFAULT_SHUTDOWN_TIMEOUT = 10.0
 
 
 @dataclass(frozen=True)
@@ -183,6 +193,13 @@ def _bearer_token(header: str) -> str:
     return token.strip() if separator and scheme.casefold() == "bearer" else ""
 
 
+def _secret_equal(left: object, right: object) -> bool:
+    return hmac.compare_digest(
+        str(left).encode("utf-8"),
+        str(right).encode("utf-8"),
+    )
+
+
 def authorize(
     tokens: Mapping[str, Principal],
     header: str,
@@ -194,7 +211,7 @@ def authorize(
 
     token = _bearer_token(header)
     principal = next(
-        (value for candidate, value in tokens.items() if token and hmac.compare_digest(candidate, token)),
+        (value for candidate, value in tokens.items() if token and _secret_equal(candidate, token)),
         None,
     )
     if principal is None:
@@ -663,11 +680,197 @@ def _empty_shared_context(request: RequestIdentity) -> dict[str, Any]:
     }
 
 
+def _environment_enabled(name: str, *, default: bool) -> bool:
+    value = str(os.environ.get(name, "")).strip().casefold()
+    if not value:
+        return default
+    return value not in {"0", "false", "no", "off", "disabled"}
+
+
+def _shutdown_timeout() -> float:
+    value = str(os.environ.get(SHUTDOWN_TIMEOUT_ENV, "")).strip()
+    if not value:
+        return DEFAULT_SHUTDOWN_TIMEOUT
+    try:
+        parsed = float(value)
+    except ValueError:
+        return DEFAULT_SHUTDOWN_TIMEOUT
+    return max(0.0, min(parsed, 300.0))
+
+
+def _writable_directory_probe(directory: Path) -> dict[str, Any]:
+    """Prove a directory can persist bytes without leaving a probe artifact."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    # TemporaryFile is anonymous where the platform supports O_TMPFILE and is
+    # delete-on-close elsewhere.  In either case readiness polling never
+    # accumulates sentinel files in a persisted Docker volume.
+    with tempfile.TemporaryFile(
+        mode="w+b", prefix=".meta-memory-ready-", dir=directory
+    ) as probe:
+        marker = uuid.uuid4().bytes
+        probe.write(marker)
+        probe.flush()
+        probe.seek(0)
+        if probe.read() != marker:
+            raise OSError("readiness write probe could not be read back")
+    return {"status": "ok", "writable": True}
+
+
+def _readiness(server: "APIServer") -> tuple[HTTPStatus, dict[str, Any]]:
+    """Check the loaded bindings, current schema and persistent directories."""
+
+    checks: dict[str, dict[str, Any]] = {}
+    bindings_valid = bool(server.tokens) and all(
+        bool(str(token))
+        and isinstance(principal, Principal)
+        and bool(principal.profile_id)
+        and bool(principal.agent_id)
+        and bool(principal.workspaces)
+        for token, principal in server.tokens.items()
+    )
+    checks["agent_bindings"] = {
+        "status": "ok" if bindings_valid else "error",
+        "loaded": bindings_valid,
+        "count": len(server.tokens),
+    }
+
+    connection = None
+    try:
+        from db_migrations import checksum, migration_files  # type: ignore
+
+        packaged = migration_files()
+        expected = [path.name.split("_", 1)[0] for path in packaged]
+        expected_checksums = {
+            path.name.split("_", 1)[0]: checksum(path) for path in packaged
+        }
+        connection = open_db(server.root)
+        connection.execute("SELECT 1").fetchone()
+        applied_rows = [
+            (str(row[0]), str(row[1]))
+            for row in connection.execute(
+                "SELECT version,checksum FROM schema_migrations ORDER BY version"
+            )
+        ]
+        applied = [version for version, _digest in applied_rows]
+        if applied != expected:
+            raise RuntimeError("database migrations are incomplete")
+        if any(
+            not hmac.compare_digest(digest, expected_checksums.get(version, ""))
+            for version, digest in applied_rows
+        ):
+            raise RuntimeError("database migration checksums do not match this release")
+        checks["database"] = {
+            "status": "ok",
+            "accessible": True,
+            "schema_current": True,
+            "checksums_valid": True,
+            "schema_version": expected[-1] if expected else "",
+        }
+    except Exception as exc:
+        checks["database"] = {
+            "status": "error",
+            "accessible": False,
+            "schema_current": False,
+            "checksums_valid": False,
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+    storage_groups = {
+        "store": (
+            ("root_writable", server.root),
+            ("database_directory_writable", server.root / "db"),
+        ),
+        "assets": (
+            ("objects_writable", server.root / "assets" / "objects"),
+            ("uploads_writable", server.root / "assets" / "uploads"),
+        ),
+    }
+    for name, probes in storage_groups.items():
+        details: dict[str, bool] = {}
+        label = ""
+        try:
+            for label, directory in probes:
+                details[label] = bool(
+                    _writable_directory_probe(directory)["writable"]
+                )
+            checks[name] = {"status": "ok", "writable": True, **details}
+        except Exception as exc:
+            checks[name] = {
+                "status": "error",
+                "writable": False,
+                "error_type": type(exc).__name__,
+                "failed_probe": label,
+                **details,
+            }
+
+    ready = all(check.get("status") == "ok" for check in checks.values())
+    body: dict[str, Any] = {
+        "status": "ready" if ready else "not_ready",
+        "checks": checks,
+    }
+    return (HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE), body
+
+
 class MemoryAPI(BaseHTTPRequestHandler):
     server: "APIServer"
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+    def handle_one_request(self) -> None:
+        self._request_id = uuid.uuid4().hex
+        self._response_status = 0
+        self._request_error_type = ""
+        started = time.monotonic()
+        try:
+            super().handle_one_request()
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+            method = str(getattr(self, "command", "") or "")
+            raw_path = str(getattr(self, "path", "") or "")
+            try:
+                path = urlsplit(raw_path).path
+            except ValueError:
+                path = ""
+            if method or self._response_status:
+                self.server.log_request_event(
+                    request_id=self._request_id,
+                    method=method or "UNKNOWN",
+                    path=path or "/",
+                    status=self._response_status,
+                    duration_ms=elapsed_ms,
+                    error_type=self._request_error_type,
+                )
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            supplied = str(self.headers.get("X-Request-ID") or "").strip()
+            matches_token = any(
+                _secret_equal(supplied, token)
+                for token in self.server.tokens
+                if supplied
+            )
+            if _REQUEST_ID.fullmatch(supplied) and not matches_token:
+                self._request_id = supplied
+        return parsed
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._response_status = int(code)
+        super().send_response(code, message)
+
+    def end_headers(self) -> None:
+        self.send_header("X-Request-ID", self._request_id)
+        super().end_headers()
+
+    def _record_unhandled(self, error: BaseException) -> None:
+        # Only the exception class reaches access logs.  Exception messages can
+        # contain request data, filesystem names or other operator secrets.
+        self._request_error_type = type(error).__name__
 
     def _json_body(self) -> dict[str, Any]:
         try:
@@ -769,6 +972,10 @@ class MemoryAPI(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/healthz":
                 self._reply(HTTPStatus.OK, {"status": "ok"})
+                return
+            if parsed.path == "/readyz":
+                status, body = _readiness(self.server)
+                self._reply(status, body)
                 return
             if parsed.path in _STATUS_PATHS:
                 query = {key: values[-1] for key, values in parse_qs(parsed.query, keep_blank_values=True).items()}
@@ -990,7 +1197,8 @@ class MemoryAPI(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self._reply(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
-        except Exception:
+        except Exception as exc:
+            self._record_unhandled(exc)
             self._reply(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1020,7 +1228,8 @@ class MemoryAPI(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             self._reply(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
-        except Exception:
+        except Exception as exc:
+            self._record_unhandled(exc)
             self._reply(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -1061,7 +1270,8 @@ class MemoryAPI(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.FORBIDDEN, {"error": "forbidden", "detail": str(exc)})
         except (ValueError, KeyError, OSError) as exc:
             self._reply(HTTPStatus.BAD_REQUEST, {"error": "bad_request", "detail": str(exc)})
-        except Exception:
+        except Exception as exc:
+            self._record_unhandled(exc)
             self._reply(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
 
     def _direct_asset_upload(self, parsed) -> dict[str, Any]:
@@ -1564,6 +1774,8 @@ class APIServer(ThreadingHTTPServer):
         asset_chunk_bytes: int = DEFAULT_ASSET_CHUNK_BYTES,
         tls_cert: str | Path | None = None,
         tls_key: str | Path | None = None,
+        access_log: bool = False,
+        log_stream: TextIO | None = None,
     ) -> None:
         resolved_root = Path(root).expanduser().resolve()
         base = config or load_config()
@@ -1575,6 +1787,14 @@ class APIServer(ThreadingHTTPServer):
             1,
             min(int(asset_chunk_bytes), 8 * 1024 * 1024, self.max_asset_bytes),
         )
+        self.access_log = bool(access_log)
+        self.log_stream = log_stream or sys.stderr
+        self._log_lock = threading.Lock()
+        self._request_condition = threading.Condition()
+        self._active_requests = 0
+        self._serving = threading.Event()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_reason = ""
         super().__init__(address, MemoryAPI)
         if tls_cert or tls_key:
             if not tls_cert or not tls_key:
@@ -1583,6 +1803,146 @@ class APIServer(ThreadingHTTPServer):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(str(Path(tls_cert).expanduser()), str(Path(tls_key).expanduser()))
             self.socket = context.wrap_socket(self.socket, server_side=True)
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        if self._shutdown_requested.is_set():
+            return
+        self._serving.set()
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            self._serving.clear()
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Count the accepted socket before its worker starts.  Counting only
+        # inside the handler leaves a scheduling race where shutdown can see
+        # zero active work immediately before a new worker begins.
+        self.request_started()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.request_finished()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_finished()
+
+    def request_started(self) -> None:
+        with self._request_condition:
+            self._active_requests += 1
+
+    def request_finished(self) -> None:
+        with self._request_condition:
+            self._active_requests = max(0, self._active_requests - 1)
+            if not self._active_requests:
+                self._request_condition.notify_all()
+
+    def wait_for_requests(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._request_condition:
+            while self._active_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._request_condition.wait(remaining)
+            return True
+
+    def log_event(self, event: str, **fields: Any) -> None:
+        if not self.access_log:
+            return
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": str(event),
+            **fields,
+        }
+        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        with self._log_lock:
+            print(encoded, file=self.log_stream, flush=True)
+
+    def handle_error(self, _request: Any, _client_address: Any) -> None:
+        # socketserver's default prints a free-form traceback.  Keep hosted
+        # service output machine-readable and avoid serializing request state.
+        error_type = getattr(sys.exc_info()[0], "__name__", "Exception")
+        self.log_event("http_connection_error", error_type=error_type)
+
+    def log_request_event(
+        self,
+        *,
+        request_id: str,
+        method: str,
+        path: str,
+        status: int,
+        duration_ms: float,
+        error_type: str = "",
+    ) -> None:
+        safe_path = path
+        for token in self.tokens:
+            if token:
+                safe_path = safe_path.replace(token, "[REDACTED]")
+        safe_request_id = request_id
+        if any(
+            _secret_equal(request_id, token)
+            for token in self.tokens
+            if request_id
+        ):
+            safe_request_id = "[REDACTED]"
+        fields: dict[str, Any] = {
+            "request_id": safe_request_id,
+            "method": method,
+            # Query strings are intentionally excluded: identities and future
+            # credentials must never leak through an operator access log.
+            "path": safe_path,
+            "status": int(status),
+            "duration_ms": duration_ms,
+        }
+        if error_type:
+            fields["error_type"] = error_type
+        self.log_event("http_request", **fields)
+
+    def request_shutdown(self, *, reason: str) -> bool:
+        """Ask serve_forever to stop without calling shutdown on its thread."""
+
+        if self._shutdown_requested.is_set():
+            return False
+        self._shutdown_reason = str(reason or "requested")
+        self._shutdown_requested.set()
+        self.log_event("server_shutdown_requested", reason=self._shutdown_reason)
+        if self._serving.is_set():
+            threading.Thread(
+                target=self.shutdown,
+                name="meta-memory-http-shutdown",
+                daemon=True,
+            ).start()
+        return True
+
+
+@contextmanager
+def _graceful_signal_handlers(server: APIServer) -> Iterator[None]:
+    """Install process signal handlers only where Python permits doing so."""
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous: dict[signal.Signals, Any] = {}
+
+    def stop(signum: int, _frame: object) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        server.request_shutdown(reason=f"signal:{name}")
+
+    try:
+        for candidate in (signal.SIGTERM, signal.SIGINT):
+            previous[candidate] = signal.getsignal(candidate)
+            signal.signal(candidate, stop)
+        yield
+    finally:
+        for candidate, handler in previous.items():
+            signal.signal(candidate, handler)
 
 
 def create_server(
@@ -1595,6 +1955,8 @@ def create_server(
     asset_chunk_bytes: int = DEFAULT_ASSET_CHUNK_BYTES,
     tls_cert: str | Path | None = None,
     tls_key: str | Path | None = None,
+    access_log: bool = False,
+    log_stream: TextIO | None = None,
 ) -> APIServer:
     """Create a configured server without starting its blocking loop."""
 
@@ -1607,6 +1969,8 @@ def create_server(
         asset_chunk_bytes=asset_chunk_bytes,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        access_log=access_log,
+        log_stream=log_stream,
     )
 
 
@@ -1621,6 +1985,8 @@ def serve(
     asset_chunk_bytes: int = DEFAULT_ASSET_CHUNK_BYTES,
     tls_cert: str | Path | None = None,
     tls_key: str | Path | None = None,
+    access_log: bool | None = None,
+    shutdown_timeout: float | None = None,
 ) -> None:
     """Run the central HTTP transport until interrupted."""
 
@@ -1633,6 +1999,11 @@ def serve(
         asset_chunk_bytes=asset_chunk_bytes,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        access_log=(
+            _environment_enabled(ACCESS_LOG_ENV, default=True)
+            if access_log is None
+            else bool(access_log)
+        ),
     )
     print(
         json.dumps(
@@ -1649,12 +2020,25 @@ def serve(
         ),
         flush=True,
     )
+    graceful_seconds = _shutdown_timeout() if shutdown_timeout is None else max(
+        0.0, min(float(shutdown_timeout), 300.0)
+    )
+    drained = True
     try:
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
+        with _graceful_signal_handlers(server):
+            if not server._shutdown_requested.is_set():
+                try:
+                    server.serve_forever()
+                except KeyboardInterrupt:
+                    server.request_shutdown(reason="keyboard_interrupt")
     finally:
+        drained = server.wait_for_requests(graceful_seconds)
+        server.log_event(
+            "server_stopped",
+            reason=server._shutdown_reason or "serve_forever_returned",
+            requests_drained=drained,
+            graceful_timeout_seconds=graceful_seconds,
+        )
         server.server_close()
 
 

@@ -212,7 +212,12 @@ def _validate_archive_payload(stage: Path, names: set[str], manifest: dict[str, 
     allowed_meta = {MANIFEST_NAME, CHECKSUMS_NAME}
     payload_names = names - allowed_meta
     if payload_names != set(expected):
-        raise ValueError("Backup files do not match its checksum manifest.")
+        missing = sorted(set(expected) - payload_names)[:5]
+        unexpected = sorted(payload_names - set(expected))[:5]
+        raise ValueError(
+            "Backup files do not match its checksum manifest "
+            f"(missing={missing}, unexpected={unexpected})."
+        )
     for name, digest in expected.items():
         path = _safe_stage_path(stage, name)
         if not path.is_file() or _sha256_file(path) != digest:
@@ -407,9 +412,15 @@ def _stage_config(stage: Path, config: "AppConfig" | None) -> Path | None:
 def _write_checksums(stage: Path) -> dict[str, str]:
     entries: dict[str, str] = {}
     for path in sorted(stage.rglob("*")):
-        if not path.is_file() or path.name in {MANIFEST_NAME, CHECKSUMS_NAME}:
+        if not path.is_file():
             continue
         relative = path.relative_to(stage).as_posix()
+        # Only the two archive-control files at the ZIP root are metadata.
+        # Hosted resumable uploads legitimately contain nested manifest.json
+        # files; excluding them here created an archive that could be written
+        # but would always fail its own restore validation.
+        if relative in {MANIFEST_NAME, CHECKSUMS_NAME}:
+            continue
         entries[relative] = _sha256_file(path)
     lines = [f"{digest}  {name}" for name, digest in sorted(entries.items())]
     (stage / CHECKSUMS_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
